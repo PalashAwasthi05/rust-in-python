@@ -1,0 +1,8 @@
+0
+[1, 2, 3]
+2
+9
+config { debug: true }
+config { debug: false }
+false
+7

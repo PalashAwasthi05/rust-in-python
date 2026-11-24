@@ -1,0 +1,14 @@
+0
+900
+9
+Some(2)
+Before Same After
+true
+Entry { key: "k", hits: 3 } k 3
+["x=11", "y=1"]
+[1, 2]
+ok 6
+err negative: -1
+err too big
+Ok(14)
+Err("plain")

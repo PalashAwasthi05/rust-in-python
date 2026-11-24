@@ -1,0 +1,9 @@
+0
+ok 42
+ok 7
+error: parse error: invalid digit found in string
+error: 500 out of range
+6
+200 out of range
+Ok(8)
+boxed -1 out of range

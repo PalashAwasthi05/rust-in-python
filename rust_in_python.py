@@ -540,6 +540,11 @@ class MacroExpander:
                     result.append(replace(group, items=self.expand(group.items, macros, depth)))
                     index = argument + 1
                     continue
+                if builtin == "cfg":
+                    value = "true" if cfg_enabled(group.items) else "false"
+                    result.append(replace(item, text=value, end=group.closing.end))
+                    index = argument + 1
+                    continue
                 if builtin in {"concat", "stringify"}:
                     if builtin == "concat":
                         parts = self.expand(group.items, macros, depth + 1)
@@ -1253,6 +1258,49 @@ class ModuleUnit:
     glob_aliases: dict = field(default_factory=dict)
     hidden_traits: set = field(default_factory=set)
     macro_use: bool = False
+    # Functions, constants, and statics that share their name with a module in this scope.
+    values: dict = field(default_factory=dict)
+
+
+VALUE_KINDS = {"fn", "const", "static"}
+
+
+# The configuration rustc uses for a plain debug build of a binary on a 64-bit Unix host.
+CFG_FLAGS = {"debug_assertions", "unix"}
+CFG_VALUES = {"target_family": {"unix"}, "target_pointer_width": {"64"}, "target_endian": {"little"},
+              "panic": {"unwind"}, "target_os": {sys.platform.replace("darwin", "macos")},
+              "target_has_atomic": {"8", "16", "32", "64", "ptr"}}
+
+
+def cfg_enabled(items):
+    """Evaluate a #[cfg(...)] predicate given the token trees inside its parentheses."""
+    items = list(items)
+    if not items:
+        raise RustError("empty cfg predicate")
+    head = items[0]
+    word = tree_text(head)
+    if word in {"all", "any", "not"} and len(items) == 2 and isinstance(items[1], TokenGroup):
+        groups, current = [], []
+        for part in items[1].items:
+            if tree_text(part) == ",":
+                if current:
+                    groups.append(current)
+                current = []
+            else:
+                current.append(part)
+        if current:
+            groups.append(current)
+        results = [cfg_enabled(group) for group in groups]
+        if word == "not":
+            if len(results) != 1:
+                raise head.error("cfg(not(..)) takes one predicate")
+            return not results[0]
+        return all(results) if word == "all" else any(results)
+    if len(items) == 1 and isinstance(head, Token):
+        return word in CFG_FLAGS
+    if len(items) == 3 and tree_text(items[1]) == "=" and isinstance(items[2], Token):
+        return decode_string(items[2]) in CFG_VALUES.get(word, set())
+    raise getattr(head, "error", RustError)("unsupported cfg predicate")
 
 
 class Modules:
@@ -1273,6 +1321,8 @@ class Modules:
         self.lazy_items = {}
         self.lazy_fallback = False
         self.enum_variants = {}
+        self.local_macros = {}
+        self.reexported_macros = {}
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
         self.units[STD_ROOT] = std
@@ -1282,7 +1332,20 @@ class Modules:
         if not is_identifier(token.text) or token.text in RESERVED_BY_EDITION[self.edition]:
             raise token.error("expected an item identifier")
         name = identifier_text(token.text)
+        if name in unit.values and unit.values[name].token is token:
+            return unit.values[name]
         if name in unit.symbols:
+            existing = unit.symbols[name]
+            # Modules live in the type namespace, so a function, constant, or static may share the name.
+            if {existing.kind, kind} <= VALUE_KINDS | {"module"} and "module" in {existing.kind, kind} \
+                    and existing.kind != kind and name not in unit.values:
+                symbol = ModuleSymbol((*unit.path, name), kind, boundary, token)
+                if kind == "module":
+                    unit.values[name] = existing
+                    unit.symbols[name] = symbol
+                else:
+                    unit.values[name] = symbol
+                return symbol
             raise token.error(f"duplicate item {token.text!r}")
         symbol = ModuleSymbol((*unit.path, name), kind, boundary, token)
         unit.symbols[name] = symbol
@@ -1324,6 +1387,7 @@ class Modules:
             local_inner = False
             macro_use = False
             custom_path = None
+            disabled = False
             while index + 1 < len(items) and tree_text(items[index]) == "#":
                 inner = tree_text(items[index + 1]) == "!"
                 position = index + (2 if inner else 1)
@@ -1343,6 +1407,10 @@ class Modules:
                         local_inner = True
                 elif not inner and len(attribute.items) == 1 and tree_text(attribute.items[0]) == "macro_use":
                     macro_use = True
+                elif (not inner and len(attribute.items) == 2 and tree_text(attribute.items[0]) == "cfg"
+                      and isinstance(attribute.items[1], TokenGroup)):
+                    if not cfg_enabled(attribute.items[1].items):
+                        disabled = True
                 elif (not inner and len(attribute.items) == 3
                       and tuple(map(tree_text, attribute.items[:2])) == ("path", "=")
                       and isinstance(attribute.items[2], Token)):
@@ -1369,6 +1437,18 @@ class Modules:
                     and tree_text(items[index + 1]) in {"fn", "impl", "trait"}):
                 index += 1
             word = tree_text(items[index])
+            if disabled:
+                # A #[cfg] whose predicate is false removes the whole item before name resolution.
+                if word == "mod":
+                    index += 3
+                elif word == "const" and index + 1 < len(items) and tree_text(items[index + 1]) == "fn":
+                    index = self.item_end(items, index + 1, "fn")
+                elif word in {"fn", "struct", "enum", "trait", "const", "static", "type", "impl", "use",
+                              "macro_rules", "union", "extern"}:
+                    index = self.item_end(items, index, word)
+                else:
+                    raise items[index].error("unsupported item under #[cfg]")
+                continue
             if macro_use and word != "mod":
                 raise items[index].error("macro_use requires a module")
             if word == "const" and index + 1 < len(items) and tree_text(items[index + 1]) == "fn":
@@ -1446,6 +1526,11 @@ class Modules:
                         if key in self.exported and not expanded:
                             raise name.error(f"duplicate exported macro {name.text!r}")
                         self.exported[key] = body, local_inner
+                    elif word == "macro_rules" and not expanded and index + 3 < len(items):
+                        # A module-level macro can be re-exported by path with `pub(crate) use name;`.
+                        name, body = items[index + 2:index + 4]
+                        if isinstance(name, Token) and isinstance(body, TokenGroup):
+                            self.local_macros[(unit.path, identifier_text(name.text))] = body
                     output.extend(kept_attributes)
                     output.extend(items[index:end])
                 index = end
@@ -1690,6 +1775,9 @@ class Modules:
             return []
         index = 0
         parts = list(prefix)
+        if not parts and len(items) > 1 and tree_text(items[0]) == "::" and tree_text(items[1]) in STD_CRATES:
+            # `use ::std::x` names the extern crate explicitly.
+            index = 1
         while index < len(items):
             item = items[index]
             if isinstance(item, TokenGroup) and tree_text(item) == "{":
@@ -1750,6 +1838,8 @@ class Modules:
             return ModuleSymbol(root.path, "module", (), token)
         first = path.pop(0)
         symbol = self.lookup(root, first, origin, token)
+        if not path and symbol and symbol.kind == "module" and first in root.values:
+            symbol = self.lookup_value(root, first, origin, token)
         if not symbol and not absolute and first in STD_CRATES:
             symbol = ModuleSymbol(STD_ROOT, "module", (), token)
         if not symbol and not absolute:
@@ -1762,6 +1852,8 @@ class Modules:
             nested = self.units[symbol.path]
             name = path.pop(0)
             found = self.lookup(nested, name, origin, token)
+            if not path and found and found.kind == "module" and name in nested.values:
+                found = self.lookup_value(nested, name, origin, token)
             if found and found.name in STD_BUILTIN_TRAITS:
                 found = ModuleSymbol((STD_BUILTIN_TRAITS[found.name],), "trait", (), token)
             if not found and symbol.path[:1] == STD_ROOT:
@@ -1823,6 +1915,13 @@ class Modules:
             raise token.error(f"{name!r} is private")
         return symbol
 
+    @staticmethod
+    def lookup_value(unit, name, origin, token):
+        symbol = unit.values[name]
+        if origin[:len(symbol.visible_from)] != symbol.visible_from:
+            raise token.error(f"{name!r} is private")
+        return symbol
+
     def link_imports(self, *, strict=True):
         for unit in self.units.values():
             unit.aliases.clear()
@@ -1875,6 +1974,11 @@ class Modules:
                         unresolved.append((unit, item, item.token.error(f"cannot re-export private item {item.alias!r}")))
                         continue
                     existing = unit.symbols.get(item.alias) or unit.aliases.get(item.alias)
+                    if (existing and existing.kind == "module" and target.kind in VALUE_KINDS
+                            and unit.values.get(item.alias, target).path == target.path):
+                        # A value import may share its name with a module.
+                        unit.values[item.alias] = replace(target, visible_from=item.visible_from)
+                        continue
                     if existing and existing.path != target.path:
                         raise item.token.error(f"duplicate import {item.alias!r}")
                     unit.aliases[item.alias] = replace(target, visible_from=item.visible_from)
@@ -1910,6 +2014,7 @@ class Modules:
 
     def link_macros(self, exports):
         self.macro_paths = {(name,): (macro, ()) for name, macro in exports.items()}
+        self.macro_paths.update(self.reexported_macros)
         while True:
             size = len(self.macro_paths)
             for unit in self.units.values():
@@ -1946,6 +2051,9 @@ class Modules:
             if bare and len(parts) == 1 and symbol.kind not in {"unit_struct", "associated", "const", "static"}:
                 return token
             return replace(token, text=symbol.name)
+        if len(parts) == 3 and parts[0] in STD_CRATES and "::".join(parts[1:]) in SCALAR_CONSTANTS:
+            # Legacy numeric modules such as `std::i32::MAX` alias the associated constants.
+            return replace(token, text="::".join(parts[1:]))
         if len(parts) > 1:
             return replace(token, text="::".join(parts))
         if type_name and unit.path:
@@ -1967,6 +2075,15 @@ class Modules:
             exports[name] = (expander.definitions, expander.rules(body), local_inner)
             if local_inner:
                 expander.local_inner_macros.add(id(body))
+        self.reexported_macros = {}
+        for unit in self.units.values():
+            for item in unit.imports:
+                path = item.path[1:] if item.path[:1] == ("self",) else item.path
+                body = self.local_macros.get((unit.path, path[0])) if len(path) == 1 else None
+                if body is not None and item.alias not in {"_", "*"}:
+                    expander.definitions += 1
+                    self.reexported_macros[(*unit.path, item.alias)] = (
+                        (expander.definitions, expander.rules(body), False), item.visible_from)
         self.link_macros(exports)
         self.link_imports(strict=False)
         self.link_macros(exports)
@@ -2437,6 +2554,7 @@ class TypeAlias:
     lifetimes: tuple
     parameters: tuple
     target: object
+    defaults: tuple = ()
 
     def specialize(self, arguments, token):
         supplied_lifetimes = tuple(arg for arg in arguments if isinstance(arg, LifetimeArgument))
@@ -2445,6 +2563,12 @@ class TypeAlias:
         if supplied_lifetimes and len(supplied_lifetimes) != len(self.lifetimes):
             raise token.error(f"{self.name.text} expects {len(self.lifetimes)} lifetime arguments")
         types = arguments[len(supplied_lifetimes):]
+        if len(types) < len(self.parameters) and self.defaults:
+            # Omitted trailing parameters take their defaults, which may mention earlier parameters.
+            for parameter, default in tuple(zip(self.parameters, self.defaults))[len(types):]:
+                if default is None:
+                    break
+                types = (*types, substitute(default, dict(zip(self.parameters, types))))
         if len(types) != len(self.parameters):
             raise token.error(f"{self.name.text} expects {len(self.parameters)} type or const arguments")
         for parameter, arg in zip(self.parameters, types):
@@ -3222,6 +3346,9 @@ class Program:
 
 
 class Parser:
+    # Set by attributes() when a #[cfg(...)] among them is false; the caller drops what follows.
+    cfg_disabled = False
+
     def __init__(self, source, *, tokens=None, fragment=False, modules=None, unit=None, edition="2021"):
         self.edition = modules.edition if modules else edition
         self.tokens = iter(lex(source, edition=self.edition) if tokens is None else tokens)
@@ -3283,6 +3410,51 @@ class Parser:
             return replace(token, text="'" + identifier_text(token.text[1:]))
         return token
 
+    def cfg_predicate(self):
+        name = self.advance()
+        if name.text in {"all", "any", "not"} and self.accept("("):
+            results = []
+            while self.current.text != ")":
+                results.append(self.cfg_predicate())
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            if name.text == "not":
+                if len(results) != 1:
+                    raise name.error("cfg(not(..)) takes one predicate")
+                return not results[0]
+            return all(results) if name.text == "all" else any(results)
+        if not is_identifier(name.text):
+            raise name.error("unsupported cfg predicate")
+        if self.accept("="):
+            value = self.advance()
+            if not is_string_literal(value.text):
+                raise value.error("expected a string literal")
+            return decode_string(value) in CFG_VALUES.get(name.text, set())
+        return name.text in CFG_FLAGS
+
+    def alias_record_path(self, path, type_arguments):
+        """A struct expression or pattern through a type alias names the aliased struct."""
+        if not self.modules or path.text not in self.modules.alias_names:
+            return path, type_arguments
+        alias = self.modules.type_aliases.get(path.text)
+        if alias is None:
+            return path, type_arguments
+        if type_arguments is None:
+            type_arguments = (None,) * len(alias.parameters)
+        target = alias.specialize(type_arguments, path)
+        if isinstance(target, AppliedType) and isinstance(target.name, str):
+            return replace(path, text=target.name), target.arguments
+        if isinstance(target, str):
+            return replace(path, text=target), None
+        return path, type_arguments
+
+    def extern_crate_path(self, token):
+        """Treat a leading `::std`, `::core`, or `::alloc` path like the unprefixed crate path."""
+        if token.text == "::" and self.current.text in STD_CRATES:
+            return self.advance()
+        return token
+
     def qualified_token(self, token, parts, *, bare=False, type_name=False):
         if self.modules:
             return self.modules.name_token(self.unit, token, parts, bare=bare, type_name=type_name)
@@ -3311,7 +3483,7 @@ class Parser:
     def type_name(self, *, static_string=False, signature=None):
         if self.lifetime_scope:
             signature = self.lifetime_scope if signature is None else {**self.lifetime_scope, **signature}
-        token = self.advance()
+        token = self.extern_crate_path(self.advance())
         if token.text == "&&":
             self.lookahead.appendleft(self.current)
             self.current = replace(token, text="&", column=token.column + 1)
@@ -3634,7 +3806,9 @@ class Parser:
         name = self.declare_token(self.identifier())
         if name.text in PRIMITIVES:
             raise name.error(f"duplicate type {name.text!r}")
+        self.parameter_defaults = {}
         lifetimes, parameters = self.generic_parameters()
+        defaults = tuple(self.parameter_defaults.get(parameter) for parameter in parameters)
         self.type_parameters = parameters
         self.where_clause(lifetimes)
         self.expect("=")
@@ -3647,7 +3821,8 @@ class Parser:
         if isinstance(target, ReferenceType) and target.lifetime is None:
             raise name.error("a reference type alias requires an explicit lifetime")
         self.expect(";")
-        return TypeAlias(name, tuple(map(LifetimeArgument, lifetimes)), tuple(parameters.values()), target)
+        return TypeAlias(name, tuple(map(LifetimeArgument, lifetimes)), tuple(parameters.values()), target,
+                         defaults if any(default is not None for default in defaults) else ())
 
     def peek(self, offset=0):
         while len(self.lookahead) <= offset:
@@ -3750,6 +3925,13 @@ class Parser:
         methods = {}
         associated = {}
         while not self.accept("}"):
+            self.cfg_disabled = False
+            if self.current.text == "#" and self.peek() == "[":
+                self.attributes()
+            if self.cfg_disabled:
+                # A member under a false #[cfg(...)] is skipped unparsed, as rustc never sees it.
+                self.skip_member()
+                continue
             visible = self.member_visibility()
             if self.accept("type"):
                 name = self.identifier()
@@ -3774,6 +3956,11 @@ class Parser:
                 self.expect(";")
                 continue
             constant = self.accept("const")
+            if constant and self.current.text in {"fn", "unsafe"}:
+                # A `const fn` method behaves like any other method at run time.
+                constant = None
+            if self.current.text == "unsafe" and self.peek() == "fn":
+                self.advance()
             if not constant:
                 self.expect("fn")
             name = self.identifier()
@@ -3803,6 +3990,19 @@ class Parser:
             if function.body is not None or (self.in_std and not declaration):
                 program.functions[internal.text] = function
         return methods, associated
+
+    def skip_member(self):
+        depth = 0
+        while True:
+            token = self.advance()
+            if token.text in {"(", "[", "{"}:
+                depth += 1
+            elif token.text in {")", "]", "}"}:
+                depth -= 1
+                if depth == 0 and token.text == "}":
+                    break
+            elif token.text == ";" and depth == 0:
+                break
 
     def associated_where(self, lifetimes):
         if not self.accept("where"):
@@ -3869,6 +4069,8 @@ class Parser:
         return lifetimes, types
 
     def trait_path(self):
+        if self.current.text == "::" and self.peek() in STD_CRATES:
+            self.advance()
         token = self.advance() if self.current.text in {"crate", "self", "super"} else self.identifier()
         parts = [token.text]
         while self.accept("::"):
@@ -4103,9 +4305,18 @@ class Parser:
 
     def attributes(self):
         derives = {}
+        self.cfg_disabled = False
         while self.current.text == "#" and self.peek() == "[":
             self.expect("#")
             self.expect("[")
+            if self.current.text == "cfg" and self.peek() == "(":
+                self.advance()
+                self.expect("(")
+                if not self.cfg_predicate():
+                    self.cfg_disabled = True
+                self.expect(")")
+                self.expect("]")
+                continue
             if self.current.text != "derive":
                 # repr, allow, inline, must_use, doc, and similar attributes do not change behaviour here.
                 depth = 1
@@ -4148,16 +4359,40 @@ class Parser:
             self.expect("{")
             variants = set()
             while self.current.text != "}":
-                marker = self.accept("#")
-                if marker:
+                marker = None
+                disabled = False
+                while self.current.text == "#":
+                    hash_token = self.advance()
                     self.expect("[")
-                    self.expect("default")
-                    self.expect("]")
+                    if self.current.text == "default" and self.peek() == "]":
+                        marker = hash_token
+                        self.expect("default")
+                        self.expect("]")
+                        continue
+                    if self.current.text == "cfg" and self.peek() == "(":
+                        self.advance()
+                        self.expect("(")
+                        disabled = disabled or not self.cfg_predicate()
+                        self.expect(")")
+                        self.expect("]")
+                        continue
+                    # allow, doc, and similar variant attributes do not change behaviour here.
+                    depth = 1
+                    while depth:
+                        token = self.advance()
+                        depth += {"[": 1, "]": -1}.get(token.text, 0)
                 variant = self.identifier()
-                if variant.text in variants:
+                if variant.text in variants and not disabled:
                     raise variant.error(f"duplicate variant {variant.text!r}")
-                variants.add(variant.text)
+                if not disabled:
+                    variants.add(variant.text)
                 ctor = self.constructor(name.text, f"{name.text}::{variant.text}")
+                if disabled:
+                    if self.accept("="):
+                        self.expression()
+                    if not self.accept(","):
+                        break
+                    continue
                 if self.accept("="):
                     discriminant = self.const_expression(self.expression(), "i128")
                     program.discriminants[ctor.path] = discriminant.value
@@ -4186,20 +4421,28 @@ class Parser:
         if self.accept("{"):
             names = set()
             while self.current.text != "}":
+                self.cfg_disabled = False
+                if self.current.text == "#" and self.peek() == "[":
+                    self.attributes()
+                disabled = self.cfg_disabled
                 visible = self.field_visibility(variant)
                 name = self.identifier()
-                if name.text in names:
+                if name.text in names and not disabled:
                     raise name.error(f"duplicate field {name.text!r}")
-                names.add(name.text)
                 self.expect(":")
-                fields.append((name.text, self.type_name(static_string=True)))
-                visibility.append((name.text, visible))
+                kind = self.type_name(static_string=True)
+                if not disabled:
+                    names.add(name.text)
+                    fields.append((name.text, kind))
+                    visibility.append((name.text, visible))
                 if not self.accept(","):
                     break
             self.expect("}")
             return Constructor(path, annotation, "record", tuple(fields), tuple(visibility))
         if self.accept("("):
             while self.current.text != ")":
+                if self.current.text == "#" and self.peek() == "[":
+                    self.attributes()
                 visible = self.field_visibility(variant)
                 name = str(len(fields))
                 fields.append((name, self.type_name(static_string=True)))
@@ -4221,7 +4464,12 @@ class Parser:
         token = self.expect("{")
         statements = []
         tail = None
+        discard_from = None
         while self.current.text != "}":
+            if discard_from is not None and len(statements) > discard_from:
+                # The statement after a false #[cfg(...)] is parsed and then dropped.
+                del statements[discard_from:]
+                discard_from = None
             if marker := self.accept("@macro_definition"):
                 statements.append(Expr("macro_definition", marker))
                 continue
@@ -4229,6 +4477,8 @@ class Parser:
                 continue
             if self.current.text == "#" and self.peek() == "[":
                 self.attributes()
+                if self.cfg_disabled:
+                    discard_from = len(statements)
                 continue
             let = self.accept("let")
             if let:
@@ -4255,6 +4505,10 @@ class Parser:
                 statements.append(Expr("discard", value.token, (value, True)))
             else:
                 raise self.current.error("expected ';' or '}'")
+        if discard_from is not None:
+            del statements[discard_from:]
+            if tail is not None and len(statements) == discard_from:
+                tail = None
         self.expect("}")
         return Expr("block", token, (statements, tail))
 
@@ -4382,7 +4636,7 @@ class Parser:
         if self.current.text == "unsafe" and self.peek() == "{":
             self.advance()
             return self.block()
-        token = self.advance()
+        token = self.extern_crate_path(self.advance())
         word = token.text
         if word.startswith("@host:"):
             word = word.removeprefix("@host:")
@@ -4572,6 +4826,7 @@ class Parser:
                 item = self.modules.lazy_items[path.text]
                 return Expr("lazy_" + item.kind, path, (item,))
             if allow_record and self.current.text == "{":
+                path, type_arguments = self.alias_record_path(path, type_arguments)
                 return Expr("record", path, self.record_fields(self.expression, "name"),
                             type_arguments=type_arguments)
             if self.current.text == "(":
@@ -5001,7 +5256,7 @@ class Parser:
         return Expr("pattern_range", separator, (first, last, separator.text == "..="))
 
     def simple_pattern(self):
-        token = self.advance()
+        token = self.extern_crate_path(self.advance())
         if token.text == "&&":
             self.lookahead.appendleft(self.current)
             self.current = replace(token, text="&", column=token.column + 1)
@@ -5062,6 +5317,7 @@ class Parser:
         if path.text in self.statics:
             raise path.error("a pattern binding cannot shadow a static item")
         if self.current.text == "{":
+            path, type_arguments = self.alias_record_path(path, type_arguments)
             return Expr("pattern_record", path, self.record_fields(self.pattern, "bind"),
                         type_arguments=type_arguments)
         if self.accept("("):
@@ -5081,11 +5337,16 @@ class Parser:
         self.expect("{")
         arms = []
         while self.current.text != "}":
+            self.cfg_disabled = False
+            if self.current.text == "#" and self.peek() == "[":
+                self.attributes()
+            disabled = self.cfg_disabled
             pattern = self.pattern()
             guard = self.expression(allow_record=False) if self.accept("if") else None
             self.expect("=>")
             body = self.expression(statement=self.current.text == "{")
-            arms.append((pattern, guard, body))
+            if not disabled:
+                arms.append((pattern, guard, body))
             if not self.accept(",") and body.kind not in BLOCK_EXPRESSIONS:
                 break
         self.expect("}")
@@ -14544,7 +14805,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
         program.traits_in_scope[unit.path] = unit.hidden_traits | prelude_traits | {
             symbol.name for symbol in symbols.values() if symbol and symbol.kind == "trait"
         }
-        program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
+        program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in (symbols | unit.values).items()
                                               if symbol and symbol.kind == "fn"}
         program.constants_in_scope[unit.path] = {name: scalars[symbol.name] for name, symbol in symbols.items()
                                                  if symbol and symbol.kind in {"const", "static"}
