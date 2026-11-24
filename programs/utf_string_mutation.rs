@@ -1,0 +1,52 @@
+fn main() {
+    let mut s = String::from("héllo");
+    s.insert(0, '¡');
+    println!("{} {}", s, s.len());
+    let end = s.len();
+    s.insert_str(end, " wörld");
+    println!("{}", s);
+    let removed = s.remove(2);
+    println!("removed {} -> {}", removed, s);
+    let popped = s.pop();
+    println!("{:?} {}", popped, s);
+    s.truncate(6);
+    println!("{} {}", s, s.len());
+    let drained: String = s.drain(..4).collect();
+    println!("drained {:?} left {:?}", drained, s);
+    let mut t = String::from("The quick brown fox");
+    t.replace_range(4..9, "slow");
+    println!("{}", t);
+    t.replace_range(..3, "A");
+    println!("{}", t);
+    t.retain(|c| c != 'o');
+    println!("{}", t);
+    let mut u = String::from("ñandú 🦀 añejo");
+    u.retain(|c| c.is_ascii());
+    println!("{:?}", u);
+    let mut v = String::with_capacity(4);
+    v.push('日');
+    v.push_str("本");
+    v.extend(['語', '!'].iter());
+    println!("{} {}", v, v.len());
+    v.clear();
+    println!("{:?} {}", v, v.is_empty());
+    let mut w = String::from("abc");
+    while let Some(c) = w.pop() {
+        print!("{}", c);
+    }
+    println!();
+    let mut x = String::from("hello");
+    x.insert(5, '!');
+    let idx = x.find('l').unwrap();
+    x.insert_str(idx, "--");
+    println!("{}", x);
+    let mut y = "a,b,c".to_string();
+    let tail = y.split_off(2);
+    println!("{} | {}", y, tail);
+    let mut z = String::from("🦀🦀🦀");
+    z.truncate(4);
+    println!("{} {}", z, z.len());
+    let mut d = String::from("αβγδε");
+    let mid: String = d.drain(2..6).collect();
+    println!("{} {}", mid, d);
+}

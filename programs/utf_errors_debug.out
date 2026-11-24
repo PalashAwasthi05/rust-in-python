@@ -1,0 +1,18 @@
+0
+incomplete utf-8 byte sequence from index 1
+Utf8Error { valid_up_to: 1, error_len: None }
+None
+[97, 195]
+[97, 195]
+Ok("ok")
+Err(Utf8Error { valid_up_to: 1, error_len: Some(1) })
+incomplete utf-8 byte sequence from index 0 | up_to=0 len=None
+invalid utf-8 sequence of 1 bytes from index 0 | up_to=0 len=Some(1)
+invalid utf-8 sequence of 1 bytes from index 0 | up_to=0 len=Some(1)
+invalid utf-8 sequence of 2 bytes from index 1 | up_to=1 len=Some(2)
+A�A��
+true
+Err("invalid utf-8 sequence of 1 bytes from index 0")
+None
+Some("é")
+Some("hé")

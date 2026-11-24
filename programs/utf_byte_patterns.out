@@ -1,0 +1,19 @@
+0
+ 97 'a' letter
+ 49 '1' digit
+ 32 ' ' space
+195 'Ã' non-ascii
+169 '©' non-ascii
+ 33 '!' other
+get /index.html
+starts with GET
+total 363
+true
+é
+'é'
+true
+Some(2)
+a=3 b=1 n=2
+Hi
+[116, 97, 98, 9, 113, 117, 111, 116, 101, 34]
+[99, 98, 97]

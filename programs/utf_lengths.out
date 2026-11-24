@@ -1,0 +1,15 @@
+0
+"hello": bytes=5 chars=5 empty=false
+"café": bytes=5 chars=4 empty=false
+"日本語": bytes=9 chars=3 empty=false
+"🦀 crab": bytes=9 chars=6 empty=false
+"": bytes=0 chars=0 empty=true
+"naïve résumé": bytes=15 chars=12 empty=false
+owned len 7 chars 5
+a len_utf8=1 len_utf16=1 as u32=97
+é len_utf8=2 len_utf16=1 as u32=233
+日 len_utf8=3 len_utf16=1 as u32=26085
+🦀 len_utf8=4 len_utf16=2 as u32=129408
+ß len_utf8=2 len_utf16=1 as u32=223
+total bytes 43
+most chars: naïve résumé

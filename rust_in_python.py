@@ -5721,6 +5721,35 @@ class Parser:
 
 
 ESCAPES = {'n': '\n', 'r': '\r', 't': '\t', '0': '\0', '"': '"', "'": "'", '\\': '\\'}
+# Grapheme_Extend characters outside the Mn and Me categories, which Rust escapes in Debug output.
+GRAPHEME_EXTEND_EXTRA = frozenset(
+    "\u200c\uff9e\uff9f\u09be\u09d7\u0b3e\u0b57\u0bbe\u0bd7\u0cc0\u0cc2\u0cc7\u0cc8\u0cca\u0ccb\u0cd5\u0cd6"
+    "\u0d3e\u0d57\u0dcf\u0ddf\u1715\u1734\u1b35\u1b3b\u1b3d\u1b43\u1b44\u1baa\u1bf2\u1bf3\u302e\u302f\ua953"
+    "\ua9c0\U000111c0\U00011235\U0001133e\U0001134d\U00011357\U000113b8\U000113c2\U000113c5\U000113c7"
+    "\U000113c8\U000113c9\U000113cf\U000114b0\U000114bd\U000115af\U000116b6\U00011930\U0001193d\U00011f41"
+    "\U00016ff0\U00016ff1\U0001d165\U0001d166\U0001d16d\U0001d16e\U0001d16f\U0001d170\U0001d171\U0001d172")
+
+
+def grapheme_extended(char):
+    return unicodedata.category(char) in {"Mn", "Me"} or char in GRAPHEME_EXTEND_EXTRA
+
+
+def rust_escape(text, mode):
+    """Rust's escape_debug, escape_default, or escape_unicode of a str or char."""
+    parts = []
+    for index, char in enumerate(text):
+        named = next((key for key, item in ESCAPES.items() if item == char), None)
+        if mode == "unicode" or named is None and (
+                not " " <= char <= "~" if mode == "default"
+                else not char.isprintable() or index == 0 and grapheme_extended(char)):
+            parts.append(f"\\u{{{ord(char):x}}}")
+        elif named is not None and (mode == "debug" or char != "\0"):
+            parts.append("\\" + named)
+        elif named is not None:
+            parts.append("\\u{0}")
+        else:
+            parts.append(char)
+    return "".join(parts)
 STRING_ESCAPE = re.compile(r'\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,12}\}|\n\s*|.)')
 
 
@@ -10483,6 +10512,16 @@ class Checker:
                 peeled_left, peeled_right = self.resolve(left), self.resolve(right)
                 while isinstance(peeled_left, ReferenceType) and isinstance(peeled_right, ReferenceType):
                     peeled_left, peeled_right = self.resolve(peeled_left.inner), self.resolve(peeled_right.inner)
+                if word in {"==", "!="}:
+                    # Vec<T> == &[U; N], [T; N] == &[U], and &[T] == Vec<U> compare through one reference.
+                    def sequence(kind):
+                        return is_vector(kind) or isinstance(kind, (ArrayType, SliceType))
+                    if sequence(peeled_left) and isinstance(peeled_right, ReferenceType) and sequence(
+                            self.resolve(peeled_right.inner)):
+                        peeled_right = self.resolve(peeled_right.inner)
+                    elif sequence(peeled_right) and isinstance(peeled_left, ReferenceType) and sequence(
+                            self.resolve(peeled_left.inner)):
+                        peeled_left = self.resolve(peeled_left.inner)
                 text_pair = {peeled_left, peeled_right} in ({STRING, STR_REFERENCE}, {STRING, "str"})
                 trait = "PartialEq" if word in {"==", "!="} else "PartialOrd"
                 cross = (peeled_left != peeled_right and not isinstance(peeled_left, TypeVariable)
@@ -12052,8 +12091,11 @@ def format_value(value, annotation, spec):
     elif isinstance(value, float) and spec.precision is not None and math.isfinite(value):
         text = format(value, f".{spec.precision}f")
     else:
-        text = display(value, False)
-        if spec.precision is not None and not numeric:
+        text = display(value, kind == "?")
+        if kind == "?" and isinstance(value, str):
+            # Debug for str and char writes the quoted text directly, ignoring width and fill.
+            return text
+        if spec.precision is not None and not numeric and kind == "":
             text = text[:spec.precision]
     return pad_formatted(text, numeric, spec, prefix)
 
@@ -12774,8 +12816,24 @@ class Interpreter:
             return None if index < 0 else (index, index + len(needle))
         return find
 
+    def reverse_matches(self, text, pattern):
+        """Yield non-overlapping matches searched from the end, as rfind and rmatch_indices see them."""
+        needle = text_of(pattern) if isinstance(pattern, (Address, StringAddress, SliceAddress)) else pattern
+        if not isinstance(needle, str) or isinstance(needle, Character):
+            yield from reversed(list(all_matches(self, text, pattern)))
+            return
+        stop = len(text)
+        while stop >= 0:
+            index = text.rfind(needle, 0, stop)
+            if index < 0:
+                return
+            yield index, index + len(needle)
+            stop = index if needle else index - 1
+
     def find_pattern(self, text, pattern, *, anchored=None, reverse=False):
         """Find a pattern in text, returning character offsets (start, stop) or None."""
+        if reverse and anchored is None:
+            return next(self.reverse_matches(text, pattern), None)
         find = self.pattern_matcher(pattern)
         matches = []
         start = 0
@@ -14329,6 +14387,16 @@ def text_of(value):
     return value
 
 
+def utf8_boundaries(data, *offsets):
+    """Panic unless each byte offset lies on a UTF-8 character boundary of data, like str indexing does."""
+    for offset in offsets:
+        if offset > len(data):
+            raise RustPanic(f"byte index {offset} is out of bounds")
+        if offset < len(data) and data[offset] & 0xC0 == 0x80:
+            raise RustPanic(f"byte index {offset} is not a char boundary")
+    return data
+
+
 def child(address, index):
     return address.child(Offset(index))
 
@@ -14414,9 +14482,7 @@ def method_split_last(interpreter, result, items):
 def method_split_at(interpreter, result, items, middle):
     value = text_of(items)
     if isinstance(value, str):
-        data = value.encode()
-        if middle > len(data):
-            raise RustPanic("byte index out of bounds")
+        data = utf8_boundaries(value.encode(), middle)
         parts = (shared(data[:middle].decode()), shared(data[middle:].decode()))
     else:
         values = items_of(items)
@@ -14697,6 +14763,7 @@ def method_remove(interpreter, result, items, index):
         data = value.encode()
         if index >= len(data):
             raise RustPanic("cannot remove a char from the end of a string")
+        utf8_boundaries(data, index)
         removed = data[index:].decode()[0]
         items.write(data[:index].decode() + data[index + len(removed.encode()):].decode())
         return Character(removed)
@@ -14812,7 +14879,7 @@ def method_dedup_by(interpreter, result, items, same):
 def method_split_off(interpreter, result, items, at):
     value = items.read()
     if isinstance(value, str):
-        data = value.encode()
+        data = utf8_boundaries(value.encode(), at)
         items.write(data[:at].decode())
         return data[at:].decode()
     if at > len(value.items):
@@ -14853,7 +14920,7 @@ def method_drain(interpreter, result, items, bounds):
     if start is None:
         raise RustPanic(f"range end index out of range for slice of length {size}")
     if isinstance(value, str):
-        data = value.encode()
+        data = utf8_boundaries(value.encode(), start, stop)
         items.write((data[:start] + data[stop:]).decode())
         return lazy(map(Character, data[start:stop].decode()))
     items.write(ArrayValue(value.items[:start] + value.items[stop:]))
@@ -15119,6 +15186,14 @@ def method_split_terminator(interpreter, result, text, pattern):
 
 
 @intrinsic
+def method_rsplit_terminator(interpreter, result, text, pattern):
+    parts = interpreter.split_text(text_of(text), pattern)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return lazy(map(shared, reversed(parts)))
+
+
+@intrinsic
 def method_split_inclusive(interpreter, result, text, pattern):
     value = text_of(text)
     parts, start = [], 0
@@ -15265,7 +15340,15 @@ def method_matches(interpreter, result, text, pattern):
 @intrinsic
 def method_rmatches(interpreter, result, text, pattern):
     value = text_of(text)
-    return lazy(shared(value[a:b]) for a, b in reversed(list(all_matches(interpreter, value, pattern))))
+    return lazy(shared(value[a:b]) for a, b in interpreter.reverse_matches(value, pattern))
+
+
+@intrinsic
+def method_rmatch_indices(interpreter, result, text, pattern):
+    value = text_of(text)
+    pair = element_type(result)
+    return lazy(make_tuple(interpreter, pair, byte_offset(value, a), shared(value[a:b]))
+                for a, b in interpreter.reverse_matches(value, pattern))
 
 
 @intrinsic
@@ -15368,20 +15451,44 @@ def method_is_ascii(interpreter, result, text):
 
 @intrinsic
 def method_escape_default(interpreter, result, text):
-    escapes = {"\t": "\\t", "\r": "\\r", "\n": "\\n", "'": "\\'", '"': '\\"', "\\": "\\\\"}
-    return "".join(escapes.get(char) or (char if " " <= char <= "~" else f"\\u{{{ord(char):x}}}")
-                   for char in text_of(text))
+    return rust_escape(text_of(text), "default")
 
 
 @intrinsic
 def method_escape_debug(interpreter, result, text):
-    text = text_of(text)
-    return escape_debug_text(text, "'\"", None if isinstance(text, Character) else 1)
+    return rust_escape(text_of(text), "debug")
 
 
 @intrinsic
 def method_escape_unicode(interpreter, result, text):
-    return "".join(f"\\u{{{ord(char):x}}}" for char in text_of(text))
+    return rust_escape(text_of(text), "unicode")
+
+
+@intrinsic
+def method_encode_utf16(interpreter, result, text):
+    data = text_of(text).encode("utf-16-le")
+    return lazy(int.from_bytes(data[index:index + 2], "little") for index in range(0, len(data), 2))
+
+
+@intrinsic
+def method_utf16_decode(interpreter, result, units, lossy):
+    data = b"".join(unit.to_bytes(2, "little") for unit in items_of(units))
+    try:
+        return option(interpreter, result, data.decode("utf-16-le"))
+    except UnicodeDecodeError:
+        return option(interpreter, result, data.decode("utf-16-le", errors="replace")) if lossy else option(
+            interpreter, result)
+
+
+@intrinsic
+def method_encode_utf8(interpreter, result, value, destination):
+    data = text_of(value).encode()
+    items = items_of(destination)
+    if len(data) > len(items):
+        raise RustPanic(f"encode_utf8: need {len(data)} bytes to encode U+{ord(text_of(value)):04X}, "
+                        f"but the buffer has {len(items)}")
+    destination.write(ArrayValue((*data, *items[len(data):])))
+    return Address(Binding(str(text_of(value)), True))
 
 
 @intrinsic
@@ -15389,9 +15496,19 @@ def method_from_utf8(interpreter, result, data):
     raw = bytes(items_of(data))
     try:
         return interpreter.variant(result, "Ok", raw.decode("utf-8"))
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as failure:
         error = result.arguments[1]
-        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (data,)))
+        detail = utf8_error(interpreter, interpreter.program.layout(error)[1][0].fields[1][1], failure)
+        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (data, detail)))
+
+
+def utf8_error(interpreter, annotation, failure):
+    """A std::str::Utf8Error for a failed Python decode, with rustc's maximal-subpart error length."""
+    length = AppliedType(OPTION, ("u8",))
+    incomplete = failure.reason == "unexpected end of data"
+    error_len = (interpreter.variant(length, "None") if incomplete
+                 else interpreter.variant(length, "Some", failure.end - failure.start))
+    return Value(interpreter.program.layout(annotation)[1][0], (failure.start, error_len))
 
 
 @intrinsic
@@ -15405,6 +15522,7 @@ def method_replace_range(interpreter, result, address, bounds, replacement):
     start, stop = interpreter.range_bounds(bounds, len(data))
     if start is None:
         raise RustPanic("range out of bounds")
+    utf8_boundaries(data, start, stop)
     address.write((data[:start] + text_of(replacement).encode() + data[stop:]).decode())
 
 
@@ -16895,8 +17013,7 @@ def rust_from_utf8(interpreter, result, data):
     try:
         return interpreter.variant(result, "Ok", shared(raw.decode("utf-8")))
     except UnicodeDecodeError as error:
-        return interpreter.variant(result, "Err", Value(interpreter.program.layout(result.arguments[1])[1][0],
-                                                        (error.start,)))
+        return interpreter.variant(result, "Err", utf8_error(interpreter, result.arguments[1], error))
 
 
 @intrinsic

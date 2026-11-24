@@ -1,0 +1,60 @@
+use std::convert::TryFrom;
+
+fn main() {
+    let s = "héllo wörld";
+    println!("{:?}", s[1..].chars().next());
+    let b: &[u8] = s.as_bytes();
+    println!("{:?}", &b[1..3]);
+    println!("{}", char::from(233u8));
+    println!("{:?}", s.bytes().nth(1));
+    println!("{}", "ß".to_uppercase().len());
+    println!("{}", 'ß'.is_lowercase());
+    println!("{} {}", "İ".to_lowercase(), "İ".to_lowercase().len());
+    for (i, c) in s.chars().rev().enumerate().take(3) {
+        print!("{}{} ", i, c);
+    }
+    println!();
+    println!("{:?}", b.iter().rposition(|&x| x == b'o'));
+    let fixed = String::from_utf8(vec![0x61, 0xff]).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    println!("{}", fixed);
+    let cow = String::from_utf8_lossy(b"plain");
+    println!("{} {}", cow, cow.len());
+    let owned: String = cow.to_string();
+    println!("{}", owned);
+    let v = b"abc".to_vec();
+    println!("{}", v == b"abc");
+    println!("{}", &v[..] == b"abc");
+    println!("{}", v.as_slice() == "abc".as_bytes());
+    println!("{}", "abc1".bytes().all(|b| b.is_ascii_alphanumeric()));
+    println!("{:?}", char::from_digit(35, 36));
+    println!("{}", (b'n'.wrapping_add(13)) as char);
+    println!("{:?}", s.char_indices().filter(|(_, c)| !c.is_ascii()).map(|(i, _)| i).last());
+    println!("{}", "a\u{0}b".len());
+    println!("{:?}", u8::try_from('é'));
+    println!("{:?}", u8::try_from('e'));
+    println!("{:?}", char::try_from(233u32));
+    println!("{:?}", char::try_from(0xD800u32).is_err());
+    let rev: String = ('a'..='e').rev().collect();
+    println!("{}", rev);
+    let boxed: Box<str> = "boxed".into();
+    println!("{}", boxed);
+    println!("{}", String::from('é') + &'x'.to_string());
+    println!("{:?}", "é".as_bytes());
+    println!("{}", s.to_owned().len());
+    let mut chars = s.chars();
+    chars.next();
+    println!("{}", chars.as_str());
+    println!("{:?}", "a,b,,c".split(',').rev().collect::<Vec<_>>());
+    println!("{:?}", "a b  c".split(' ').collect::<Vec<_>>());
+    println!("{:?}", "AbcDef".find(char::is_lowercase));
+    println!("{:?}", "über".char_indices().map(|(i, c)| format!("{}{}", i, c)).collect::<Vec<_>>().concat());
+    println!("{}", "Hello".chars().all(char::is_alphabetic));
+    println!("{}", "x".cmp("é") == std::cmp::Ordering::Less);
+    println!("{:?}", "αβγ".chars().position(|c| c == 'γ'));
+    println!("{:?}", "αβγ".find('γ'));
+    let bytes = "hi".as_bytes().to_owned();
+    println!("{:?}", bytes);
+    println!("{}", std::str::from_utf8(&bytes).map(|s| s.len()).unwrap_or(0));
+    println!("{:?}", "end".char_indices().last());
+    println!("{}", "ÅÄÖ".chars().map(|c| c.len_utf8()).sum::<usize>());
+}

@@ -1,0 +1,20 @@
+0
+STRASSE
+straße
+école ünïcödé
+GROß
+true
+false
+MAKE ME LOUD é
+make me loud é
+ß -> SS / ß alpha=true upper=false
+é -> É / é alpha=true upper=false
+İ -> İ / i̇ alpha=true upper=true
+a -> A / a alpha=true upper=false
+1 -> 1 / 1 alpha=false upper=false
+2
+A
+true
+true
+false
+Hello Wörld

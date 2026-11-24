@@ -1,0 +1,16 @@
+0
+ok: alice starts with byte 97
+ok: élodie starts with byte 233
+error: unicode code point out of range
+error: invalid utf-8 sequence of 1 bytes from index 3
+error: empty name
+0x41 -> 'A'
+0x1f980 -> '🦀'
+0xdfff -> error: converted integer out of range for `char`
+0x110000 -> error: converted integer out of range for `char`
+Some(1)
+error: incomplete utf-8 byte sequence from index 0
+converted integer out of range for `char` | CharTryFromError(())
+unicode code point out of range | TryFromCharError(())
+Ok(26085)
+y
