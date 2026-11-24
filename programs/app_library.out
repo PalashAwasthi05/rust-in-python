@@ -1,0 +1,37 @@
+0
+day  1: ana borrows 'Dune' until day 15
+day  1: ERROR 'Dune' is out with ana
+day  2: ben reserves 'Dune' (position 1)
+day  2: cho reserves 'Dune' (position 2)
+day  2: ERROR ben already waiting for 'Dune'
+day  3: cho borrows 'Cosmos' until day 10
+day  3: dev borrows 'Matilda' until day 13
+day  4: ERROR no member zed
+day  5: ERROR no book 999
+day 12: audit: 3 out, overdue ["102@cho"]
+day 20: ana returns 'Dune' 5 days late, fee 75; ben is next
+day 20: ERROR 'Dune' is reserved for ben
+day 21: ben borrows 'Dune' until day 35
+day 22: cho returns 'Cosmos' 12 days late, fee 300
+day 22: audit: 2 out, overdue ["104@dev"]
+day 25: dev returns 'Matilda' 12 days late, fee 60
+day 26: ERROR dev does not hold 104
+day 30: ana borrows 'Foundation' until day 44
+day 30: dev borrows 'SPQR' until day 51
+day 60: audit: 3 out, overdue ["101@ben", "103@dev", "105@ana"]
+day 61: ben returns 'Dune' 26 days late, fee 390; cho is next
+day 70: dev returns 'SPQR' 19 days late, fee 475
+day 71: cho borrows 'SPQR' until day 92
+-- members --
+Member { name: "ana", loans: [105], fees: 75 } history=[101, 105]
+Member { name: "ben", loans: [], fees: 390 } history=[101]
+Member { name: "cho", loans: [103], fees: 300 } history=[102, 103]
+Member { name: "dev", loans: [], fees: 535 } history=[104, 103]
+-- popular --
+1. Dune         x2
+2. SPQR         x2
+3. Cosmos       x1
+by genre: {Fiction: [101, 105], Science: [102], History: [103], Kids: [104]}
+overdue audit days: {12, 22, 60}, after day 20: [22, 60]
+total fees 1300, book strong counts [1, 1, 2, 1, 2]
+2>=1<2>=1>=

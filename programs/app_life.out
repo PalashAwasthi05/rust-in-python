@@ -1,0 +1,58 @@
+0
+glider gen 0 pop 5:
++------------+
+|.#..........|
+|..#.........|
+|###.........|
+|............|
+|............|
+|............|
+|............|
+|............|
++------------+
+glider gen 4 pop 5:
++------------+
+|............|
+|..#.........|
+|...#........|
+|.###........|
+|............|
+|............|
+|............|
+|............|
++------------+
+glider       -> Running(7), final pop 5, bbox Some(((2, 2), (4, 4)))
+blinker      -> Oscillator { period: 2, from: 0 }, final pop 3, bbox Some(((3, 5), (3, 7)))
+toad         -> Oscillator { period: 2, from: 0 }, final pop 6, bbox Some(((3, 6), (4, 9)))
+block        -> StillLife(0), final pop 4, bbox Some(((0, 0), (1, 1)))
+r-pentomino gen 0 pop 5:
++------------+
+|............|
+|............|
+|.......##...|
+|......##....|
+|.......#....|
+|............|
+|............|
+|............|
++------------+
+r-pentomino gen 7 pop 11:
++------------+
+|.......#....|
+|.....##.##..|
+|.....#......|
+|.....#...#..|
+|......###...|
+|............|
+|............|
+|............|
++------------+
+r-pentomino  -> Running(7), final pop 18, bbox Some(((0, 4), (5, 9)))
+diehard      -> Running(7), final pop 12, bbox Some(((2, 4), (6, 10)))
+odd shape    -> Running(7), final pop 9, bbox Some(((3, 4), (6, 8)))
+gen 1 pop 5 same-as-start false
+gen 2 pop 5 same-as-start false
+gen 3 pop 5 same-as-start false
+gen 4 pop 5 same-as-start false
+glider wrapped to the origin: true
+default cell is Dead

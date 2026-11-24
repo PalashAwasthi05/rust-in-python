@@ -1,0 +1,36 @@
+0
+a.c                      "abc"                      => "abc"
+a.c                      "xxa-cxx"                  => "a-c"
+a.c                      "ac"                       => no match
+^h(e|a)llo$              "hello"                    => "hello" [Some("e")]
+^h(e|a)llo$              "hallo"                    => "hallo" [Some("a")]
+^h(e|a)llo$              "hullo"                    => no match
+^h(e|a)llo$              "hello!"                   => no match
+colou?r                  "color"                    => "color"
+colou?r                  "the colour red"           => "colour"
+colou?r                  "colouur"                  => no match
+[a-c]+[^0-9]?\d{2,3}     "zzabba!123"               => "abba!123"
+[a-c]+[^0-9]?\d{2,3}     "c7"                       => no match
+[a-c]+[^0-9]?\d{2,3}     "ab12345"                  => "ab123"
+[a-c]+[^0-9]?\d{2,3}     "x99"                      => no match
+(\w+)@(\w+)\.com         "mail bob@example.com now" => "bob@example.com" [Some("bob"), Some("example")]
+(\w+)@(\w+)\.com         "no at sign"               => no match
+<.+>                     "<a><b>"                   => "<a><b>"
+<.+?>                    "<a><b>"                   => "<a>"
+(a|ab)(c|bcd)(d*)        "abcd"                     => "abcd" [Some("a"), Some("bcd"), Some("")]
+x*                       ""                         => ""
+x*                       "yyy"                      => ""
+(\d+)-(\d+)?             "10-"                      => "10-" [Some("10"), None]
+(\d+)-(\d+)?             "10-20"                    => "10-20" [Some("10"), Some("20")]
+([A-Z][a-z]*\s?){2}      "say Hello World ok"       => "Hello World " [Some("World ")]
+(a*)*b                   "aaab"                     => "aaab" [Some("aaa")]
+(a*)*b                   "aaa"                      => no match
+"a{3": unclosed { at position 3
+"*a": nothing to repeat at position 0
+"(ab": missing ) at position 3
+"ab)": unmatched ) at position 2
+"[abc": unclosed [ at position 4
+"a{5,2}": bad repetition range at position 5
+"^*": nothing to repeat at position 1
+"a\\": trailing backslash at position 2
+groups=1 root=Concat([Char('a'), Repeat { node: Group(Alt([Concat([Char('b')]), Concat([Char('c')])]), 1), min: 0, max: None, greedy: true }])

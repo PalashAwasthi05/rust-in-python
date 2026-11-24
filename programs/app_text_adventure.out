@@ -1,0 +1,81 @@
+0
+> look
+== Cellar ==
+Damp stone walls. Stairs lead up.
+Exits: up
+You see: lamp
+> take lamp
+Taken: lamp.
+> n
+You can't go north from here.
+> go up
+== Kitchen ==
+Pots hang from hooks.
+Exits: down, east, south
+You see: bread, knife
+> take the bread
+Taken: bread.
+> take knife
+Taken: knife.
+> s
+== Garden ==
+Overgrown roses.
+Exits: north
+You see: rose
+> take rose
+Taken: rose.
+> dance
+?? I don't know how to 'dance'
+> go
+?? go where?
+> north
+== Kitchen ==
+Pots hang from hooks.
+Exits: down, east, south
+> e
+== Great Hall ==
+A long table runs the length of the hall.
+Exits: north, up, west
+> n
+It is pitch dark. You might be eaten by a grue.
+> take old key
+You fumble around in the dark.
+> use lamp
+The lamp is now on.
+> look
+== Library ==
+Shelves of crumbling books.
+Exits: south
+You see: old key, book
+> take the old key
+Taken: old key.
+> take book
+Taken: book.
+> drop knife
+Dropped.
+> look
+== Library ==
+Shelves of crumbling books.
+Exits: south
+You see: knife
+> i
+You carry: lamp, bread, book, rose, old key
+> use bread
+Delicious.
+> s
+== Great Hall ==
+A long table runs the length of the hall.
+Exits: north, up, west
+> u
+== Tower Top ==
+Wind howls. A locked chest sits here.
+Exits: down
+You see: chest
+> take chest
+The chest is far too heavy.
+> use rose
+Using the rose in the Tower does nothing.
+> use old key
+The chest creaks open, revealing treasure!
+(ignoring 'look': game over)
+state=Won moves=25 score=90 visited=[Cellar, Kitchen, Hall, Library, Tower, Garden]

@@ -1,0 +1,36 @@
+0
+ 0: deposited $25.50 to #100
+ 1: withdrew $70.00 from #102
+ 2: REJECTED Withdraw(102, 2000): account #102 has -$40.00 but $20.00 was requested
+ 3: moved $1234.56 #101 -> #104
+ 4: moved $400.00 #103 -> #102
+ 5: REJECTED Transfer { from: 104, to: 104, amount: 1 }: cannot transfer to the same account
+ 6: REJECTED Deposit(999, 10): account #999 does not exist
+ 7: REJECTED Withdraw(100, -5): invalid amount -5
+ 8: froze #104
+ 9: REJECTED Deposit(104, 100): account #104 is frozen
+10: REJECTED Transfer { from: 100, to: 104, amount: 100 }: account #104 is frozen
+11: thawed #104
+12: #104 was not frozen
+13: REJECTED Withdraw(103, 200000): account #103 has -$400.00 but $2000.00 was requested
+14: REJECTED Withdraw(102, 45000): account #102 has $360.00 but $450.00 was requested
+15: month end: #101 $7.53, #103 -$8.00, #104 $3.96
+16: month end: #101 $7.54, #103 -$8.16, #104 $3.97
+recent: ["REJECTED Withdraw(102, 45000): account #102 has $360.00 but $450.00 was requested", "month end: #101 $7.53, #103 -$8.00, #104 $3.96", "month end: #101 $7.54, #103 -$8.16, #104 $3.97"]
+--------------- accounts ---------------
+#100 alice    Checking     $145.50
+#101 alice    Savings     $3780.51
+#102 bob      Checking     $360.00
+#103 bob      Credit      -$416.16
+#104 carol    Savings     $1992.49
+-------------- net worth ---------------
+alice         $3926.01
+carol         $1992.49
+bob            -$56.16
+--------------- by kind ----------------
+Checking    2      $505.50
+Savings     2     $5773.00
+Credit      1     -$416.16
+bank total $5862.34
+    -$123.45|$0.05       |$1000000.00 |
+richest single account: Some("alice")
