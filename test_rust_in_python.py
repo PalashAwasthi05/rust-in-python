@@ -1516,6 +1516,37 @@ VALID = [
             for n in selected.iter() { println!("{n}"); }
         }
     """, "3\n2\n1\n1\n2\n3\n8\n6\n4\n2\n0\n1\n8\n"),
+    ("iterator map is lazy and reverses the order of mapper calls", """
+        struct Item(i32);
+        fn show(n: i32) -> Item { println!("map {n}"); Item(n + 4) }
+        fn main() {
+            let v = vec![1, 2, 3];
+            let values = v.iter().map(|n| *n * 2).map(show).rev();
+            println!("start");
+            for Item(n) in values { println!("{n}"); break; }
+            let scores = [3, 5].into_iter().map(show);
+            for Item(n) in scores.clone() { println!("{n}"); }
+            for Item(n) in scores { println!("{n}"); }
+        }
+    """, "start\nmap 6\n10\nmap 3\n7\nmap 5\n9\nmap 3\n7\nmap 5\n9\n"),
+    ("map accepts mutable closures and clones owned capture state", """
+        fn main() {
+            let mut count = 0;
+            for value in vec![4, 5].into_iter().map(|n| { count += 1; count * n }) {
+                println!("{value}");
+            }
+            println!("{count}");
+            let mut count = 0;
+            let mut mapper = move |n: i32| { count += 1; n + count };
+            let mut copied = mapper;
+            println!("{} {}", mapper(0), copied(0));
+            let mapped = vec![1, 3].into_iter().map(mapper);
+            let cloned = mapped.clone();
+            for value in mapped { println!("{value}"); }
+            for value in cloned { println!("{value}"); }
+            println!("{}", mapper(0));
+        }
+    """, "4\n10\n2\n1 1\n3\n6\n3\n6\n2\n"),
 ]
 
 INVALID = [
@@ -2240,6 +2271,20 @@ INVALID = [
             for value in it { println!("{value}"); }
         }
     """, "use of moved value 'it'"),
+    ("an iterator map callback must be callable more than once", """
+        struct Item(i32);
+        fn consume(item: Item) -> i32 { item.0 }
+        fn main() {
+            let value = Item(3);
+            for n in vec![1, 2].into_iter().map(move |n| consume(value) + n) { println!("{n}"); }
+        }
+    """, "iterator map cannot use a closure that consumes its captures"),
+    ("creating a mapper cannot conflict with the live source borrow", """
+        fn main() {
+            let mut v = vec![1usize];
+            for n in v.iter_mut().map(|value| *value + v.len()) { println!("{n}"); }
+        }
+    """, "mutably borrowed"),
 ]
 
 
@@ -2323,10 +2368,18 @@ class InterpreterTests(unittest.TestCase):
                     for n in v.iter() { println!("{n}"); }
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "iterator_adapter.rs"
-            unsupported.write_text('''
+            map_iterator = folder / "iterator_adapter.rs"
+            map_iterator.write_text('''
                 fn main() {
                     for n in vec![1, 2, 3].into_iter().map(|n| n + 1) { println!("{n}"); }
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "owned_string.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let mut text = String::from("Rust");
+                    text.push('!');
+                    println!("{text}");
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2349,14 +2402,14 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, unsupported, panics, bounds, overflow, shift],
+                                     for_iteration, iterator, map_iterator, unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match",
+                              "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])

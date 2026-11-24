@@ -1087,13 +1087,15 @@ class FunctionType:
 @dataclass(frozen=True)
 class IteratorType:
     item: object
+    source: tuple
+    borrowed: bool = False
 
     def __str__(self):
         return f"iterator with item type {self.item}"
 
 
 def borrowing_iterator(annotation):
-    return isinstance(annotation, IteratorType) and isinstance(annotation.item, ReferenceType)
+    return isinstance(annotation, IteratorType) and annotation.borrowed
 
 
 @dataclass(frozen=True)
@@ -1101,6 +1103,7 @@ class IteratorValue:
     collection: object
     borrowed: bool
     reverse: bool = False
+    mappers: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1406,7 +1409,8 @@ def substitute(annotation, arguments):
         return FunctionType(tuple(substitute(kind, arguments) for kind in annotation.parameters),
                             substitute(annotation.result, arguments), annotation.closure)
     if isinstance(annotation, IteratorType):
-        return IteratorType(substitute(annotation.item, arguments))
+        return replace(annotation, item=substitute(annotation.item, arguments),
+                       source=tuple(substitute(part, arguments) for part in annotation.source))
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
     if isinstance(annotation, TupleType):
@@ -1503,7 +1507,8 @@ class Program:
             return FunctionType(tuple(self.normalize(kind, seen) for kind in annotation.parameters),
                                 self.normalize(annotation.result, seen), annotation.closure)
         if isinstance(annotation, IteratorType):
-            return IteratorType(self.normalize(annotation.item, seen))
+            return replace(annotation, item=self.normalize(annotation.item, seen),
+                           source=tuple(self.normalize(part, seen) for part in annotation.source))
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
         if isinstance(annotation, TupleType):
@@ -1577,7 +1582,9 @@ class Program:
                 )
             return trait in {"Copy", "Clone", "PartialEq", "Eq"}
         if isinstance(annotation, IteratorType):
-            return trait == "Clone" and self.implements(annotation.item, "Clone", assumed)
+            source = annotation.source[1] if annotation.source[0] in {"map", "rev"} else annotation.item
+            return (trait == "Clone" and self.implements(source, "Clone", assumed)
+                    and (annotation.source[0] != "map" or self.implements(annotation.source[3], "Clone", assumed)))
         if isinstance(annotation, AssociatedType):
             normalized = self.normalize(annotation)
             if not isinstance(normalized, AssociatedType):
@@ -3704,7 +3711,7 @@ class Checker:
             return FunctionType(tuple(map(self.resolve, annotation.parameters)), self.resolve(annotation.result),
                                 annotation.closure)
         if isinstance(annotation, IteratorType):
-            return IteratorType(self.resolve(annotation.item))
+            return replace(annotation, item=self.resolve(annotation.item), source=tuple(map(self.resolve, annotation.source)))
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
         if isinstance(annotation, TupleType):
@@ -3730,7 +3737,7 @@ class Checker:
         if isinstance(annotation, FunctionType):
             return any(self.occurs(variable, kind) for kind in (*annotation.parameters, annotation.result))
         if isinstance(annotation, IteratorType):
-            return self.occurs(variable, annotation.item)
+            return any(self.occurs(variable, part) for part in (annotation.item, *annotation.source))
         if isinstance(annotation, AppliedType):
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
         if isinstance(annotation, TupleType):
@@ -3770,8 +3777,9 @@ class Checker:
                 self.require(actual.result, expected.result, token)
                 return
         if isinstance(actual, IteratorType) and isinstance(expected, IteratorType):
-            self.require(actual.item, expected.item, token)
-            return
+            if actual.source == expected.source and actual.borrowed == expected.borrowed:
+                self.require(actual.item, expected.item, token)
+                return
         if isinstance(actual, AppliedType) and isinstance(expected, AppliedType):
             if actual.name == expected.name and len(actual.arguments) == len(expected.arguments):
                 for left, right in zip(actual.arguments, expected.arguments):
@@ -4432,7 +4440,7 @@ class Checker:
         return "()"
 
     def type_of(self, expr, scope, expected=None):
-        if id(expr) in self.program.call_functions or expr.kind in {"length", "is_empty", "iterator", "reverse_iterator"}:
+        if id(expr) in self.program.call_functions or expr.kind in {"length", "is_empty", "iterator", "reverse_iterator", "map_iterator"}:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
         elif expr.kind == "block" and expr.label:
@@ -5090,7 +5098,9 @@ class Checker:
         base = actual.inner if isinstance(actual, ReferenceType) else actual
         if isinstance(actual, IteratorType) and name in {"rev", "into_iter"} and not rest and expr.type_arguments is None:
             expr.kind, expr.args = ("reverse_iterator" if name == "rev" else "group"), (original,)
-            return actual
+            return replace(actual, source=("rev", actual)) if name == "rev" else actual
+        if isinstance(actual, IteratorType) and name == "map":
+            return self.iterator_map(expr, scope, actual)
         if (name in {"iter", "iter_mut", "into_iter"} and not isinstance(base, IteratorType)
                 and iteration_item(ReferenceType(base, False)) is not None):
             return self.iterator_constructor(expr, scope, original, actual)
@@ -5183,7 +5193,34 @@ class Checker:
         if item is None:
             raise expr.token.error(f"cannot iterate over {actual}")
         expr.kind, expr.args = "iterator", (original,)
-        return IteratorType(item)
+        borrowed = isinstance(actual, ReferenceType)
+        base = actual.inner if borrowed else actual
+        if borrowed and (isinstance(base, (ArrayType, SliceType)) or is_vector(base)):
+            origin = ("slice", actual.mutable)
+        elif isinstance(base, ArrayType):
+            origin = ("array", base.length)
+        else:
+            origin = (base.name, actual.mutable if borrowed else None)
+        return IteratorType(item, origin, borrowed)
+
+    def iterator_map(self, expr, scope, iterator):
+        if len(expr.args) != 2 or expr.type_arguments is not None:
+            raise expr.token.error("map expects one callable argument")
+        mapper = expr.args[1]
+        output = TypeVariable("mapped item", expr.token)
+        self.variables.append(output)
+        signature = FunctionType((iterator.item,), output)
+        actual = self.type_of(mapper, scope, signature)
+        if not isinstance(actual, FunctionType) or len(actual.parameters) != 1:
+            raise mapper.token.error("map expects a callable with one parameter")
+        self.require(actual.parameters[0], iterator.item, mapper.token)
+        self.require(actual.result, output, mapper.token)
+        item = self.resolve(output)
+        if isinstance(item, ReferenceType) or borrowing_iterator(item):
+            raise mapper.token.error("borrowed outputs from iterator map are unsupported")
+        identity = mapper.args[0] if mapper.kind == "function_pointer" else None
+        expr.kind = "map_iterator"
+        return IteratorType(item, ("map", iterator, identity, actual), iterator.borrowed or bool(actual.closure))
 
     def vector_method(self, expr, scope, expected, actual, base):
         name = expr.token.text
@@ -5923,11 +5960,13 @@ class Ownership:
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
-        if kind in {"iterator", "reverse_iterator"}:
+        if kind in {"iterator", "reverse_iterator", "map_iterator"}:
             if borrowing_iterator(self.annotation(expr)):
                 cursor, _ = self.lower_iterator(expr, scope, cursor)
                 return cursor
-            return self.lower(args[0], scope, cursor)
+            for argument in args:
+                cursor = self.lower(argument, scope, cursor)
+            return cursor
         if kind == "closure_value":
             cursor, _ = self.lower_closure(expr, scope, cursor)
             return cursor
@@ -6129,6 +6168,26 @@ class Ownership:
             return self.lower_iterator(expr.args[0], scope, cursor, consume=False)
         if expr.kind == "reverse_iterator":
             return self.lower_iterator(expr.args[0], scope, cursor)
+        if expr.kind == "map_iterator":
+            source, mapper = expr.args
+            iterator_loan = None
+            if borrowing_iterator(self.annotation(source)):
+                cursor, iterator_loan = self.lower_iterator(source, scope, cursor)
+            else:
+                cursor = self.lower(source, scope, cursor)
+            if iterator_loan:
+                cursor, holder = self.keep_loan(cursor, iterator_loan, source.token)
+            mapper_type = self.annotation(mapper)
+            mapper_loan = None
+            if mapper_type.closure:
+                if self.program.functions[mapper_type.closure].consumes_captures:
+                    raise mapper.token.error("iterator map cannot use a closure that consumes its captures")
+                cursor, mapper_loan = self.lower_closure(mapper, scope, cursor)
+            else:
+                cursor = self.lower(mapper, scope, cursor)
+            if iterator_loan:
+                cursor = self.emit(cursor, "read", holder, source.token)
+            return cursor, self.merge_loans(tuple(loan for loan in (iterator_loan, mapper_loan) if loan), False)
         if expr.kind == "iterator":
             return self.lower_reference(expr.args[0], scope, cursor)
         raise expr.token.error(f"borrowed iterator from {expr.kind} is unsupported")
@@ -6204,7 +6263,8 @@ class Ownership:
             if kind == "for":
                 step = self.emit(restart, "read", iterator, token) if iterator else restart
                 self.connect(step, finish)
-                item = Place(Local(replace(source.token, text="<iteration item>"), True, loan))
+                item_loan = loan if isinstance(item_type, ReferenceType) else None
+                item = Place(Local(replace(source.token, text="<iteration item>"), True, item_loan))
                 body_entry = self.emit(step, "declare", item, source.token)
                 pattern, types = self.program.patterns[id(source)]
                 access = self.pattern_accesses(pattern, item, item_type)
@@ -6471,7 +6531,36 @@ class Interpreter:
     def match_bindings(self, source, address):
         pattern, types = self.program.patterns[id(source)]
         for bindings in pattern.bindings(address.read(), address):
-            yield {name: Binding(item, types[name][1]) for name, item in bindings.items()}
+            scope = {}
+            for name, item in bindings.items():
+                annotation, mutable = types[name]
+                if isinstance(item, FunctionValue) and item.environment and self.program.is_copy(annotation):
+                    item = self.clone_value(item)
+                scope[name] = Binding(item, mutable)
+            yield scope
+
+    def clone_value(self, value):
+        if isinstance(value, FunctionValue) and value.environment:
+            bindings = dict(value.environment)
+            for capture in self.program.functions[value.name].captures:
+                if capture.by_move:
+                    binding = bindings[capture.name.key]
+                    bindings[capture.name.key] = Binding(self.clone_value(binding.value), binding.mutable)
+            return replace(value, environment=bindings)
+        if isinstance(value, IteratorValue):
+            collection = value.collection if value.borrowed else self.clone_value(value.collection)
+            return replace(value, collection=collection, mappers=tuple(map(self.clone_value, value.mappers)))
+        if isinstance(value, ArrayValue):
+            return ArrayValue(tuple(map(self.clone_value, value.items)))
+        if isinstance(value, Value):
+            return Value(value.constructor, tuple(map(self.clone_value, value.fields)))
+        return value
+
+    def mapped_items(self, values, mappers):
+        for value in values:
+            for mapper in mappers:
+                value = self.call(mapper.name, (value,), mapper.arguments, mapper.environment)
+            yield value
 
     def placeholder(self, annotation):
         # Wildcard patterns can inspect an aggregate's shape without reading
@@ -6583,6 +6672,12 @@ class Interpreter:
         if kind == "reverse_iterator":
             iterator = self.eval(args[0], scope)
             return replace(iterator, reverse=not iterator.reverse)
+        if kind == "map_iterator":
+            iterator = self.eval(args[0], scope)
+            mapper = self.eval(args[1], scope)
+            if mapper.environment and self.program.is_copy(self.program.expr_types[id(args[1])]):
+                mapper = self.clone_value(mapper)
+            return replace(iterator, mappers=(*iterator.mappers, mapper))
         if kind in {"function_pointer", "closure_value"}:
             name, arguments = args
             environment = {}
@@ -6686,8 +6781,7 @@ class Interpreter:
         if kind == "deref":
             return self.eval(args[0], scope).read()
         if kind == "clone":
-            # Aggregate values are immutable records, so a clone can share storage.
-            return self.eval(args[0], scope)
+            return self.clone_value(self.eval(args[0], scope))
         if kind == "name":
             ctor = self.program.constructors.get(token.text)
             if ctor and ctor.style == "unit":
@@ -6791,6 +6885,8 @@ class Interpreter:
                     values = stored.items
                 if iterator and iterator.reverse:
                     values = reversed(tuple(values))
+                if iterator and iterator.mappers:
+                    values = self.mapped_items(values, iterator.mappers)
             for value in values:
                 address = Address(Binding(value, True))
                 inner = Scope(scope, next(self.match_bindings(source, address)))
