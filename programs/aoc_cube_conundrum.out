@@ -1,0 +1,9 @@
+0
+part 1: 8
+game 1: Rgb { r: 4, g: 2, b: 6 } power 48
+game 2: Rgb { r: 1, g: 3, b: 4 } power 12
+game 3: Rgb { r: 20, g: 13, b: 6 } power 1560
+game 4: Rgb { r: 14, g: 3, b: 15 } power 630
+game 5: Rgb { r: 6, g: 3, b: 2 } power 36
+part 2: 2286
+most draws: Some(4)

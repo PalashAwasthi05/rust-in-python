@@ -1,0 +1,4 @@
+0
+[Cond { field: 3, less: true, value: 1351, target: "px" }, Goto("qqz")]
+part 1: 19114
+part 2: 167409079868000

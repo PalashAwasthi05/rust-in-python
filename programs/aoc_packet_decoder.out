@@ -1,0 +1,16 @@
+0
+D2FE28                         versions=6   value=2021
+38006F45291200                 versions=9   value=1
+8A004A801A8002F478             versions=16  value=15
+620080001611562C8802118E34     versions=12  value=46
+C0015000016115A2E0802F182340   versions=23  value=46
+A0016C880162017C3686B18A3D4780 versions=31  value=54
+C200B40A82                     versions=14  value=3
+04005AC33890                   versions=8   value=54
+880086C3E88112                 versions=15  value=7
+CE00C43D881120                 versions=11  value=9
+D8005AC2A8F0                   versions=13  value=1
+F600BC2D8F                     versions=19  value=0
+9C005AC2F8F0                   versions=16  value=0
+9C0141080250320F1802104A08     versions=20  value=1
+Packet { version: 6, payload: Literal(2021) }

@@ -13140,7 +13140,8 @@ class Interpreter:
         function = self.functions[name]
         if function.body is None:
             previous = self.type_arguments
-            previous_types = getattr(self, "intrinsic_types", None)
+            # Intrinsics may run Rust code (closures, user iterators) that calls other intrinsics.
+            previous_intrinsic = (getattr(self, "intrinsic_types", None), getattr(self, "intrinsic_receiver", None))
             self.type_arguments = {p: self.program.normalize(substitute(t, previous))
                                    for p, t in (arguments or {}).items()}
             try:
@@ -13159,7 +13160,7 @@ class Interpreter:
                 return INTRINSICS[key](self, result, *values)
             finally:
                 self.type_arguments = previous
-                self.intrinsic_types = previous_types
+                self.intrinsic_types, self.intrinsic_receiver = previous_intrinsic
         own = {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
@@ -15920,6 +15921,8 @@ def method_rotate_right(interpreter, result, value, amount):
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits >> amount) | (bits << (width - amount))) & ((1 << width) - 1), result)
+
+
 
 
 @intrinsic
