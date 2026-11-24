@@ -1,5 +1,6 @@
 """Regression cases that also run against rustc when it is installed."""
 
+from contextlib import redirect_stderr
 from io import StringIO
 import json
 import os
@@ -3263,6 +3264,8 @@ class InterpreterTests(unittest.TestCase):
                 use proc_macro::TokenStream;
                 #[proc_macro]
                 pub fn answer(_: TokenStream) -> TokenStream { "6 * 7".parse().unwrap() }
+                #[proc_macro]
+                pub fn shifted(_: TokenStream) -> TokenStream { "8u8 >> 1".parse().unwrap() }
                 #[proc_macro_attribute]
                 pub fn add(_: TokenStream, item: TokenStream) -> TokenStream {
                     let mut result = item;
@@ -3278,22 +3281,39 @@ class InterpreterTests(unittest.TestCase):
                             "--out-dir", folder, helper], check=True, capture_output=True, timeout=30)
             crate = next(path for path in folder.iterdir() if path != helper)
             external = f"helper={crate}"
+            (folder / "nested.rs").write_text("""
+                use helper::shifted;
+                pub fn value() -> u8 { shifted!() }
+            """, encoding="utf-8")
             source = """
                 use helper::{answer, add, Marker};
+                mod nested;
                 #[derive(Marker, Debug)]
                 struct Number(i32);
                 #[add]
-                fn main() { println!("{} {} {} {:?}", answer!(), from_attribute(), from_derive(), Number(3)); }
+                fn main() {
+                    let mask = 2u8 << 3;
+                    let repeated = vec![nested::value(); 2];
+                    let list = vec![1, answer!()];
+                    let formatted = format!("{mask} {repeated:?} {list:?}");
+                    print!("{formatted}");
+                    eprint!("proc");
+                    eprintln!(" macros");
+                    println!(" {} {} {} {:?}", answer!(), from_attribute(), from_derive(), Number(3));
+                }
             """
             input_file = folder / "main.rs"
             binary = folder / "binary"
             input_file.write_text(source, encoding="utf-8")
             subprocess.run(["rustc", "--edition=2021", "--extern", external, input_file, "-o", binary],
                            check=True, capture_output=True, timeout=30)
-            rust = subprocess.check_output([binary], text=True, timeout=10)
+            rust = subprocess.run([binary], capture_output=True, text=True, timeout=10, check=True)
             output = StringIO()
-            run(source, output, proc_extern=(external,))
-            self.assertEqual(output.getvalue(), rust)
+            errors = StringIO()
+            with redirect_stderr(errors):
+                run(source, output, proc_extern=(external,), source_path=input_file)
+            self.assertEqual(output.getvalue(), rust.stdout)
+            self.assertEqual(errors.getvalue(), rust.stderr)
 
 
 if __name__ == "__main__":

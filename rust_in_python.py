@@ -426,7 +426,7 @@ class MacroExpander:
                 if (item_start or (item_scope and first is None)) and index < len(items) and tree_text(items[index]) == ";":
                     index += 1
                 continue
-            if (tree_text(item) == "vec" and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
+            if (tree_text(item) in {"vec", "@host:vec"} and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
                     and isinstance(items[index + 2], TokenGroup)):
                 group = items[index + 2]
                 result.append(replace(item, text="@vec"))
@@ -2939,6 +2939,9 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word.startswith("@host:"):
+            word = word.removeprefix("@host:")
+            token = replace(token, text=word)
         if word == "const" and self.current.text == "{":
             return Expr("inline_const", token, (self.block(),))
         if word == "@vec":
@@ -8507,17 +8510,29 @@ fn main() {
 
 
 def render_source(trees):
-    return " ".join(token.text for token in flatten_trees(trees))
+    parts = []
+    previous = None
+    for token in flatten_trees(trees):
+        joined_shift = (previous is not None and previous.text in {"<", ">"}
+                        and token.text in {previous.text, previous.text + "="}
+                        and previous.line == token.line and previous.column + 1 == token.column)
+        if parts and not joined_shift:
+            parts.append(" ")
+        parts.append(token.text)
+        previous = token
+    return "".join(parts)
 
 
 def rustc_source(source, libraries, source_path=None, *, edition="2021"):
-    # rustc's expanded text lowers standard derives and println into internal
-    # library calls. Preserve those two interpreter entry points through it.
+    # Keep the interpreter's library entry points through rustc expansion.
     prefix = "__rust_in_python_host"
     while prefix in source:
         prefix += "_"
     marker = prefix + ":derive:"
-    shim = prefix + "_print"
+    formats = ("println", "print", "eprintln", "eprint", "format", "panic")
+    shims = {f"{prefix}_{name}": name for name in (*formats, "vec")}
+    repeat_shim = f"{prefix}_vec_repeat"
+    shims[repeat_shim] = "vec"
     trees, _ = token_trees(lex(source))
 
     def keep_derives(items):
@@ -8563,16 +8578,21 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
         return tuple(result)
 
     source = render_source(keep_derives(trees))
-    macro = ("fn " + shim + "() {}\n"
-             "macro_rules! println { () => { " + shim + "() }; "
-             "($fmt:expr $(, $arg:expr)* $(,)?) => { " + shim + "($fmt $(,$arg)*) }; }\n")
+    declarations = [f"fn {shim}() {{}}" for shim in shims]
+    macros = [f"macro_rules! {name} {{ ($($args:tt)*) => {{ {prefix}_{name}($($args)*) }}; }}"
+              for name in formats]
+    macros.append("macro_rules! vec {"
+                  f"($value:expr; $count:expr) => {{ {repeat_shim}($value, $count) }};"
+                  f"($($value:expr),* $(,)?) => {{ {prefix}_vec($($value),*) }};"
+                  "}")
+    macro = " ".join((*declarations, *macros))
     # Inner attributes belong first in a crate.
     trees, _ = token_trees(lex(source))
     start = 0
     while (start + 2 < len(trees) and tree_text(trees[start]) == "#" and tree_text(trees[start + 1]) == "!"
            and isinstance(trees[start + 2], TokenGroup)):
         start += 3
-    source = render_source(trees[:start]) + "\n" + macro + render_source(trees[start:])
+    source = f"{render_source(trees[:start])} {macro} {render_source(trees[start:])}"
     with TemporaryDirectory(prefix="rust-in-python-") as folder:
         directory = Path(source_path).resolve().parent if source_path is not None else folder
         args = ["rustc", f"--edition={edition}", "--crate-name", "rust_in_python_input",
@@ -8586,11 +8606,11 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
             raise RustError("procedural macro expansion exceeded 30 seconds") from error
         if compiler.returncode:
             raise RustError("rustc macro expansion failed\n" + compiler.stderr.strip())
-    output, _ = token_trees(lex(compiler.stdout))
-    return render_source(strip_host_items(output, marker, shim, libraries))
+    output, end = token_trees(lex(compiler.stdout))
+    return strip_host_items(output, marker, shims, repeat_shim, libraries), end
 
 
-def strip_host_items(items, marker, shim, libraries, *, top=True):
+def strip_host_items(items, marker, shims, repeat_shim, libraries, *, top=True):
     result = []
     index = 0
     while index < len(items):
@@ -8613,20 +8633,39 @@ def strip_host_items(items, marker, shim, libraries, *, top=True):
             if name in {"prelude_import", "allow", "warn", "deny", "forbid", "automatically_derived"}:
                 index += 2
                 continue
-        if top and (words[:3] == ("extern", "crate", "std")
-                    or (len(words) > 1 and words[0] == "use"
-                        and (words[1] in libraries or words[1:4] == ("std", "::", "prelude")))):
+        import_head = words[2] if len(words) > 2 and words[1] == "::" else words[1] if len(words) > 1 else None
+        external_crate = len(words) > 2 and words[:2] == ("extern", "crate") and words[2] in {*libraries, "std"}
+        host_import = words[0] == "use" and (import_head in libraries or (
+            top and words[1:4] == ("std", "::", "prelude")
+        ))
+        if external_crate or host_import:
             while index < len(items) and tree_text(items[index]) != ";":
                 index += 1
             index += 1
             continue
-        if top and (words[:3] == ("macro_rules", "!", "println") or words[:2] == ("fn", shim)):
+        if top and (len(words) >= 2 and words[0] == "fn" and words[1] in shims):
             index += 4
             continue
-        if isinstance(current, Token) and current.text == shim:
-            result.extend((replace(current, text="println"), replace(current, text="!")))
+        if top and words[:2] == ("macro_rules", "!") and len(words) == 4 and isinstance(items[index + 3], TokenGroup):
+            if any(token.text in shims for token in flatten_trees(items[index + 3].items)):
+                index += 4
+                continue
+        if isinstance(current, Token) and current.text in shims:
+            result.extend((replace(current, text="@host:" + shims[current.text]), replace(current, text="!")))
+            if current.text == repeat_shim and index + 1 < len(items) and isinstance(items[index + 1], TokenGroup):
+                group = items[index + 1]
+                parts = list(group.items)
+                separator = next((at for at, part in enumerate(parts) if tree_text(part) == ","), None)
+                if separator is None:
+                    raise current.error("invalid expanded vec repeat")
+                parts[separator] = replace(parts[separator], text=";")
+                parts = strip_host_items(tuple(parts), marker, shims, repeat_shim, libraries, top=False)
+                result.append(replace(group, items=parts))
+                index += 2
+                continue
         elif isinstance(current, TokenGroup):
-            result.append(replace(current, items=strip_host_items(current.items, marker, shim, libraries, top=False)))
+            inner = strip_host_items(current.items, marker, shims, repeat_shim, libraries, top=False)
+            result.append(replace(current, items=inner))
         else:
             result.append(current)
         index += 1
@@ -8652,8 +8691,9 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
-        source = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
-    trees, end = token_trees(lex(source))
+        trees, end = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
+    else:
+        trees, end = token_trees(lex(source))
     modules = Modules(trees, source_path, edition)
     modules.expand()
     program = Program(type_aliases=modules.type_aliases, statics=modules.statics)

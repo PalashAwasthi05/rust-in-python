@@ -229,7 +229,7 @@ The optional host uses the installed Rust compiler to expand function-like, attr
 python3 rust_in_python.py --proc-extern demo_macros=./libdemo_macros.so program.rs
 ```
 
-On macOS, use the compiled `.dylib` path. The Python interpreter checks and runs the expanded program. The host exchanges expanded source text, so compiler span metadata is lost at that boundary.
+On macOS, use the compiled `.dylib` path. The Python interpreter checks and runs the expanded program, including supported formatting and vector macros in file-backed modules. The host exchanges expanded source text, so compiler span metadata is lost at that boundary.
 
 ## Compare a crate against rustc
 
