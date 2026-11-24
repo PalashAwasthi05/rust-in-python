@@ -1,0 +1,21 @@
+0
+empty: true len=0 peek=None
+pop on empty: None
+after pushes: [50 -> 40 -> 30 -> 20 -> 10] (len 5)
+peek: Some(50)
+after peek_mut: [51 -> 40 -> 30 -> 20 -> 10]
+peek after map: Some(102)
+pop: Some(102)
+pop: Some(40)
+now: [30 -> 20 -> 10] (len 3)
+reversed: [10 -> 20 -> 30]
+iter_mut: [1007 -> 2007 -> 3007]
+sum=6021 max=Some(3007)
+evens: []
+push_back: [1007 -> 2007 -> 3007 -> 1 -> 2] (len 5)
+into_iter doubled: [2014, 4014, 6014, 2, 4]
+words: [the -> quick -> brown -> fox]
+joined: THE!! QUICK BROWN FOX
+the!!(5) quick(5) brown(5) fox(3) 
+drained empty: true
+big len 2000 head Some(1999)

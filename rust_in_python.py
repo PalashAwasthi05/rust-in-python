@@ -1172,6 +1172,7 @@ def std_token_trees(edition):
 
 ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
 INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
+FROM_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "FromIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
@@ -1180,6 +1181,7 @@ DEREF_MUT = MODULE_SEPARATOR.join(("std", "ops", "DerefMut"))
 GUARD_TYPES = {MODULE_SEPARATOR.join(("std", "cell", "RefMut"))}
 GUARDS = GUARD_TYPES | {MODULE_SEPARATOR.join(("std", "cell", "Ref"))}
 DROP = MODULE_SEPARATOR.join(("std", "ops", "Drop"))
+HASHER = MODULE_SEPARATOR.join(("std", "hash", "Hasher"))
 RC = MODULE_SEPARATOR.join(("std", "rc", "Rc"))
 WEAK = MODULE_SEPARATOR.join(("std", "rc", "Weak"))
 POINTER_TYPES = {BOX, RC, WEAK}
@@ -2767,6 +2769,10 @@ def loose_equal(first, second):
         return literal_compatible(second, first)
     if isinstance(first, AppliedType) and isinstance(second, AppliedType):
         return first.name == second.name and all(map(loose_equal, first.arguments, second.arguments))
+    if isinstance(first, TupleType) and isinstance(second, TupleType):
+        return len(first.elements) == len(second.elements) and all(map(loose_equal, first.elements, second.elements))
+    if isinstance(first, ReferenceType) and isinstance(second, ReferenceType):
+        return first.mutable == second.mutable and loose_equal(first.inner, second.inner)
     return first == second
 
 
@@ -3058,7 +3064,8 @@ class Program:
             if (annotation.item == "Output" and annotation.trait in BUILTIN_OPERATORS
                     and (primitive in PRIMITIVES or primitive == STRING)
                     and not any(isinstance(kind, AppliedType) or kind not in PRIMITIVES and isinstance(kind, str)
-                                for kind in annotation.trait_arguments)):
+                                for kind in (argument.inner if isinstance(argument, ReferenceType) else argument
+                                             for argument in annotation.trait_arguments))):
                 # Built-in arithmetic yields the operand type; impls like Mul<Vec2> for f64 are user-defined.
                 return primitive
             if (annotation.item == "Item" and annotation.trait == INTO_ITERATOR
@@ -3069,6 +3076,10 @@ class Program:
                     return builtin
                 if ITERATOR in self.traits and self.implements(owner, ITERATOR):
                     return self.normalize(AssociatedType(owner, "Item", ITERATOR), seen)
+            if (annotation.item == "Item" and annotation.trait == INTO_ITERATOR and isinstance(owner, OpaqueType)
+                    and ITERATOR in owner.bounds):
+                # An `impl Iterator` is IntoIterator with the same Item.
+                return self.normalize(AssociatedType(owner, "Item", ITERATOR), seen)
             if (annotation.item == "IntoIter" and annotation.trait in {None, INTO_ITERATOR}
                     and not isinstance(owner, (TypeParameter, TypeVariable, AssociatedType, OpaqueType))
                     and self.implementation(owner, INTO_ITERATOR) is None):
@@ -3221,7 +3232,8 @@ class Program:
                 if trait is None:
                     return False
                 actual = self.normalize(substitute(binding.project(argument, trait), arguments))
-                if actual != self.normalize(substitute(expected, arguments)):
+                # Literals not yet settled, like the 0 in `iter.chain(once(0))`, can still match.
+                if not loose_equal(actual, self.normalize(substitute(expected, arguments))):
                     return False
         return True
 
@@ -8273,7 +8285,9 @@ class Checker:
             value, mutable = args
             hint = expected.inner if isinstance(expected, ReferenceType) else None
             if hint == "str" or isinstance(self.resolve(hint), (SliceType, DynType)):
-                hint = None
+                # An array literal borrowed as a slice still takes its element type from the slice.
+                hint = (self.resolve(hint) if isinstance(self.resolve(hint), SliceType)
+                        and ungroup(value).kind in {"array", "array_repeat"} else None)
             if mutable:
                 self.mark_mutable_place(value)
             annotation = self.type_of(value, scope, hint)
@@ -9067,6 +9081,7 @@ class Checker:
         if (name in {"collect", "sum", "product"} and not isinstance(base, IteratorType)
                 and not isinstance(actual, ReferenceType) and ITERATOR in self.program.traits
                 and self.implements(self.resolve(base), ITERATOR)):
+            self.require_impl_associated_bounds(base, ITERATOR, expr.token)
             item = self.resolve(AssociatedType(base, "Item", ITERATOR))
             return self.iterator_terminal(expr, expected, IteratorType(item, ("trait",)))
         if (isinstance(actual, IteratorType) or isinstance(base, IteratorType)) and name == "as_str" and not rest:
@@ -9189,6 +9204,7 @@ class Checker:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
             trait = candidates[0]
+            self.require_impl_associated_bounds(receiver, trait.name.text, expr.token)
             if isinstance(receiver, DynType):
                 method = trait.methods[name]
                 if method.self_sized:
@@ -9245,6 +9261,29 @@ class Checker:
             expr.args = (target, *rest)
             return self.method_type(expr, scope, expected)
         raise expr.token.error(f"no method {name!r} for {base}")
+
+    def require_impl_associated_bounds(self, receiver, trait, token):
+        """Unify the associated-type bounds of the impl a method call selects, as `B: Iterator<Item = A::Item>`."""
+        resolved = self.resolve(receiver)
+        if isinstance(resolved, (TypeVariable, TypeParameter, AssociatedType, OpaqueType, DynType)):
+            return
+        found = self.program.implementation(resolved, trait)
+        if found is None:
+            return
+        _, arguments = found
+        for parameter, argument in arguments.items():
+            if not isinstance(parameter, TypeParameter):
+                continue
+            for binding, expected in parameter.associated_bindings.items():
+                if binding.item in {CALL_ITEM, ARGS_ITEM}:
+                    continue
+                bound = self.program.associated_trait(binding.bound, binding.item)
+                if bound is None:
+                    continue
+                actual = self.resolve(binding.project(argument, bound))
+                wanted = self.resolve(substitute(expected, arguments))
+                if not any(isinstance(kind, AssociatedType) for kind in (actual, wanted)):
+                    self.require(actual, wanted, token)
 
     def method_type_after_builtins(self, expr, scope, expected):
         """Resolve a str search through std's Pattern-taking methods instead of the built-in fast path."""
@@ -9448,6 +9487,12 @@ class Checker:
             if name == RESULT:
                 self.require(item.arguments[1], target.arguments[1], token)
             self.check_collect(item.arguments[0], target.arguments[0], token)
+        elif FROM_ITERATOR in self.program.traits and (
+                found := self.program.implementation(target, FROM_ITERATOR, arguments_wanted=(item,))) is not None:
+            impl, arguments = found
+            declared = self.program.trait_arguments(impl.trait, impl.trait_arguments, impl.target)
+            if declared and declared[0] is not None:
+                self.require(item, substitute(declared[0], arguments), token)
         else:
             raise token.error(f"cannot collect items of type {item} into {target}")
 
@@ -11720,6 +11765,20 @@ class Interpreter:
             entries.sort(key=functools.cmp_to_key(lambda left, right: self.compare(left[0], right[0])))
         return entries
 
+    def from_iterator(self, target, source):
+        """The FromIterator::from_iter impl, with its type arguments, that collect() into target runs."""
+        name = target.name if isinstance(target, AppliedType) else target
+        if (name in {STRING, OPTION, RESULT, DEQUE, HEAP} or name in MAP_TYPES or is_vector(target)
+                or FROM_ITERATOR not in self.program.traits):
+            return None
+        item = self.program.normalize(self.program.iteration_item(source)) if self.program.iteration_item(source) else None
+        implementation = self.program.implementation(target, FROM_ITERATOR, arguments_wanted=(item,))
+        if implementation is None:
+            return None
+        impl, arguments = implementation
+        method = impl.methods["from_iter"]
+        return method.name.text, {**arguments, method.method_parameters[0]: source}
+
     def collect(self, values, target):
         """Build a collection of the requested type from iterator items."""
         name = target.name if isinstance(target, AppliedType) else target
@@ -11767,7 +11826,10 @@ class Interpreter:
                 implementation = self.cached_implementation(value.constructor.annotation, DROP)
                 if implementation:
                     impl, arguments = implementation
-                    self.call(impl.methods["drop"].name.text, (Address(Binding(value, True)),), arguments)
+                    binding = Binding(value, True)
+                    self.call(impl.methods["drop"].name.text, (Address(binding),), arguments)
+                    # Fields drop as Drop::drop left them, so values it took out are not released twice.
+                    value = binding.value if isinstance(binding.value, Value) else value
             for item in value.fields:
                 self.drop_value(item)
         elif isinstance(value, ArrayValue):
@@ -11918,6 +11980,59 @@ class Interpreter:
         if result.constructor.path.endswith("::Err"):
             raise RustPanic("a formatting trait implementation returned an error when the underlying stream did not")
         return formatter.read().fields[0]
+
+    def hasher_call(self, hasher, hasher_type, name, *values):
+        """Call a Hasher method on a user hasher, falling back to the trait's default body."""
+        found = self.program.implementation(hasher_type, HASHER)
+        if found and name in found[0].methods:
+            impl, arguments = found
+            return self.call(impl.methods[name].name.text, (hasher, *values), arguments)
+        trait = self.program.traits[HASHER]
+        return self.call(trait.methods[name].name.text, (hasher, *values), {trait.self_type: hasher_type})
+
+    def builtin_hash(self, value, annotation, hasher, hasher_type):
+        """Hash::hash for built-in and derived impls, feeding the hasher the same calls std's impls make."""
+        while isinstance(value, (Address, BoxValue, RcValue)):
+            value = value.read()
+        while isinstance(annotation, ReferenceType) or (
+                isinstance(annotation, AppliedType) and annotation.name in {BOX, RC} and annotation.arguments):
+            annotation = annotation.inner if isinstance(annotation, ReferenceType) else annotation.arguments[0]
+        annotation = self.program.concrete_type(annotation)
+        if annotation in INTEGER_TYPES:
+            self.hasher_call(hasher, hasher_type, f"write_{annotation}", value)
+        elif annotation == "bool":
+            self.hasher_call(hasher, hasher_type, "write_u8", int(value))
+        elif annotation == "char":
+            self.hasher_call(hasher, hasher_type, "write_u32", ord(value))
+        elif annotation in {"str", STRING}:
+            self.hasher_call(hasher, hasher_type, "write", shared(ArrayValue(tuple(str(value).encode()))))
+            self.hasher_call(hasher, hasher_type, "write_u8", 0xFF)
+        elif isinstance(annotation, TupleType):
+            for item, kind in zip(value.fields if isinstance(value, Value) else value, annotation.elements):
+                self.builtin_hash(item, kind, hasher, hasher_type)
+        elif isinstance(annotation, (ArrayType, SliceType)) or is_vector(annotation) or (
+                isinstance(annotation, AppliedType) and annotation.name == DEQUE):
+            items = items_of(value) if not isinstance(value, Value) else items_of(value.fields[0])
+            element = annotation.element if isinstance(annotation, (ArrayType, SliceType)) else annotation.arguments[0]
+            self.hasher_call(hasher, hasher_type, "write_usize", len(items))
+            for item in items:
+                self.builtin_hash(item, element, hasher, hasher_type)
+        elif isinstance(value, Value) and value.constructor.path:
+            implementation = self.cached_implementation(annotation, "Hash")
+            if implementation:
+                impl, arguments = implementation
+                method = impl.methods["hash"]
+                self.call(method.name.text, (shared(value), hasher),
+                          arguments | {method.method_parameters[0]: hasher_type})
+                return
+            ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path == value.constructor.path)
+            if "::" in ctor.path:
+                # Derived Hash on an enum writes the discriminant as an isize first.
+                self.hasher_call(hasher, hasher_type, "write_isize", self.program.discriminant(ctor))
+            for item, (_, kind) in zip(value.fields, ctor.fields):
+                self.builtin_hash(item, kind, hasher, hasher_type)
+        elif annotation != "()":
+            raise RustPanic(f"cannot hash a value of type {annotation}")
 
     def builtin_fmt(self, value, formatter, debug, result):
         """`x.fmt(f)` for a built-in x, honouring the formatter's width, fill, and precision as Rust does."""
@@ -12233,6 +12348,10 @@ class Interpreter:
             values = self.iteration_values(collection, annotation, source.token)
             result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
             if token.text == "collect":
+                implementation = self.from_iterator(result, annotation)
+                if implementation is not None:
+                    function, arguments = implementation
+                    return self.call(function, (collection,), arguments)
                 return self.collect(values, result)
             if token.text == "count":
                 return checked(sum(1 for _ in values), token, "usize", runtime=True)
@@ -12372,8 +12491,10 @@ class Interpreter:
                 address.write(ArrayValue((*items, arguments[0])))
             elif token.text == "clear":
                 address.write(ArrayValue(()))
+                drop_removed(self, items)
             elif token.text == "truncate":
                 address.write(ArrayValue(items[:arguments[0]]))
+                drop_removed(self, items[arguments[0]:])
             elif token.text == "pop":
                 if items:
                     address.write(ArrayValue(items[:-1]))
@@ -12746,6 +12867,11 @@ class Interpreter:
                         "eq", "partial_cmp", "cmp"}:
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
                     return self.builtin_compare(name, values[0], values[1], result)
+                if implementation is None and trait == "Hash" and name == "hash" and len(values) == 2:
+                    hasher = self.program.normalize(substitute(arguments[function.method_parameters[0]],
+                                                               self.type_arguments))
+                    self.builtin_hash(values[0], receiver, values[1], hasher)
+                    return None
                 if implementation is None and trait == "Hash" and name == "hash":
                     helper = self.functions[HASH_BUILTIN]
                     hasher = next(arguments[parameter] for parameter in function.method_parameters)
@@ -13503,40 +13629,62 @@ def method_retain(interpreter, result, items, keep):
     if isinstance(value, str):
         items.write("".join(char for char in value if interpreter.call_value(keep, Character(char))))
         return None
-    items.write(ArrayValue(tuple(item for index, item in enumerate(value.items)
-                                 if interpreter.call_value(keep, child(items, index)))))
+    kept, removed = [], []
+    for index, item in enumerate(value.items):
+        (kept if interpreter.call_value(keep, child(items, index)) else removed).append(item)
+    items.write(ArrayValue(tuple(kept)))
+    if interpreter.track_drops:
+        # Removed elements are dropped, which releases Rc counts and runs Drop impls.
+        for item in removed:
+            interpreter.drop_value(item)
 
 
 INTRINSICS[".retain_mut"] = method_retain
 
 
+def drop_removed(interpreter, values):
+    """Drop elements a Vec method removed, releasing Rc counts and running Drop impls."""
+    if interpreter.track_drops:
+        for value in values:
+            interpreter.drop_value(value)
+
+
 @intrinsic
 def method_dedup(interpreter, result, items):
-    kept = []
+    kept, removed = [], []
     for item in items_of(items):
         if not kept or not interpreter.equal(kept[-1], item):
             kept.append(item)
+        else:
+            removed.append(item)
     items.write(ArrayValue(tuple(kept)))
+    drop_removed(interpreter, removed)
 
 
 @intrinsic
 def method_dedup_by_key(interpreter, result, items, key):
-    kept, keys = [], []
+    kept, keys, removed = [], [], []
     for item in items_of(items):
         current = interpreter.call_value(key, Address(Binding(item, True)))
         if not keys or not interpreter.equal(keys[-1], current):
             kept.append(item)
             keys.append(current)
+        else:
+            removed.append(item)
     items.write(ArrayValue(tuple(kept)))
+    drop_removed(interpreter, removed)
 
 
 @intrinsic
 def method_dedup_by(interpreter, result, items, same):
-    kept = []
+    kept, removed = [], []
     for item in items_of(items):
         if not kept or not interpreter.call_value(same, Address(Binding(item, True)), Address(Binding(kept[-1], True))):
             kept.append(item)
+        else:
+            removed.append(item)
     items.write(ArrayValue(tuple(kept)))
+    drop_removed(interpreter, removed)
 
 
 @intrinsic
@@ -13555,7 +13703,11 @@ def method_split_off(interpreter, result, items, at):
 @intrinsic
 def method_resize(interpreter, result, items, length, value):
     values = items_of(items)
-    extra = tuple(interpreter.clone_value(value) for _ in range(length - len(values)))
+    # The value itself fills the last new slot; when nothing grows it is dropped.
+    extra = (*(interpreter.clone_value(value) for _ in range(length - len(values) - 1)), value)
+    if length <= len(values):
+        extra = ()
+        drop_removed(interpreter, (*values[length:], value))
     items.write(ArrayValue(values[:length] + extra))
 
 
@@ -13564,6 +13716,7 @@ def method_resize_with(interpreter, result, items, length, make):
     values = items_of(items)
     extra = tuple(interpreter.call_value(make) for _ in range(length - len(values)))
     items.write(ArrayValue(values[:length] + extra))
+    drop_removed(interpreter, values[length:])
 
 
 @intrinsic
@@ -13598,6 +13751,23 @@ def rust_range_next(interpreter, result, address):
         return option(interpreter, result)
     address.write(Value(value.constructor, (range_step(start, None, 1), end)))
     return option(interpreter, result, start)
+
+
+@intrinsic
+def rust_range_nth(interpreter, result, address, n):
+    """Range::nth skips n items at once, so step_by over a long range stays fast."""
+    value = address.read()
+    start, end = value.fields
+    if isinstance(start, Character):
+        for _ in range(n):
+            rust_range_next(interpreter, result, address)
+        return rust_range_next(interpreter, result, address)
+    if start + n >= end:
+        if start < end:
+            address.write(Value(value.constructor, (end, end)))
+        return option(interpreter, result)
+    address.write(Value(value.constructor, (start + n + 1, end)))
+    return option(interpreter, result, start + n)
 
 
 @intrinsic

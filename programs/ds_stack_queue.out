@@ -1,0 +1,27 @@
+0
+[1 2 3> len 3 peek Some(3)
+3 2 1 
+sum 6
+clone equal: true
+drained top-first: [3, 2, 1]
+letters [a b c> Stack { items: ['a', 'b', 'c'] }
+size_hint (3, Some(3))
+size_hint after next (2, Some(2))
+"(a[b]{c})"  -> Ok(())
+"(]"         -> Err((1, ']'))
+"(("         -> Err((1, '('))
+"x}"         -> Err((1, '}'))
+""           -> Ok(())
+3 4 + 2 *            => Ok(14)
+5 1 2 + 4 * + 3 -    => Ok(14)
+1 +                  => Err("missing operand for +")
+4 0 /                => Err("division by zero")
+1 2                  => Err("2 values left over")
+2 3 ^                => Err("unknown token \"^\"")
+                     => Err("empty expression")
+front Some("a")
+queue ["a", "b", "c", "d", "e"] len 5
+dequeue Some("a")
+took ["B", "C"], 2 left
+rest ["d", "e"]
+evens [2, 4, 6, 8, 10]

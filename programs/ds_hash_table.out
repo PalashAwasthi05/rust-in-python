@@ -1,0 +1,16 @@
+0
+fnv("") = cbf29ce484222325
+fnv("a") = af63dc4c8601ec8c
+fnv("foobar") = 85944171f73967e8
+len 8 cap 16 layout ..#...#.######..
+counts [("the", 4), ("on", 2), ("sat", 2), ("and", 1), ("cat", 1), ("dog", 1), ("log", 1), ("mat", 1)]
+get the=Some(4)
+get cow=None
+remove sat=Some(2) remove sat=None
+remove on=Some(2); layout ..#...#.##x##x..
+insert sat -> None; len 7 deleted 1
+overwrite the -> Some(4)
+nums len 100 cap 512 hits 100 avg probes/lookup 1.65
+sum of remaining values 14950
+Some("one-a")
+None

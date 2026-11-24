@@ -1,0 +1,31 @@
+0
+leaf parent = None
+leaf parent = Some("branch")
+branch strong = 1, weak = 1; leaf strong = 2, weak = 0
+after branch scope: leaf parent = None, strong = 1
+root (1)
+  a (10)
+    a1 (100)
+      leaf (3)
+    a2 (200)
+  b (20)
+    b1 (300)
+sum(root) = 634 sum(a) = 313
+path(leaf) = root/a/a1/leaf
+found b1 under root/b/b1
+find zz: None
+detach a: true
+detach a again: false
+path(leaf) after detach = a/a1/leaf
+sum(root) = 321
+path(leaf) after move = root/b/a/a1/leaf
+| root (1)
+|   b (20)
+|     b1 (300)
+|     a (10)
+|       a1 (100)
+|         leaf (3)
+|       a2 (200)
+a strong = 2 weak = 2
+b's children: ["B1", "A"]
+after dropping root: b parent alive = false
