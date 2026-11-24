@@ -1566,12 +1566,33 @@ class AssociatedBinding:
     bound: str
     item: str
     arguments: tuple = ()
+    lifetimes: tuple = ()
 
     def map_arguments(self, transform):
         return replace(self, arguments=tuple(map(transform, self.arguments)))
 
     def project(self, owner, trait):
         return AssociatedType(owner, self.item, trait.name.text, self.arguments)
+
+    def match_arguments(self, arguments):
+        if len(arguments) != len(self.arguments):
+            return None
+        replacements = {}
+        for declared, actual in zip(self.arguments, arguments):
+            if isinstance(declared, LifetimeArgument) and declared in self.lifetimes:
+                if not isinstance(actual, LifetimeArgument) or replacements.setdefault(declared, actual) != actual:
+                    return None
+            elif declared != actual:
+                return None
+        return replacements
+
+    def canonicalize(self, expected):
+        if not self.lifetimes:
+            return self, expected
+        names = {lifetime: LifetimeArgument(f"'@bound:{index}")
+                 for index, lifetime in enumerate(self.lifetimes)}
+        binding = self.map_arguments(functools.partial(substitute, arguments=names))
+        return replace(binding, lifetimes=tuple(names.values())), substitute(expected, names)
 
 
 @dataclass(frozen=True)
@@ -1814,9 +1835,10 @@ class Program:
                 else:
                     bindings = ()
                 for binding, kind in bindings:
-                    if (binding.item == annotation.item and binding.arguments == annotation.arguments
-                            and self.associated_trait(binding.bound, binding.item) is trait):
-                        return self.normalize(kind, (*seen, annotation))
+                    if binding.item == annotation.item and self.associated_trait(binding.bound, binding.item) is trait:
+                        arguments = binding.match_arguments(annotation.arguments)
+                        if arguments is not None:
+                            return self.normalize(substitute(kind, arguments), (*seen, annotation))
                 if not isinstance(owner, (TypeParameter, TypeVariable)):
                     implementation = self.implementation(owner, trait.name.text)
                     if implementation:
@@ -2547,31 +2569,52 @@ class Parser:
         self.expect(";")
         self.trait_names[alias] = trait
 
-    def trait_bounds(self, *, bindings=None, signature=None):
+    def trait_bounds(self, *, bindings=None, signature=None, outer_lifetimes=()):
         bounds = set()
+        outer_signature = (signature or {}) | {lifetime.name: set() for lifetime in outer_lifetimes}
         while True:
+            local_lifetimes = self.bound_lifetimes(outer_signature) if self.accept("for") else ()
+            lifetimes = (*outer_lifetimes, *local_lifetimes)
+            bound_signature = (signature or {}) | {lifetime.name: set() for lifetime in lifetimes}
             bound = self.trait_path()
             bounds.add(bound)
+            if lifetimes and bindings is None:
+                raise self.current.error("higher-ranked bounds require an associated type constraint here")
             if bindings is not None and self.accept("<"):
                 while self.current.text != ">":
                     name = self.identifier()
                     arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
                     for argument in arguments:
                         if isinstance(argument, LifetimeArgument) and argument.name not in {"'static", "'_"} and (
-                            signature is None or argument.name not in signature
+                            argument.name not in bound_signature
                         ):
                             raise name.error(f"undeclared lifetime {argument.name}")
                     self.expect("=")
-                    key = AssociatedBinding(bound, name.text, arguments)
+                    key = AssociatedBinding(bound, name.text, arguments, lifetimes)
                     if key in bindings:
                         raise name.error(f"duplicate associated type binding {name.text!r}")
-                    bindings[key] = self.type_name(signature=signature)
+                    bindings[key] = self.type_name(signature=bound_signature)
                     if not self.accept(","):
                         break
                 self.expect(">")
             if not self.accept("+"):
                 break
         return bounds
+
+    def bound_lifetimes(self, signature):
+        self.expect("<")
+        lifetimes = {}
+        while self.current.text != ">":
+            token = self.advance()
+            if not LIFETIME.fullmatch(token.text) or token.text in {"'static", "'_"}:
+                raise token.error("expected a bound lifetime parameter")
+            if token.text in lifetimes or token.text in (signature or {}):
+                raise token.error(f"duplicate or shadowed lifetime {token.text}")
+            lifetimes[token.text] = LifetimeArgument(token.text)
+            if not self.accept(","):
+                break
+        self.expect(">")
+        return tuple(lifetimes.values())
 
     def lifetime_bounds(self):
         bounds = set()
@@ -2602,8 +2645,11 @@ class Parser:
                 if not self.accept(","):
                     break
                 continue
+            quantified = self.bound_lifetimes(lifetimes) if self.accept("for") else ()
             lhs = self.advance()
             self.expect(":")
+            if quantified and (lhs.text == "Self" or lhs.text not in self.type_parameters):
+                raise lhs.error("a higher-ranked where bound requires a type parameter")
             if LIFETIME.fullmatch(lhs.text):
                 self.require_lifetimes((lhs,), lifetimes)
                 bounds = self.lifetime_bounds()
@@ -2616,7 +2662,7 @@ class Parser:
             elif lhs.text in self.type_parameters:
                 parameter = self.type_parameters[lhs.text]
                 parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
-                                                          signature=lifetimes))
+                                                          signature=lifetimes, outer_lifetimes=quantified))
             else:
                 raise lhs.error(f"unknown type parameter {lhs.text}")
             if not self.accept(","):
@@ -4314,6 +4360,12 @@ class Checker:
         if trait is None:
             raise token.error(f"unknown or ambiguous associated item {binding.item!r} for {binding.bound}")
         self.check_associated_arguments(trait, binding.item, binding.arguments, token)
+        for lifetime in binding.lifetimes:
+            if lifetime not in binding.arguments:
+                replacement = {lifetime: LifetimeArgument("'@check")}
+                if (substitute(expected, replacement) != expected
+                        or any(substitute(argument, replacement) != argument for argument in binding.arguments)):
+                    raise token.error(f"bound lifetime {lifetime.name} must be a direct associated type argument")
         self.check_type(expected, token)
         return trait
 
@@ -4384,7 +4436,8 @@ class Checker:
                 resolved = self.resolve(kind)
                 if isinstance(resolved, AssociatedType):
                     raise impl.token.error("associated type cannot resolve to itself")
-                if isinstance(resolved, ReferenceType) and LifetimeArgument(resolved.lifetime) not in definition.parameters:
+                if (isinstance(resolved, ReferenceType) and resolved.lifetime != "'static"
+                        and LifetimeArgument(resolved.lifetime) not in definition.parameters):
                     raise impl.token.error("associated reference types require a lifetime parameter")
                 for bound in sorted(declaration.bounds):
                     self.obligation(kind, bound, impl.token)
@@ -4406,10 +4459,10 @@ class Checker:
                     def substitute_parameter(kind):
                         return self.resolve(substitute(kind, bindings))
 
-                    expected = {key.map_arguments(substitute_parameter): substitute_parameter(kind)
-                                for key, kind in declared.associated_bindings.items()}
-                    actual = {key.map_arguments(self.resolve): self.resolve(kind)
-                              for key, kind in provided.associated_bindings.items()}
+                    expected = dict(key.map_arguments(substitute_parameter).canonicalize(substitute_parameter(kind))
+                                    for key, kind in declared.associated_bindings.items())
+                    actual = dict(key.map_arguments(self.resolve).canonicalize(self.resolve(kind))
+                                  for key, kind in provided.associated_bindings.items())
                     if actual != expected:
                         raise method.name.error(f"method {name!r} has incompatible associated type bounds")
                 required_types = tuple(self.resolve(substitute(kind, bindings)) for _, _, kind in required.params)
@@ -4620,11 +4673,18 @@ class Checker:
                 if isinstance(self.resolve(projection.owner), TypeVariable):
                     remaining.append((projection, expected, token))
                 else:
-                    self.require(projection, expected, token)
+                    self.require_associated_equality(projection, expected, token)
             if len(remaining) == len(pending):
                 return remaining
             pending = remaining
         return pending
+
+    def require_associated_equality(self, projection, expected, token):
+        actual, expected = self.resolve(projection), self.resolve(expected)
+        if isinstance(actual, ReferenceType) and isinstance(expected, ReferenceType):
+            if actual.lifetime and expected.lifetime and actual.lifetime != expected.lifetime:
+                raise token.error(f"associated type requires lifetime {expected.lifetime}, found {actual.lifetime}")
+        self.require(actual, expected, token)
 
     def fill_holes(self, annotation, token):
         if annotation is None:
@@ -4795,7 +4855,7 @@ class Checker:
             for binding, expected in function.result.bindings:
                 trait = self.program.associated_trait(binding.bound, binding.item)
                 projection = binding.project(witnesses[name], trait)
-                self.require(projection, expected, function.name)
+                self.require_associated_equality(projection, expected, function.name)
 
     def resolve_pattern(self, pattern):
         tag = pattern.tag

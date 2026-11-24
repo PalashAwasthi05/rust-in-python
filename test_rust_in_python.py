@@ -14,6 +14,27 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("higher-ranked associated equalities preserve the receiver's borrow", """
+        trait Lending {
+            type Item<'a> where Self: 'a;
+            fn get<'a>(&'a self) -> Self::Item<'a>;
+        }
+        struct Packet(i32);
+        impl Lending for Packet {
+            type Item<'a> = &'a i32;
+            fn get<'a>(&'a self) -> &'a i32 { &self.0 }
+        }
+        fn borrow<'s, R>(r: &'s R) -> &'s i32 where for<'a> R: Lending<Item<'a> = &'a i32> {
+            r.get()
+        }
+        fn wrap(value: i32) -> impl for<'a> Lending<Item<'a> = &'a i32> { Packet(value) }
+        fn main() {
+            let item = Packet(17);
+            let second = wrap(21);
+            let shared = borrow(&item);
+            println!("{shared} {}", second.get());
+        }
+    """, "17 21\n"),
     ("const generic associated bindings normalize exact specializations", """
         trait Read {
             type Item<const N: usize>;
@@ -1977,6 +1998,35 @@ VALID = [
 ]
 
 INVALID = [
+    ("a static associated reference does not satisfy a higher-ranked equality", """
+        trait Lending {
+            type Item<'a> where Self: 'a;
+        }
+        struct Global;
+        impl Lending for Global { type Item<'a> = &'static i32; }
+        fn checked(_: impl for<'a> Lending<Item<'a> = &'a i32>) {}
+        fn main() { checked(Global); }
+    """, "associated type requires lifetime 'a, found 'static"),
+    ("lending projections keep the argument borrowed through the returned reference", """
+        trait Lending {
+            type Item<'a> where Self: 'a;
+            fn get<'a>(&'a self) -> Self::Item<'a>;
+        }
+        struct Packet(i32);
+        impl Lending for Packet {
+            type Item<'a> = &'a i32;
+            fn get<'a>(&'a self) -> &'a i32 { &self.0 }
+        }
+        fn borrow<'s, R>(r: &'s R) -> &'s i32 where R: for<'a> Lending<Item<'a> = &'a i32> {
+            r.get()
+        }
+        fn main() {
+            let mut packet = Packet(17);
+            let borrowed = borrow(&packet);
+            packet.0 = 32;
+            println!("{borrowed}");
+        }
+    """, "borrowed"),
     ("generic associated equality applies only to the named specialization", """
         trait Read {
             type Item<const N: usize>;
