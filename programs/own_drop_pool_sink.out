@@ -1,0 +1,38 @@
+0
+new a
+new b
+new c
+took a
+new d
+drop c
+pool ["b", "d"]
+drop b
+kept 1
+new z
+new y
+sorted first y
+new x
+swapped out y
+drop y
+drop x
+drop z
+drop d
+drop a
+new p
+new q
+total 2
+drop q
+found true
+drop p
+new o
+drop o
+mapped Some(1)
+new r
+ok r
+new e
+new e2
+drop e
+got e2
+drop e2
+drop r
+refs 1

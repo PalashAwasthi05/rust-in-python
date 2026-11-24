@@ -1,0 +1,14 @@
+101
+echo a
+echo b
+unload a
+plugins dropped, shared echo b
+unload c
+taken echo c
+cell empty true
+guard risky1 released
+2
+guard risky5 released
+guard two released
+guard 1 released
+unload b

@@ -1,0 +1,13 @@
+0
+["apple", "apricot"]
+["apricot", "avocado", "blueberry"]
+["banana", "apple", "apricot", "avocado", "blueberry"]
+["blueberry", "banana", "avocado", "apricot", "apple"]
+["apple", "apricot"]
+["got payload", "n+1 = 42", "static"]
+left 0
+[1, 2, 3]
+30
+["banana"] ["apple", "apricot", "avocado", "blueberry"]
+[11, 12, 13]
+6

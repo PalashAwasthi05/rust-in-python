@@ -2374,6 +2374,9 @@ class Capture:
     annotation: object
     by_move: bool
     mutable: bool = False
+    # False when the closure only copies Copy fields out of the variable (Rust 2021 precise
+    # capture), so a move closure neither takes nor drops the variable itself.
+    whole: bool = True
 
 
 @dataclass(frozen=True, eq=False)
@@ -3655,6 +3658,12 @@ class Parser:
                 self.argument_parameters = outer
             elif self.accept("<"):
                 while self.current.text != ">":
+                    if is_lifetime(self.current.text):
+                        # Lifetime arguments of a trait object are erased.
+                        self.advance()
+                        if not self.accept(","):
+                            break
+                        continue
                     if self.peek() == "=":
                         name = self.identifier()
                         self.expect("=")
@@ -4262,6 +4271,12 @@ class Parser:
             if bindings is not None and self.accept("<"):
                 positional = []
                 while self.current.text != ">":
+                    if is_lifetime(self.current.text):
+                        # Lifetime arguments of a bound (`dyn Source<'a>`) are erased.
+                        self.advance()
+                        if not self.accept(","):
+                            break
+                        continue
                     if not (is_identifier(self.current.text) and self.peek() == "=") and not (
                             is_identifier(self.current.text) and self.peek() == "<" and self.generic_item_binding()):
                         positional.append(self.type_name(signature=bound_signature))
@@ -5595,6 +5610,34 @@ class Binding:
     moved: bool = False
 
 
+class MovedOut:
+    """Stands in for a field moved out of a partially moved aggregate, so drop glue skips it."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return "<moved>"
+
+
+MOVED_OUT = MovedOut()
+
+
+def moved_path(value, item):
+    """The field path at which `item` (by identity) sits inside `value`, or None."""
+    if value is item:
+        return ()
+    if isinstance(value, Value):
+        children = zip((name for name, _ in value.constructor.fields), value.fields)
+    elif isinstance(value, ArrayValue):
+        children = ((str(index), child) for index, child in enumerate(value.items))
+    else:
+        return None
+    for name, child in children:
+        path = moved_path(child, item)
+        if path is not None:
+            return (Token(name, 0, 0), *path)
+    return None
+
+
 @dataclass
 class Scope:
     parent: Scope | None = None
@@ -5643,11 +5686,25 @@ class CaptureContext:
     enclosing: Scope
     by_move: bool
     captures: dict = field(default_factory=dict)
+    uses: dict = field(default_factory=dict)
+    field_uses: dict = field(default_factory=dict)
 
     def find(self, token):
         binding = self.enclosing.find(token)
         self.captures.setdefault(token.key, Capture(token, binding.value, self.by_move))
         return Binding(binding.value, binding.mutable)
+
+    @staticmethod
+    def of_capture(scope, token):
+        """The capture context through which a closure body reaches `token`, if it is a capture."""
+        current = scope
+        while current:
+            if token.key in current.bindings:
+                return None
+            current = current.parent
+        if scope.captures is not None and token.key in scope.captures.captures:
+            return scope.captures
+        return None
 
     @staticmethod
     def mark_mutable(scope, expr):
@@ -5677,6 +5734,9 @@ def ungroup(expr):
     while expr.kind == "group":
         expr = expr.args[0]
     return expr
+
+
+PLACE_ROOTS = {"name", "deref", "box_deref", "static_item", "lazy_static", "field", "index", "range_index"}
 
 
 def place_root(expr):
@@ -8351,6 +8411,9 @@ class Checker:
                     return self.constant_type(expr, scope, expected)
             binding = self.local_binding(scope, token)
             if binding is not None:
+                captures = CaptureContext.of_capture(scope, token)
+                if captures is not None:
+                    captures.uses[token.key] = captures.uses.get(token.key, 0) + 1
                 return binding.value
             name = self.program.values_in_scope.get(token.module, {}).get(token.text, token.text)
             function = self.functions.get(name)
@@ -8367,6 +8430,14 @@ class Checker:
         if kind == "field":
             value, name = args
             annotation = self.type_of(value, scope)
+            if ungroup(value).kind == "name":
+                captures = CaptureContext.of_capture(scope, ungroup(value).token)
+                if captures is not None:
+                    layout = self.program.layout(self.resolve(annotation))
+                    field_type = next((kind for field, kind in layout[1][0].fields if field == name.text), None) if (
+                        layout and len(layout[1]) == 1 and not is_box(self.resolve(annotation))
+                        and not self.derefs(self.resolve(annotation))) else None
+                    captures.field_uses.setdefault(ungroup(value).token.key, []).append(field_type)
             while isinstance(annotation, ReferenceType):
                 value = Expr("deref", value.token, (value, False))
                 annotation = self.type_of(value, scope)
@@ -8382,9 +8453,12 @@ class Checker:
             value, mutable = args
             hint = expected.inner if isinstance(expected, ReferenceType) else None
             if hint == "str" or isinstance(self.resolve(hint), (SliceType, DynType)):
-                # An array literal borrowed as a slice still takes its element type from the slice.
-                hint = (self.resolve(hint) if isinstance(self.resolve(hint), SliceType)
-                        and ungroup(value).kind in {"array", "array_repeat"} else None)
+                # An array literal borrowed as a slice still takes its element type from the slice, and a
+                # borrowed closure coerces to `&dyn Fn..`, whose signature types its parameters.
+                resolved_hint = self.resolve(hint)
+                if not ((isinstance(resolved_hint, SliceType) and ungroup(value).kind in {"array", "array_repeat"})
+                        or (ungroup(value).kind == "closure" and isinstance(resolved_hint, DynType))):
+                    hint = None
             if mutable:
                 self.mark_mutable_place(value)
             annotation = self.type_of(value, scope, hint)
@@ -9054,6 +9128,14 @@ class Checker:
         if callee == NEVER:
             expr.kind, expr.args = "group", (expr.args[0],)
             return NEVER
+        if isinstance(callee, FunctionType) and callee.closure:
+            closure = self.program.functions.get(callee.closure)
+            if closure is not None and any(capture.mutable for capture in getattr(closure, "captures", ())):
+                # Calling an FnMut closure borrows it mutably, so an enclosing closure captures it mutably.
+                CaptureContext.mark_mutable(scope, expr.args[0])
+        elif (isinstance(callee, (TypeParameter, OpaqueType)) and self.implements(callee, "FnMut")
+              and not self.implements(callee, "Fn")):
+            CaptureContext.mark_mutable(scope, expr.args[0])
         while isinstance(callee, ReferenceType) or is_box(callee):
             callee = self.resolve(callee.inner if isinstance(callee, ReferenceType) else callee.arguments[0])
         if not isinstance(callee, FunctionType) and callable_signature(callee) is not None:
@@ -9066,6 +9148,13 @@ class Checker:
         self.program.call_functions[id(expr)] = Function(token, params, callee.result, None, inputs)
         self.indirect_calls.append(expr)
         return self.check_call(expr, scope, expected, callee.parameters, callee.result, {})
+
+    def copies_fields_only(self, captures, capture):
+        """Whether every use of a by-move capture reads a Copy field of it, so only those fields are captured."""
+        key = capture.name.key
+        fields = captures.field_uses.get(key, ())
+        return (capture.by_move and fields and len(fields) == captures.uses.get(key, 0)
+                and all(kind is not None and self.program.is_copy(self.resolve(kind)) for kind in fields))
 
     def closure_type(self, expr, scope, expected):
         raw, declared, body, by_move = expr.args
@@ -9108,7 +9197,9 @@ class Checker:
         name = replace(expr.token, text=f"@closure:{len(self.closures)}")
         arguments = {parameter: parameter for parameter in self.parameters.values()}
         function = Function(name, params, result, body, type_parameters=tuple(arguments))
-        function.captures = tuple(captures.captures.values())
+        function.captures = tuple(
+            replace(capture, whole=False) if self.copies_fields_only(captures, capture) else capture
+            for capture in captures.captures.values())
         self.closures.append(function)
         self.program.functions[name.text] = function
         expr.kind, expr.args = ("closure_value" if function.captures else "function_pointer"), (name.text, arguments)
@@ -10733,6 +10824,11 @@ class Ownership:
             else:
                 once = not self.program.implements(annotation, "FnMut")
                 cursor = self.lower(pointer, scope, cursor, consume=once)
+                receiver = ungroup(pointer)
+                if (not once and isinstance(annotation, (TypeParameter, OpaqueType)) and receiver.kind == "name"
+                        and not self.program.implements(annotation, "Fn")):
+                    # Calling an FnMut value needs a mutable binding.
+                    cursor = self.emit(cursor, "write", Place(scope.find(receiver.token)), receiver.token)
         function = self.program.call_functions.get(id(expr))
         expected, _ = self.program.call_types[id(expr)]
         passed = {}
@@ -11719,6 +11815,7 @@ class Interpreter:
         pattern, types = self.program.patterns[id(source)]
         for bindings in pattern.bindings(address.read(), address):
             scope = {}
+            undo = []
             for name, item in bindings.items():
                 annotation, mutable = types[name]
                 if isinstance(item, FunctionValue) and item.environment and self.program.is_copy(annotation):
@@ -11726,9 +11823,23 @@ class Interpreter:
                 if (self.track_drops and isinstance(address, Address) and isinstance(address.binding, Binding)
                         and not isinstance(item, (Address, SliceAddress, StringAddress, DynAddress))
                         and not self.program.is_copy(self.program.normalize(substitute(annotation, self.type_arguments)))):
-                    address.binding.moved = True
+                    path = moved_path(address.read(), item)
+                    if path:
+                        # A partial move: the rest of the aggregate is still dropped with its owner.
+                        place = Address(address.binding, (*address.fields, *path))
+                        place.write(MOVED_OUT)
+                        undo.append((place, item))
+                    else:
+                        undo.append((address.binding, address.binding.moved))
+                        address.binding.moved = True
                 scope[name] = Binding(item, mutable)
             yield scope
+            # Resumed only when a match guard rejected this arm, so nothing was moved.
+            for target, previous in reversed(undo):
+                if isinstance(target, Address):
+                    target.write(previous)
+                else:
+                    target.moved = previous
 
     def eval_chain(self, conditions, scope):
         inner = Scope(scope)
@@ -12004,6 +12115,39 @@ class Interpreter:
             return Value(self.program.layout(target)[1][0], (ArrayValue(tuple(ordered)),))
         return items
 
+    def run_for(self, expr, source, body, values, scope):
+        for value in values:
+            address = Address(Binding(value, True))
+            inner = Scope(scope, next(self.match_bindings(source, address)))
+            try:
+                self.eval(body, inner)
+            except Continue as signal:
+                if not handles_jump(expr, signal):
+                    raise
+                continue
+            except Break as signal:
+                if not handles_jump(expr, signal):
+                    raise
+                break
+            finally:
+                if self.track_drops:
+                    self.drop_scope(inner.bindings)
+
+    def has_drop_glue(self, value):
+        """Whether dropping this value could run a Drop impl or release an Rc count."""
+        if isinstance(value, (RcValue, WeakValue, BoxValue)):
+            return True
+        if isinstance(value, Value):
+            return bool(value.constructor.path and self.cached_implementation(value.constructor.annotation, DROP)
+                        ) or any(map(self.has_drop_glue, value.fields))
+        if isinstance(value, ArrayValue):
+            return any(map(self.has_drop_glue, value.items))
+        if isinstance(value, MapValue):
+            return any(self.has_drop_glue(key) or self.has_drop_glue(item) for key, item in value.entries.values())
+        if isinstance(value, FunctionValue):
+            return any(capture.by_move and capture.whole for capture in self.program.functions[value.name].captures)
+        return False
+
     def drop_value(self, value):
         """Run Rust drop glue: Drop impls first, then fields; Rc values release their counts."""
         if isinstance(value, RcValue):
@@ -12027,18 +12171,38 @@ class Interpreter:
             for item in value.items:
                 self.drop_value(item)
         elif isinstance(value, MapValue):
-            for key, item in value.entries.values():
+            for key, item in self.map_order(value):
                 self.drop_value(key)
                 if item is not MAP_MEMBER:
                     self.drop_value(item)
         elif isinstance(value, BoxValue):
-            self.drop_value(value.read())
+            if not (isinstance(value.address.binding, Binding) and value.address.binding.moved):
+                self.drop_value(value.read())
+        elif isinstance(value, FunctionValue) and value.environment:
+            # A closure owns what it captured by move.
+            for capture in self.program.functions[value.name].captures:
+                binding = value.environment.get(capture.name.key)
+                if capture.by_move and capture.whole and binding is not None and not binding.moved:
+                    binding.moved = True
+                    self.drop_value(binding.value)
+        elif isinstance(value, IteratorValue) and not value.borrowed and not value.mappers:
+            # An owning iterator drops the items it has not yielded yet.
+            if isinstance(value.collection, ArrayValue) and self.has_drop_glue(value.collection):
+                remaining = value.cursor[0] if value.cursor else (
+                    reversed(value.collection.items) if value.reverse else value.collection.items)
+                for item in remaining:
+                    self.drop_value(item)
 
-    def drop_temporaries(self, mark, statement):
+    def drop_temporaries(self, mark, statement, scope=None):
         """Drop temporaries a statement created, except a borrowed initializer that a let extends."""
         created = self.temporaries[mark:]
         del self.temporaries[mark:]
-        if statement.kind == "let" and statement.args[2] is not None and ungroup(statement.args[2]).kind == "borrow":
+        if (statement is not None and statement.kind == "let" and statement.args[2] is not None
+                and ungroup(statement.args[2]).kind == "borrow"):
+            if scope is not None:
+                # The extended temporary lives, and is dropped, like a local of the enclosing block.
+                for binding in created:
+                    scope.bindings[(object(), "temporary")] = binding
             return
         for binding in reversed(created):
             if not binding.moved:
@@ -12340,9 +12504,13 @@ class Interpreter:
     def call(self, name, values, arguments=None, environment=None):
         if self.track_drops:
             parameters = {}
+            mark = len(self.temporaries)
             try:
                 return self.call_body(name, values, arguments, environment, parameters)
             finally:
+                if len(self.temporaries) > mark:
+                    # Temporaries of the body's tail expression drop when the function returns.
+                    self.drop_temporaries(mark, None)
                 self.drop_scope(parameters)
         return self.call_body(name, values, arguments, environment, None)
 
@@ -12572,7 +12740,11 @@ class Interpreter:
             concrete = self.program.normalize(substitute(self.program.expr_types[id(args[0])], self.type_arguments))
             return BoxValue(Address(Binding(value, True)), concrete)
         if kind == "box_deref":
-            return self.address(expr, scope).read()
+            place = self.address(expr, scope)
+            value = place.read()
+            if self.track_drops and id(expr) in self.program.moves and isinstance(place, Address):
+                place.write(MOVED_OUT)
+            return value
         if kind == "iterator_terminal":
             source = args[0]
             annotation = self.program.expr_types[id(source)]
@@ -12674,6 +12846,8 @@ class Interpreter:
             environment = {}
             for capture in self.program.functions[name].captures:
                 binding = scope.find(capture.name)
+                if capture.by_move and capture.whole and self.track_drops and self.has_drop_glue(binding.value):
+                    binding.moved = True
                 environment[capture.name.key] = Binding(binding.value, capture.mutable) if capture.by_move else binding
             return FunctionValue(name, {parameter: self.program.normalize(substitute(value, self.type_arguments))
                                         for parameter, value in arguments.items()}, environment)
@@ -12877,14 +13051,45 @@ class Interpreter:
             if id(expr) in self.program.moves:
                 root = place_root(expr)
                 if root.kind == "name":
+                    if self.track_drops:
+                        place = self.address(expr, scope)
+                        if isinstance(place, Address) and isinstance(place.binding, Binding) and place.fields:
+                            moved = place.read()
+                            place.write(MOVED_OUT)
+                            return moved
                     scope.find(root.token).moved = True
+            if self.track_drops:
+                path, root = [name], ungroup(value)
+                while root.kind == "field":
+                    path.append(root.args[1])
+                    root = ungroup(root.args[0])
+                if root.kind not in PLACE_ROOTS:
+                    # A field read from a temporary aggregate: the rest of it drops at the end of the statement.
+                    path.reverse()
+                    aggregate = item = self.eval(root, scope)
+                    for step in path:
+                        item = item.fields[item.constructor.index(step)]
+                    if self.has_drop_glue(aggregate):
+                        if self.has_drop_glue(item):
+                            aggregate = aggregate.replace(tuple(path), MOVED_OUT)
+                        self.temporaries.append(Binding(aggregate, False))
+                    return item
             aggregate = self.eval(value, scope)
             return aggregate.fields[aggregate.constructor.index(name)]
         if kind == "record":
             explicit, update = args
             ctor = self.runtime_constructor(expr, self.program.constructors[token.text])
             supplied = [(ctor.index(name), self.eval(value, scope)) for name, value in explicit]
-            fields = list(self.address(update, scope).read().fields) if update else [None] * len(ctor.fields)
+            fields = [None] * len(ctor.fields)
+            if update:
+                source = self.address(update, scope)
+                fields = list(source.read().fields)
+                if self.track_drops and isinstance(source, Address):
+                    # Struct update syntax moves the fields it takes out of the base value.
+                    explicit_indexes = {index for index, _ in supplied}
+                    for index, (name, _) in enumerate(ctor.fields):
+                        if index not in explicit_indexes and self.has_drop_glue(fields[index]):
+                            source.child(Token(name, 0, 0)).write(MOVED_OUT)
             for index, value in supplied:
                 fields[index] = value
             return Value(ctor, tuple(fields))
@@ -12917,7 +13122,7 @@ class Interpreter:
                             self.drop_temporaries(mark, statement)
                         raise
                     if self.track_drops and len(self.temporaries) > mark:
-                        self.drop_temporaries(mark, statement)
+                        self.drop_temporaries(mark, statement, inner)
                 return self.eval(tail, inner) if tail else None
             except Break as signal:
                 if not expr.label or not handles_jump(expr, signal):
@@ -12939,6 +13144,12 @@ class Interpreter:
                 if otherwise:
                     self.eval(otherwise, scope)
                 raise AssertionError("type checker accepted a fall-through let pattern")
+            if self.track_drops and not scope.bindings.keys().isdisjoint(bindings):
+                # A shadowed binding still owns its value until the scope ends.
+                shadowed = {(object(), key) if key in bindings else key: binding
+                            for key, binding in scope.bindings.items()}
+                scope.bindings.clear()
+                scope.bindings.update(shadowed)
             scope.bindings.update(bindings)
             return None
         if kind == "discard":
@@ -12948,6 +13159,14 @@ class Interpreter:
             return None
         if kind == "if":
             condition, yes, no = args
+            if self.track_drops:
+                # An if condition is a temporary scope of its own.
+                mark = len(self.temporaries)
+                satisfied = self.eval(condition, scope)
+                if len(self.temporaries) > mark:
+                    self.drop_temporaries(mark, None)
+                branch = yes if satisfied else no
+                return self.eval(branch, scope) if branch else None
             branch = yes if self.eval(condition, scope) else no
             return self.eval(branch, scope) if branch else None
         if kind == "if_chain":
@@ -12965,7 +13184,14 @@ class Interpreter:
             while True:
                 try:
                     inner = scope
-                    if kind == "while" and not self.eval(args[0], scope):
+                    if kind == "while" and self.track_drops:
+                        mark = len(self.temporaries)
+                        satisfied = self.eval(args[0], scope)
+                        if len(self.temporaries) > mark:
+                            self.drop_temporaries(mark, None)
+                        if not satisfied:
+                            return None
+                    elif kind == "while" and not self.eval(args[0], scope):
                         return None
                     if kind == "while_let":
                         condition, source, _ = args
@@ -13000,23 +13226,20 @@ class Interpreter:
                 else:
                     values = range(first, last + int(inclusive))
             else:
-                values = self.iteration_values(self.eval(iterable, scope), self.program.expr_types[id(iterable)],
-                                               iterable.token)
-            for value in values:
-                address = Address(Binding(value, True))
-                inner = Scope(scope, next(self.match_bindings(source, address)))
-                try:
-                    self.eval(body, inner)
-                    if self.track_drops:
-                        self.drop_scope(inner.bindings)
-                except Continue as signal:
-                    if not handles_jump(expr, signal):
-                        raise
-                    continue
-                except Break as signal:
-                    if not handles_jump(expr, signal):
-                        raise
-                    break
+                collection = self.eval(iterable, scope)
+                values = self.iteration_values(collection, self.program.expr_types[id(iterable)], iterable.token)
+                if self.track_drops and (isinstance(collection, ArrayValue) or (
+                        isinstance(collection, IteratorValue) and not collection.borrowed and not collection.mappers
+                        and isinstance(collection.collection, ArrayValue))):
+                    # Leaving the loop early drops the items the owning iterator has not yielded.
+                    values = iter(values)
+                    try:
+                        self.run_for(expr, source, body, values, scope)
+                    finally:
+                        for value in values:
+                            self.drop_value(value)
+                    return None
+            self.run_for(expr, source, body, values, scope)
             return None
         if kind == "return":
             raise Return(self.eval(args[0], scope) if args[0] else None)
@@ -13892,14 +14115,15 @@ def method_retain(interpreter, result, items, keep):
     if isinstance(value, str):
         items.write("".join(char for char in value if interpreter.call_value(keep, Character(char))))
         return None
-    kept, removed = [], []
-    for index, item in enumerate(value.items):
-        (kept if interpreter.call_value(keep, child(items, index)) else removed).append(item)
-    items.write(ArrayValue(tuple(kept)))
-    if interpreter.track_drops:
-        # Removed elements are dropped, which releases Rc counts and runs Drop impls.
-        for item in removed:
+    kept = []
+    for index in range(len(value.items)):
+        verdict = interpreter.call_value(keep, child(items, index))
+        item = items.read().items[index]
+        if verdict:
+            kept.append(item)
+        elif interpreter.track_drops:
             interpreter.drop_value(item)
+    items.write(ArrayValue(tuple(kept)))
 
 
 INTRINSICS[".retain_mut"] = method_retain
@@ -13972,6 +14196,11 @@ def method_resize(interpreter, result, items, length, value):
         extra = ()
         drop_removed(interpreter, (*values[length:], value))
     items.write(ArrayValue(values[:length] + extra))
+    if interpreter.track_drops:
+        for item in values[length:]:
+            interpreter.drop_value(item)
+        if missing <= 0:
+            interpreter.drop_value(value)
 
 
 @intrinsic
@@ -14057,6 +14286,12 @@ def rust_replace(interpreter, result, destination, value):
     previous = destination.read()
     destination.write(value)
     return previous
+
+
+@intrinsic
+def rust_forget(interpreter, result, value):
+    """Intrinsic arguments are never dropped, so forgetting a value needs no work."""
+    return None
 
 
 @intrinsic
@@ -15523,6 +15758,28 @@ def method_split_at_mut(interpreter, result, items, middle):
     root, offset = interpreter.slice_parts(items)
     return make_tuple(interpreter, result, SliceAddress(root, offset, offset + middle),
                       SliceAddress(root, offset + middle, offset + count))
+
+
+@intrinsic
+def method_split_first_mut(interpreter, result, items):
+    count = len(items_of(items))
+    if not count:
+        return option(interpreter, result)
+    root, offset = interpreter.slice_parts(items)
+    pair = element_type(result)
+    return option(interpreter, result, Value(interpreter.program.layout(pair)[1][0],
+                                             (child(items, 0), SliceAddress(root, offset + 1, offset + count))))
+
+
+@intrinsic
+def method_split_last_mut(interpreter, result, items):
+    count = len(items_of(items))
+    if not count:
+        return option(interpreter, result)
+    root, offset = interpreter.slice_parts(items)
+    pair = element_type(result)
+    return option(interpreter, result, Value(interpreter.program.layout(pair)[1][0],
+                                             (child(items, count - 1), SliceAddress(root, offset, offset + count - 1))))
 
 
 def rust_layout(interpreter, annotation):

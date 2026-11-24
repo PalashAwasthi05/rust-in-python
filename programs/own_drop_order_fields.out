@@ -1,0 +1,52 @@
+0
+struct:
+  drop Outer (before fields)
+  drop first
+  drop second
+  drop x
+  drop y
+vec:
+  removed v1
+  drop v3
+  truncated
+  drop v1
+  drop v0
+  drop v2
+tuple and array:
+  drop a0
+  drop a1
+  drop t0
+  drop t1
+enum:
+  3 holders
+  drop h2a
+  drop h2b
+  drop h1
+closure:
+  closure sees captured
+  closure done
+  drop captured
+early:
+returning early
+  drop early-a
+  drop guard
+  -> 1
+returning late
+  drop early-b
+  drop early-a
+  drop guard
+  -> 2
+option replace:
+  drop slot1
+  replaced
+  drop slot2
+  taken
+loop:
+  body 0
+  drop iter0
+  body 1
+  drop iter1
+box chain:
+  drop bx
+  drop by
+end

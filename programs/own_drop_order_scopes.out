@@ -1,0 +1,47 @@
+0
+make a
+make b
+make inner
+in block
+drop inner
+make x1
+make x2
+shadowed, x = x2
+drop b
+after drop(b)
+make temp
+temp name: temp
+drop temp
+after temp
+make underscore
+drop underscore
+after underscore
+make r1
+make r2
+drop r1
+reassigned to r2
+make p
+passing p
+consuming p
+drop p
+after consume
+make opt
+took opt
+drop opt
+after if let
+make t0
+make t1
+destructured t0
+make boxed
+unboxed boxed
+make yes
+chosen yes
+end of main
+drop yes
+drop boxed
+drop t0
+drop t1
+drop r2
+drop x2
+drop x1
+drop a

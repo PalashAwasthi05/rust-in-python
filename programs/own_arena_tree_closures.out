@@ -1,0 +1,17 @@
+0
+sum 10
+sum 20
+[2, 4, 6, 108, 51]
+2 ["APPLE", "Bob", "CAT"] ["apple", "cat"]
+fib 50 = 12586269025
+memo size 49
+[hello] []
+[3, 2, 4, 1]
+pop 3
+pop 2
+pop 1
+total 3
+["id1", "id2", "id3"] 3
+[0, 1, 2] None
+[10, 2, 3]
+[10, 20, 3]

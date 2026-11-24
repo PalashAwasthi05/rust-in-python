@@ -1,0 +1,16 @@
+0
+Ident("let")
+Ident("total_sum")
+Punct('=')
+Ident("alpha")
+Punct('+')
+Number(42)
+Punct('*')
+Ident("beta_2")
+Punct(';')
+longest ident: total_sum
+first ident: Some("let")
+eq: true
+numbers sum: 42
+<let><total_sum>=<alpha>+#42*<beta_2>;
+idents: 3

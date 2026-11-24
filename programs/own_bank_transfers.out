@@ -1,0 +1,13 @@
+0
+Ok(())
+Ok(())
+Err(Insufficient { needed: 1000, available: 70 })
+Err(SameAccount)
+Err(NoSuchAccount(9))
+error NoSuchAccount(42)
+alice           70 [100, -30]
+bob             10 [50, 30, -70]
+carol (vip)     75 [0, 70, 5]
+richest: carol (vip)
+total: 155
+[77, 11, 82]

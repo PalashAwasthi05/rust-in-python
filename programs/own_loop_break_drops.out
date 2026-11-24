@@ -1,0 +1,31 @@
+0
+-- for break
+visit f1
+drop f1
+visit f2
+drop f2
+drop f3
+after loop
+-- dyn vec
+total 13 sq3
+drop s2
+drop s3
+-- rc refcell shared drop
+drop r1
+removed; count 2
+drop r2
+-- closure fnmut counter
+n = 2
+a=2 b=1
+-- lifetimes
+a much longer line
+a much longer line
+-- closures capturing then used after
+[3, 1, 2, 3] [9, 3, 6]
+sum 9
+true false ["a", "b"] ["b", "a"]
+-- option get_or_insert
+Some([1, 2])
+inserted ins!
+end
+drop ins!

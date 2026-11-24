@@ -1,0 +1,25 @@
+0
+root
+  depth 0
+    depth 1
+      depth 2
+      depth 2
+    depth 1
+      depth 2
+      depth 2
+back at root
+rollback to 2
+[1, 2]
+commit at 3
+[1, 2, 5]
+[1, 2, 5, 6]
+start outer
+start a
+start b
+end b
+end a
+start c
+end c
+start d
+end d
+end outer
