@@ -64,11 +64,20 @@ INTEGER_TYPES = set(INTEGER_WIDTHS)
 INTEGER_SUFFIX = re.compile(f"(?:{'|'.join(INTEGER_WIDTHS)})$")
 INTEGER_BOUNDS = {kind: (-(1 << (width - 1)), 1 << (width - 1)) if kind.startswith("i") else (0, 1 << width)
                   for kind, width in INTEGER_WIDTHS.items()}
-CONST_TYPES = INTEGER_TYPES | {"bool"}
+CONST_TYPES = INTEGER_TYPES | {"bool", "char"}
+CHAR_LIMIT = 0x110000
+SURROGATES = range(0xD800, 0xE000)
+SCALAR_BOUNDS = {**INTEGER_BOUNDS, "char": (0, CHAR_LIMIT)}
+
+
+class Character(str):
+    """A Unicode scalar value, with its own Rust debug representation."""
 
 
 TOKEN = re.compile(
-    r'\s+|//[^\n]*|/\*|"(?:(?:\\[\s\S])|[^"\\])*"|'
+    r'\s+|//[^\n]*|/\*|b?r(?P<hashes>#{0,255})"[\s\S]*?"(?P=hashes)|'
+    r'b?"(?:(?:\\[\s\S])|[^"\\])*"|'
+    r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|[^\r\n])|[^'\\\r\n\t])'|"
     r"'[A-Za-z_][A-Za-z_0-9]*|"
     rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
     r'[A-Za-z_][A-Za-z_0-9]*|'
@@ -76,6 +85,7 @@ TOKEN = re.compile(
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
+LIFETIME = re.compile(r"'[A-Za-z_][A-Za-z_0-9]*\Z")
 RESERVED = set("""
     as async await break const continue crate dyn else enum extern false fn for
     gen if impl in let loop match mod move mut pub ref return self Self static
@@ -90,10 +100,12 @@ PRECEDENCE = {
 BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
 PRIMITIVES = CONST_TYPES | {"&str", "()"}
 NEVER = "!"
-INTEGER_CONSTANTS = {f"{kind}::{name}": (result, value)
-                     for kind, (lo, hi) in INTEGER_BOUNDS.items()
-                     for name, result, value in (("MIN", kind, lo), ("MAX", kind, hi - 1),
-                                                 ("BITS", "u32", INTEGER_WIDTHS[kind]))}
+SCALAR_CONSTANTS = {f"{kind}::{name}": (result, value)
+                    for kind, (lo, hi) in INTEGER_BOUNDS.items()
+                    for name, result, value in (("MIN", kind, lo), ("MAX", kind, hi - 1),
+                                                ("BITS", "u32", INTEGER_WIDTHS[kind]))}
+SCALAR_CONSTANTS.update({"char::MIN": ("char", Character("\0")),
+                         "char::MAX": ("char", Character(chr(CHAR_LIMIT - 1)))})
 
 
 def lex(source):
@@ -595,6 +607,8 @@ class Modules:
                 elif (not inner and len(attribute.items) == 3
                       and tuple(map(tree_text, attribute.items[:2])) == ("path", "=")
                       and isinstance(attribute.items[2], Token)):
+                    if not attribute.items[2].text.startswith(('"', 'r"', 'r#')):
+                        raise attribute.items[2].error("module path must be a string literal")
                     custom_path = decode_string(attribute.items[2])
                 else:
                     kept_attributes.extend(items[index:position + 1])
@@ -1097,7 +1111,7 @@ class AppliedType:
 
 @dataclass(frozen=True)
 class ConstValue:
-    value: int | bool
+    value: int | bool | Character
     kind: str | None = field(default=None, compare=False)
     boolean: bool = field(init=False)
 
@@ -1105,7 +1119,7 @@ class ConstValue:
         object.__setattr__(self, "boolean", type(self.value) is bool)
 
     def __str__(self):
-        return str(self.value).lower()
+        return display(self.value, True)
 
 
 @dataclass(frozen=True)
@@ -1629,7 +1643,7 @@ class Parser:
             self.expect("]")
             return ArrayType(element, length)
         if token.text == "&":
-            lifetime = self.advance() if self.current.text.startswith("'") else None
+            lifetime = self.advance() if LIFETIME.fullmatch(self.current.text) else None
             if lifetime and lifetime.text == "'_":
                 lifetime = None
             mutable = bool(self.accept("mut"))
@@ -1780,9 +1794,10 @@ class Parser:
         value = self.const_expression(self.expression(), annotation)
         if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
             raise name.error(f"expected a {annotation} constant")
-        if (annotation == "bool") != value.boolean:
+        if ((annotation == "bool") != value.boolean
+                or (annotation == "char") != isinstance(value.value, Character)):
             raise name.error(f"expected a {annotation} constant")
-        if not value.boolean:
+        if annotation in INTEGER_TYPES:
             checked(value.value, name, annotation)
         self.expect(";")
         self.constants[name.text] = ConstValue(value.value, annotation)
@@ -1799,14 +1814,14 @@ class Parser:
             return self.peek() == "self"
         if self.current.text != "&":
             return False
-        offset = int(self.peek().startswith("'"))
+        offset = int(LIFETIME.fullmatch(self.peek()) is not None)
         if self.peek(offset) == "mut":
             offset += 1
         return self.peek(offset) == "self"
 
     def self_parameter(self, lifetimes):
         borrowed = self.accept("&")
-        lifetime = self.advance() if borrowed and self.current.text.startswith("'") else None
+        lifetime = self.advance() if borrowed and LIFETIME.fullmatch(self.current.text) else None
         if lifetime and lifetime.text not in lifetimes:
             raise lifetime.error("undeclared receiver lifetime")
         mutable = bool(self.accept("mut"))
@@ -1931,7 +1946,7 @@ class Parser:
             return lifetimes, types
         while self.current.text != ">":
             token = self.advance()
-            if token.text.startswith("'") and token.text not in {"'static", "'_"}:
+            if LIFETIME.fullmatch(token.text) and token.text not in {"'static", "'_"}:
                 if types:
                     raise token.error("lifetime parameters must precede type parameters")
                 if token.text in lifetimes:
@@ -1992,7 +2007,7 @@ class Parser:
         bounds = set()
         while True:
             token = self.advance()
-            if not token.text.startswith("'"):
+            if not LIFETIME.fullmatch(token.text):
                 raise token.error("expected a lifetime bound")
             bounds.add(token)
             if not self.accept("+"):
@@ -2011,7 +2026,7 @@ class Parser:
         while self.current.text not in {"{", ";"}:
             if self.current.text == "[":
                 bound = self.type_name()
-                if bound.element != "()":
+                if not isinstance(bound, ArrayType) or bound.element != "()":
                     raise self.current.error("const evaluation bounds use unit arrays")
                 self.expect(":")
                 if not self.accept(","):
@@ -2019,7 +2034,7 @@ class Parser:
                 continue
             lhs = self.advance()
             self.expect(":")
-            if lhs.text.startswith("'"):
+            if LIFETIME.fullmatch(lhs.text):
                 self.require_lifetimes((lhs,), lifetimes)
                 bounds = self.lifetime_bounds()
                 self.require_lifetimes(bounds, lifetimes)
@@ -2319,7 +2334,7 @@ class Parser:
             if self.current.text == "(":
                 return Expr("call", member, self.arguments(), qualified=(self.self_type, self.current_trait))
             return Expr("name", member, qualified=(self.self_type, self.current_trait))
-        if word.startswith("'"):
+        if LIFETIME.fullmatch(word):
             if word in {"'static", "'_"} or word[1:] in RESERVED:
                 raise token.error("invalid label")
             self.expect(":")
@@ -2359,7 +2374,7 @@ class Parser:
             return self.match_expression(token)
         if word in {"return", "break", "continue"}:
             label = None
-            if word != "return" and self.current.text.startswith("'"):
+            if word != "return" and LIFETIME.fullmatch(self.current.text):
                 label = self.advance()
             value = None
             if word != "continue" and self.current.text not in {";", "}", ")", "]", ",", "=>", "else"}:
@@ -2423,8 +2438,8 @@ class Parser:
                 return Expr("print", token, self.arguments(opening))
             local = token if self.current.text != "::" else None
             path, type_arguments = self.expression_path(token, allow_record=allow_record)
-            if path.text in INTEGER_CONSTANTS:
-                return Expr("literal", path, INTEGER_CONSTANTS[path.text])
+            if path.text in SCALAR_CONSTANTS:
+                return Expr("literal", path, SCALAR_CONSTANTS[path.text])
             if path.text in self.constants:
                 constant = self.constants[path.text]
                 return Expr("literal", path, (constant.kind, constant.value))
@@ -2458,7 +2473,7 @@ class Parser:
     @staticmethod
     def literal(token, negative=False):
         word = token.text
-        if word[0].isdigit():
+        if word and word[0].isdigit():
             suffix = INTEGER_SUFFIX.search(word)
             kind = suffix.group() if suffix else "i32"
             digits = (word[:suffix.start()] if suffix else word).replace("_", "")
@@ -2476,8 +2491,16 @@ class Parser:
             raise token.error("expected an integer after '-'")
         if word in {"true", "false"}:
             return Expr("literal", token, ("bool", word == "true"))
-        if word.startswith('"'):
+        if word.startswith(('"', 'r"', 'r#')):
             return Expr("literal", token, ("&str", decode_string(token)))
+        if word.startswith(('b"', 'br"', 'br#')):
+            value = decode_string(replace(token, text=word[1:]), byte=True)
+            return Expr("byte_string", token, tuple(map(ord, value)))
+        if word.startswith("b'"):
+            value = decode_string(replace(token, text=word[1:]), byte=True)
+            return Expr("literal", token, ("u8", ord(value)))
+        if len(word) > 2 and word.startswith("'") and word.endswith("'"):
+            return Expr("literal", token, ("char", Character(decode_string(token))))
         return None
 
     def expression_path(self, token, *, allow_record=True):
@@ -2504,10 +2527,11 @@ class Parser:
             parameter = self.type_parameters.get(word)
             if self.accept("_"):
                 arguments.append(None)
-            elif lifetimes and word.startswith("'"):
+            elif lifetimes and LIFETIME.fullmatch(word):
                 arguments.append(LifetimeArgument(self.advance().text))
             elif (word in {"{", "-", "true", "false"} or self.unqualified_constant()
                   or word and word[0].isdigit()
+                  or word.endswith("'") and word.startswith(("'", "b'"))
                   or (parameter and parameter.const_type)):
                 arguments.append(self.const_argument())
             else:
@@ -2571,9 +2595,11 @@ class Parser:
                 kind = left_kind or right_kind or hint or "i32"
                 if left_kind and right_kind and left_kind != right_kind:
                     raise expr.token.error("constant operands have different types")
+                if kind == "char" and (left_kind != kind or right_kind != kind):
+                    raise expr.token.error("character comparison requires two characters")
                 if word in COMPARE or (kind == "bool" and word in {"&&", "||"}):
                     return ConstExpression(word, (left, right), "bool", expr.token, kind)
-                if kind != "bool" and word in {*ARITHMETIC, "/", "%"}:
+                if kind in INTEGER_TYPES and word in {*ARITHMETIC, "/", "%"}:
                     return ConstExpression(word, (left, right), kind, expr.token, kind)
             if all(isinstance(arg, ConstValue) for arg in (left, right)):
                 if left.boolean and right.boolean and word in {"&&", "||"}:
@@ -2582,13 +2608,15 @@ class Parser:
                 if word in COMPARE and left.boolean == right.boolean and (
                     not left.kind or not right.kind or left.kind == right.kind
                 ):
-                    if not left.boolean:
+                    if isinstance(left.value, Character) != isinstance(right.value, Character):
+                        raise expr.token.error("character comparison requires two characters")
+                    if type(left.value) is int:
                         kind = left.kind or right.kind or (hint if hint in INTEGER_TYPES else "i32")
                         checked(left.value, expr.token, kind)
                         checked(right.value, expr.token, kind)
                     return ConstValue(COMPARE[word](left.value, right.value), "bool")
                 kind = left.kind or right.kind
-                if (not left.boolean and not right.boolean and word in {*ARITHMETIC, "/", "%"}
+                if (type(left.value) is int and type(right.value) is int and word in {*ARITHMETIC, "/", "%"}
                         and (not left.kind or not right.kind or left.kind == right.kind)):
                     return ConstValue(binary(word, left.value, right.value, expr.token,
                                              kind or hint or "i32"), kind)
@@ -2684,8 +2712,8 @@ class Parser:
         ):
             raise token.error("expected a pattern")
         path, type_arguments = self.expression_path(token)
-        if path.text in INTEGER_CONSTANTS:
-            return Expr("literal", path, INTEGER_CONSTANTS[path.text])
+        if path.text in SCALAR_CONSTANTS:
+            return Expr("literal", path, SCALAR_CONSTANTS[path.text])
         if path.text in self.constants:
             constant = self.constants[path.text]
             return Expr("literal", path, (constant.kind, constant.value))
@@ -2737,8 +2765,16 @@ ESCAPES = {'n': '\n', 'r': '\r', 't': '\t', '0': '\0', '"': '"', "'": "'", '\\':
 STRING_ESCAPE = re.compile(r'\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,12}\}|\n\s*|.)')
 
 
-def decode_string(token):
+def decode_string(token, *, byte=False):
+    if token.text.startswith(('r"', 'r#')):
+        opening = token.text.index('"')
+        source = token.text[opening + 1:-opening]
+        if "\r" in source or (byte and not source.isascii()):
+            raise token.error("invalid character in raw string literal")
+        return source
     source = token.text[1:-1]
+    if byte and not source.isascii():
+        raise token.error("non-ASCII character in byte literal")
     parts = []
     start = 0
     while (slash := source.find("\\", start)) != -1:
@@ -2751,13 +2787,13 @@ def decode_string(token):
             parts.append(ESCAPES[escape])
         elif escape.startswith("\n"):
             pass
-        elif len(escape) == 3 and escape[0] == "x" and int(escape[1:], 16) < 128:
+        elif len(escape) == 3 and escape[0] == "x" and (byte or int(escape[1:], 16) < 128):
             parts.append(chr(int(escape[1:], 16)))
-        elif escape.startswith("u{"):
+        elif escape.startswith("u{") and not byte:
             digits = escape[2:-1].rstrip("_").replace("_", "")
             codepoint = int(digits, 16) if digits else -1
-            if not (1 <= len(digits) <= 6 and 0 <= codepoint <= 0x10FFFF
-                    and not 0xD800 <= codepoint <= 0xDFFF
+            if not (1 <= len(digits) <= 6 and 0 <= codepoint < CHAR_LIMIT
+                    and codepoint not in SURROGATES
                     and escape[2] != "_"):
                 raise token.error("invalid Unicode escape")
             parts.append(chr(codepoint))
@@ -2865,7 +2901,8 @@ def place_root(expr):
 
 def reference_source(expr):
     expr = ungroup(expr)
-    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference", "slice_reference"} or (
+    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference",
+                         "slice_reference", "byte_string"} or (
         expr.kind == "block" and not expr.label
     )
 
@@ -2974,7 +3011,11 @@ class IntegerRange:
     stop: int
 
     def contains(self, value):
-        return self.start <= value < self.stop
+        return self.start <= ordinal(value) < self.stop
+
+
+def ordinal(value):
+    return ord(value) if isinstance(value, Character) else value
 
 
 @dataclass(frozen=True)
@@ -3059,8 +3100,8 @@ def uncovered(matrix, types, program):
                 default.append(tuple(tail))
             else:
                 explicit.append((option, tuple(tail)))
-    if annotation in INTEGER_TYPES and explicit:
-        return uncovered_integer(explicit, default, annotation, remaining_types, program)
+    if annotation in SCALAR_BOUNDS and explicit:
+        return uncovered_scalar(explicit, default, annotation, remaining_types, program)
     if isinstance(annotation, SliceType) and explicit:
         return uncovered_slice(explicit, default, annotation, remaining_types, program)
     if isinstance(annotation, ArrayType) and explicit:
@@ -3119,20 +3160,25 @@ def uncovered_slice(explicit, default, annotation, types, program):
     return None
 
 
-def uncovered_integer(explicit, default, annotation, types, program):
-    boundaries = set(INTEGER_BOUNDS[annotation])
+def uncovered_scalar(explicit, default, annotation, types, program):
+    boundaries = set(SCALAR_BOUNDS[annotation])
+    if annotation == "char":
+        boundaries.update((SURROGATES.start, SURROGATES.stop))
     ranges = []
     for first, tail in explicit:
         tag = first.tag
-        interval = tag if isinstance(tag, IntegerRange) else IntegerRange(tag[1], tag[1] + 1)
+        interval = tag if isinstance(tag, IntegerRange) else IntegerRange(ordinal(tag[1]), ordinal(tag[1]) + 1)
         boundaries.update((interval.start, interval.stop))
         ranges.append((interval, tail))
     # A pattern's membership is constant between adjacent boundaries.
     for value in sorted(boundaries)[:-1]:
+        if annotation == "char" and value in SURROGATES:
+            continue
         rows = default + [tail for interval, tail in ranges if interval.contains(value)]
         missing = uncovered(rows, types, program)
         if missing is not None:
-            return (((annotation, value), ()), *missing)
+            shown = Character(chr(value)) if annotation == "char" else value
+            return (((annotation, shown), ()), *missing)
     return None
 
 
@@ -3535,7 +3581,10 @@ class Checker:
         if kind == "bool":
             if not value.boolean:
                 raise token.error("expected a bool constant")
-        elif value.boolean:
+        elif kind == "char":
+            if not isinstance(value.value, Character):
+                raise token.error("expected a char constant")
+        elif type(value.value) is not int:
             raise token.error(f"expected a {kind} constant")
         else:
             checked(value.value, token, kind)
@@ -3599,7 +3648,7 @@ class Checker:
         for operand, result, token in self.unary_results:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
-                if operand not in CONST_TYPES:
+                if operand != "bool" and operand not in INTEGER_TYPES:
                     raise token.error(f"cannot negate {operand} with '!'")
                 self.require(result, operand, token)
         for variable in self.variables:
@@ -3925,19 +3974,20 @@ class Checker:
             return Pattern(tag=(actual, value)), {}
         if kind == "pattern_range":
             first, last, inclusive = args
-            integer = self.resolve(annotation)
-            if integer not in INTEGER_TYPES:
-                integer = next((endpoint.args[0] for endpoint in (first, last)
-                                if endpoint and not endpoint.unsuffixed and endpoint.args[0] in INTEGER_TYPES), "i32")
-            self.require(integer, annotation, token)
+            scalar = self.resolve(annotation)
+            if scalar not in SCALAR_BOUNDS:
+                scalar = next((endpoint.args[0] for endpoint in (first, last)
+                               if endpoint and not endpoint.unsuffixed and endpoint.args[0] in SCALAR_BOUNDS), "i32")
+            self.require(scalar, annotation, token)
             for endpoint in (first, last):
                 if endpoint:
-                    actual = integer if endpoint.unsuffixed else endpoint.args[0]
-                    self.require(actual, integer, endpoint.token)
-                    checked(endpoint.args[1], endpoint.token, integer)
-            lower, upper = INTEGER_BOUNDS[integer]
-            start = first.args[1] if first else lower
-            stop = last.args[1] + int(inclusive) if last else upper
+                    actual = scalar if endpoint.unsuffixed and scalar in INTEGER_TYPES else endpoint.args[0]
+                    self.require(actual, scalar, endpoint.token)
+                    if scalar in INTEGER_TYPES:
+                        checked(endpoint.args[1], endpoint.token, scalar)
+            lower, upper = SCALAR_BOUNDS[scalar]
+            start = ordinal(first.args[1]) if first else lower
+            stop = ordinal(last.args[1]) + int(inclusive) if last else upper
             if start >= stop:
                 raise token.error("empty integer range pattern")
             return Pattern(tag=IntegerRange(start, stop)), {}
@@ -4198,17 +4248,17 @@ class Checker:
                 self.require_argument(result, target, token)
                 expr.kind, expr.args = "group", (value,)
                 return result
-            if target in INTEGER_TYPES:
-                hint = target if self.unsuffixed_integer(value) else None
+            if target in SCALAR_BOUNDS:
+                hint = ("u8" if target == "char" else target) if self.unsuffixed_integer(value) else None
                 actual = self.type_of(value, scope, hint)
                 if actual == NEVER:
                     expr.kind, expr.args = "group", (value,)
                     return NEVER
-                if actual not in CONST_TYPES:
+                if (target == "char" and actual != "u8") or actual not in CONST_TYPES:
                     raise token.error(f"cannot cast {actual} to {target}")
-                expr.kind = "integer_cast"
+                expr.kind = "scalar_cast"
                 return target
-            raise token.error("supported casts convert integers and borrowed slices or trait objects")
+            raise token.error("supported casts convert numbers, characters, or borrowed references")
         if kind in {"dyn_reference", "slice_reference"}:
             return self.program.expr_types[id(expr)]
         if kind == "literal":
@@ -4222,6 +4272,8 @@ class Checker:
             if annotation in INTEGER_TYPES:
                 checked(value, token, annotation)
             return annotation
+        if kind == "byte_string":
+            return ReferenceType(ArrayType("u8", ConstValue(len(args), "usize")), False, "'static")
         if kind == "const_value":
             return args[0].const_type
         if kind in {"array", "array_repeat"}:
@@ -5275,6 +5327,10 @@ class Ownership:
                                         two_phase=two_phase, extend_to=extend_to)
         if expr.kind in {"call", "indirect_call"}:
             return self.lower_call(expr, scope, cursor)
+        if expr.kind == "byte_string":
+            place = Place(Local(expr.token, False, static=True))
+            cursor = self.emit(cursor, "declare", place, expr.token)
+            return self.start_loan(cursor, place, False, expr.token)
         if expr.kind == "block":
             statements, tail = expr.args
             inner = Scope(scope)
@@ -5491,12 +5547,12 @@ class Ownership:
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
-        if kind in {"literal", "name", "default", "const_value", "function_pointer"}:
+        if kind in {"literal", "name", "default", "const_value", "function_pointer", "byte_string"}:
             return cursor
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
             return cursor
-        if kind in {"group", "field", "unary", "deref", "integer_cast"}:
+        if kind in {"group", "field", "unary", "deref", "scalar_cast"}:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
@@ -5856,16 +5912,17 @@ def display(value, debug):
     if isinstance(value, bool):
         return "true" if value else "false"
     if debug and isinstance(value, str):
-        parts = ['"']
+        quote = "'" if isinstance(value, Character) else '"'
+        parts = [quote]
         for char in value:
-            if char in {'"', '\\', '\n', '\r', '\t', '\0'}:
+            if char in {quote, '\\', '\n', '\r', '\t', '\0'}:
                 escape = next(key for key, item in ESCAPES.items() if item == char)
                 parts.append("\\" + escape)
             elif not char.isprintable():
                 parts.append(f"\\u{{{ord(char):x}}}")
             else:
                 parts.append(char)
-        return "".join(parts) + '"'
+        return "".join(parts) + quote
     return str(value)
 
 
@@ -5928,7 +5985,7 @@ class Interpreter:
         if annotation in INTEGER_TYPES:
             return 0
         if annotation in PRIMITIVES:
-            return {"bool": False, "&str": "", "()": None}[annotation]
+            return {"bool": False, "char": Character("\0"), "&str": "", "()": None}[annotation]
         if isinstance(annotation, ArrayType):
             return ArrayValue(tuple(self.default_value(annotation.element)
                                     for _ in range(annotation.length.value)))
@@ -6051,6 +6108,8 @@ class Interpreter:
             return self.eval(args[0], scope)
         if kind == "literal":
             return args[1]
+        if kind == "byte_string":
+            return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
             return substitute(args[0], self.type_arguments).value
         if kind == "array":
@@ -6193,10 +6252,13 @@ class Interpreter:
                 return not value
             lower, upper = INTEGER_BOUNDS[annotation]
             return ~value if lower < 0 else (upper - 1) ^ value
-        if kind == "integer_cast":
+        if kind == "scalar_cast":
             value, target = args
+            number = int(ordinal(self.eval(value, scope)))
+            if target == "char":
+                return Character(chr(number))
             lower, upper = INTEGER_BOUNDS[target]
-            return (int(self.eval(value, scope)) - lower) % (upper - lower) + lower
+            return (number - lower) % (upper - lower) + lower
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)

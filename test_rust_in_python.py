@@ -1220,6 +1220,39 @@ VALID = [
         }
     """, "340282366920938463463374607431768211455 -128 -170141183460469231731687303715884105728\n"
          "12 3000000001 44 3000000000 252 -4\n200 63 1 64\n"),
+    ("characters are Unicode scalars in patterns and const generics", r"""
+        const UPPER: char = 'Ω';
+        const ORDER: bool = 'A' < UPPER;
+        fn fixed<const C: char>() -> char { C }
+        fn group(c: char) -> u8 {
+            match c {
+                char::MIN..='\u{D7FF}' => 1,
+                '\u{E000}'..=char::MAX => 2,
+            }
+        }
+        fn identity<'a>(x: &'a u8) -> &'a u8 { x }
+        fn main() {
+            let crab = loop { break '🦀'; };
+            let backslash = '\\';
+            let quote = '\'';
+            let visible = 65 as char;
+            let escaped = b'\xFF';
+            let accent = fixed::<'é'>();
+            println!("{visible} {} {crab:?} {accent}", *identity(&escaped));
+            println!("{backslash:?} {quote:?} {} {} {}", ORDER, group(accent), group(crab));
+            println!("{} {}", UPPER as u32, '\u{1F_680}');
+        }
+    """, "A 255 '🦀' é\n'\\\\' '\\'' true 1 2\n937 🚀\n"),
+    ("raw strings and static byte strings", r"""
+        fn literal() -> &'static [u8; 3] { b"AB\xFF" }
+        fn payload(bytes: &[u8]) -> usize { bytes.len() }
+        fn main() {
+            let raw = r##"A "# and \n"##;
+            let bytes = br#"A \n"#;
+            println!(r#"{raw} {bytes:?}"#);
+            println!("{:?} {:?} {}", literal(), b"", payload(b"abc"));
+        }
+    """, 'A "# and \\n [65, 32, 92, 110]\n[65, 66, 255] [] 3\n'),
 ]
 
 INVALID = [
@@ -1792,6 +1825,15 @@ INVALID = [
     ("arithmetic requires matching integer widths", """
         fn main() { let _ = 1i16 + 1i64; }
     """, "expected i16, found i64"),
+    ("character literals cannot encode surrogates", r"""
+        fn main() { let _ = '\u{D800}'; }
+    """, "invalid Unicode escape"),
+    ("byte literals require ASCII or a byte escape", """
+        fn main() { let _ = b'é'; }
+    """, "non-ASCII character"),
+    ("integer to character casts require a byte", """
+        fn main() { let _ = 65u16 as char; }
+    """, "cannot cast u16 to char"),
 ]
 
 
@@ -1809,7 +1851,7 @@ class InterpreterTests(unittest.TestCase):
             root = folder / "main.rs"
             root.write_text("""
                 mod outer;
-                #[path = "renamed.rs"] mod alias;
+                #[path = r#"renamed.rs"#] mod alias;
                 fn main() { println!("{} {}", outer::value(), alias::value()); }
             """, encoding="utf-8")
             bad = folder / "invalid.rs"
