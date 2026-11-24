@@ -1217,6 +1217,17 @@ macro_rules! matches {
         match $value { $pattern $(if $guard)? => true, _ => false }
     }};
 }
+macro_rules! thread_local {
+    () => {};
+    ($(#[$attribute:meta])* $visibility:vis static $name:ident : $kind:ty = const { $init:expr } $(; $($rest:tt)*)?) => {
+        $visibility static $name: std::thread::LocalKey<$kind> = std::thread::LocalKey::new(|| $init);
+        $(thread_local!($($rest)*);)?
+    };
+    ($(#[$attribute:meta])* $visibility:vis static $name:ident : $kind:ty = $init:expr $(; $($rest:tt)*)?) => {
+        $visibility static $name: std::thread::LocalKey<$kind> = std::thread::LocalKey::new(|| $init);
+        $(thread_local!($($rest)*);)?
+    };
+}
 """
 
 
@@ -3825,6 +3836,8 @@ class Parser:
             return lifetimes, types
         outer = self.type_parameters
         self.type_parameters = dict(outer)
+        declared = self.declared_type_parameters()
+        self.type_parameters.update(declared)
         while self.current.text != ">":
             token = self.advance()
             if is_lifetime(token.text) and token.text not in {"'static", "'_"}:
@@ -3851,7 +3864,7 @@ class Parser:
                 name = identifier_text(token.text)
                 if name in types:
                     raise token.error(f"duplicate type parameter {token.text}")
-                parameter = TypeParameter(name)
+                parameter = declared.get(name) or TypeParameter(name)
                 types[name] = self.type_parameters[name] = parameter
                 if self.accept(":"):
                     parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
@@ -3867,6 +3880,26 @@ class Parser:
         for bounds in lifetimes.values():
             self.require_lifetimes(bounds, lifetimes)
         return lifetimes, types
+
+    def declared_type_parameters(self):
+        """The type parameters a generic list declares, so a bound may name one declared after it."""
+        declared = {}
+        offset, depth, start = 0, 0, True
+        while True:
+            text = self.current.text if offset == 0 else self.peek(offset - 1)
+            if not text or depth == 0 and text in {">", ">>", ">=", ">>="}:
+                return declared
+            if text in {"<", "(", "[", "{"}:
+                depth += 1
+            elif text in {">", ")", "]", "}"}:
+                depth -= 1
+            elif text == ">>":
+                depth -= 2
+            elif (start and depth == 0 and is_identifier(text) and text != "const"
+                  and text not in self.reserved and not is_lifetime(text)):
+                declared.setdefault(identifier_text(text), TypeParameter(identifier_text(text)))
+            start = depth == 0 and text == ","
+            offset += 1
 
     def trait_path(self):
         token = self.advance() if self.current.text in {"crate", "self", "super"} else self.identifier()
@@ -7366,7 +7399,7 @@ class Checker:
             pointer = self.program.expr_types[id(place.args[0])]
             if pointer == NEVER:
                 return
-            if write and not pointer.mutable:
+            if write and not pointer.mutable and not self.deref_mut_call(place.args[0]):
                 raise expr.token.error("cannot write through a shared reference")
             return
         if place.kind != "name":
@@ -8315,7 +8348,16 @@ class Checker:
             # Unsized coercions to trait objects happen after the call, in type_of.
             expected = None
         if expected is not None and arguments and not defer_projection:
-            self.require_argument(result, expected, token)
+            if first is not None and params:
+                # The receiver settles Self's parameters first; the expected type is then only a hint,
+                # since the result may still reach it by a deref coercion (&String to &str).
+                self.require_argument(first, params[0], token)
+                try:
+                    self.require_argument(result, expected, token)
+                except RustError:
+                    pass
+            else:
+                self.require_argument(result, expected, token)
         for parameter, owner in arguments.items():
             if isinstance(parameter, TypeParameter):
                 for binding, value in parameter.associated_bindings.items():
@@ -8634,7 +8676,7 @@ class Checker:
                 view = Expr("range_index", expr.token, (receiver, None, None, False))
                 expr.args = (Expr("borrow", expr.token, (view, mutable), auto_borrow=True), *rest)
                 return self.method_type(expr, scope, expected)
-        if name == "clone" and not rest:
+        if name == "clone" and not rest and (self.implements(base, "Clone") or not self.derefs(base)):
             expr.kind = "clone"
             return self.check_expr(expr, scope, expected)
         if ((name == "to_string" or (name == "to_owned" and base in {STRING, "str"}))
@@ -9198,9 +9240,30 @@ class Checker:
             if function is not None:
                 self.program.call_functions[id(call)] = replace(function, result=reference, return_inputs=())
         self.program.expr_types[id(call)] = reference
+        self.__dict__.setdefault("overloaded_derefs", {})[id(call)] = (call, value, actual, scope)
         target = Expr("deref", token, (call, False))
         self.program.expr_types[id(target)] = reference.inner
         return target, self.resolve(reference.inner)
+
+    def deref_mut_call(self, call):
+        """Turn an overloaded `*value` that is written through into `*DerefMut::deref_mut(&mut value)`."""
+        entry = self.__dict__.get("overloaded_derefs", {}).get(id(call))
+        if entry is None or entry[0] is not call or DEREF_MUT not in self.program.traits:
+            return False
+        _, value, actual, scope = entry
+        actual = self.resolve(actual)
+        base = actual.inner if isinstance(actual, ReferenceType) else actual
+        if isinstance(actual, ReferenceType) and not actual.mutable or not self.implements(base, DEREF_MUT):
+            return False
+        if not isinstance(actual, ReferenceType):
+            self.require_place(value, write=True, allow_temporary=True)
+        CaptureContext.mark_mutable(scope, value)
+        trait = self.program.traits[DEREF_MUT]
+        call.token, call.args = replace(call.token, text="deref_mut"), (value,)
+        bindings = self.trait_bindings(trait, base, call)
+        reference = self.resolve(self.receiver_call(call, scope, None, trait.methods["deref_mut"], bindings, actual))
+        self.program.expr_types[id(call)] = reference
+        return reference.mutable
 
     def index_call(self, expr, scope, base, index, annotation):
         """Index a non-built-in collection through std::ops::Index or IndexMut."""
@@ -9773,7 +9836,8 @@ class Ownership:
             expiring = frozenset()
             if place is None:
                 cursor = self.lower(target, scope, cursor)
-                promoted = not mutable and self.promotable(target)
+                promoted = (not mutable and self.promotable(target)
+                            or place_root(target).kind in {"static_item", "lazy_static"})
                 local = Local(Token("<temporary value>", expr.token.line, expr.token.column),
                               not promoted, static=promoted)
                 place = Place(local)
@@ -10845,6 +10909,14 @@ class Interpreter:
                 scope[name] = Binding(item, mutable)
             yield scope
 
+    def eval_condition(self, condition, scope):
+        """Evaluate an `if` or `while` condition, which drops its temporaries before the body runs."""
+        mark = len(self.temporaries)
+        value = self.eval(condition, scope)
+        if self.track_drops and len(self.temporaries) > mark:
+            self.drop_temporaries(mark, condition)
+        return value
+
     def eval_chain(self, conditions, scope):
         inner = Scope(scope)
         for source, condition in conditions:
@@ -11096,7 +11168,10 @@ class Interpreter:
                 implementation = self.cached_implementation(value.constructor.annotation, DROP)
                 if implementation:
                     impl, arguments = implementation
-                    self.call(impl.methods["drop"].name.text, (Address(Binding(value, True)),), arguments)
+                    slot = Binding(value, True)
+                    self.call(impl.methods["drop"].name.text, (Address(slot),), arguments)
+                    # Drop glue then drops the fields as `drop` left them (e.g. after Option::take).
+                    value = slot.value if isinstance(slot.value, Value) else value
             for item in value.fields:
                 self.drop_value(item)
         elif isinstance(value, ArrayValue):
@@ -11109,6 +11184,15 @@ class Interpreter:
                     self.drop_value(item)
         elif isinstance(value, BoxValue):
             self.drop_value(value.read())
+        elif isinstance(value, FunctionValue) and value.environment:
+            for capture in self.functions[value.name].captures:
+                binding = value.environment.get(capture.name.key)
+                if capture.by_move and binding is not None and not binding.moved:
+                    binding.moved = True
+                    self.drop_value(binding.value)
+        elif isinstance(value, IteratorValue):
+            for mapper in value.mappers:
+                self.drop_value(mapper)
 
     def drop_temporaries(self, mark, statement):
         """Drop temporaries a statement created, except a borrowed initializer that a let extends."""
@@ -11626,14 +11710,22 @@ class Interpreter:
             for capture in self.program.functions[name].captures:
                 binding = scope.find(capture.name)
                 environment[capture.name.key] = Binding(binding.value, capture.mutable) if capture.by_move else binding
+                if (capture.by_move and self.track_drops and not binding.moved and not self.program.is_copy(
+                        self.program.normalize(substitute(capture.annotation, self.type_arguments)))):
+                    # The closure owns what it captured by value and drops it when it is dropped.
+                    binding.moved = True
             return FunctionValue(name, {parameter: self.program.normalize(substitute(value, self.type_arguments))
                                         for parameter, value in arguments.items()}, environment)
         if kind == "indirect_call":
-            callee = self.eval(args[0], scope)
+            callee = owned = self.eval(args[0], scope)
             while isinstance(callee, (Address, BoxValue, DynAddress)):
                 callee = callee.read()
             values = tuple(self.eval(argument, scope) for argument in args[1:])
-            return self.call(callee.name, values, callee.arguments, callee.environment)
+            result = self.call(callee.name, values, callee.arguments, callee.environment)
+            if self.track_drops and id(args[0]) in self.program.moves:
+                # Calling an FnOnce closure by value consumes it.
+                self.drop_value(owned)
+            return result
         if kind == "try":
             value, enclosing = args
             value = self.eval(value, scope)
@@ -11871,7 +11963,7 @@ class Interpreter:
             return None
         if kind == "if":
             condition, yes, no = args
-            branch = yes if self.eval(condition, scope) else no
+            branch = yes if self.eval_condition(condition, scope) else no
             return self.eval(branch, scope) if branch else None
         if kind == "if_chain":
             conditions, yes, no = args
@@ -11888,7 +11980,7 @@ class Interpreter:
             while True:
                 try:
                     inner = scope
-                    if kind == "while" and not self.eval(args[0], scope):
+                    if kind == "while" and not self.eval_condition(args[0], scope):
                         return None
                     if kind == "while_let":
                         condition, source, _ = args
@@ -14197,7 +14289,7 @@ def rust_duration_debug(interpreter, result, nanos, formatter):
 @intrinsic
 def rust_clock_nanos(interpreter, result):
     import time
-    return time.perf_counter_ns()
+    return time.perf_counter_ns() + getattr(interpreter, "clock_offset", 0)
 
 
 @intrinsic
@@ -14516,6 +14608,214 @@ def rust_box_unsized(interpreter, result, value):
 @intrinsic
 def rust_track_drops(interpreter, result):
     interpreter.track_drops = True
+
+
+class GreenThread:
+    """One Rust thread: a Python thread that runs only while it holds the scheduler's baton."""
+
+    def __init__(self, ident, name):
+        self.ident = ident
+        self.name = name
+        self.wake = None
+        self.finished = False
+        self.panicked = False
+        self.result = None
+        self.blocked_at = None
+        self.state = None
+
+
+class GreenScheduler:
+    """Runs Rust threads one at a time, switching only where a thread blocks, yields, or spawns.
+
+    A spawned thread runs at once and its parent resumes when it finishes or blocks, so programs
+    whose output does not depend on timing print what rustc's build prints. Blocked threads poll:
+    they wait in the ready queue and recheck their condition when resumed. `version` counts state
+    changes that could unblock a thread; when every live thread has blocked without one, the
+    program has deadlocked.
+    """
+
+    STACK_SIZE = 256 * 1024 * 1024
+
+    def __init__(self, interpreter):
+        import threading
+        self.threading = threading
+        self.interpreter = interpreter
+        main = GreenThread(1, "main")
+        main.wake = threading.Semaphore(0)
+        self.threads = {1: main}
+        self.current = main
+        self.ready = deque()
+        self.version = 0
+        self.next_ident = 2
+        self.fatal = None
+        self.locals = {}
+
+    @staticmethod
+    def of(interpreter):
+        scheduler = getattr(interpreter, "green_scheduler", None)
+        if scheduler is None:
+            scheduler = interpreter.green_scheduler = GreenScheduler(interpreter)
+        return scheduler
+
+    def save(self, thread):
+        interpreter = self.interpreter
+        thread.state = (interpreter.temporaries, interpreter.type_arguments,
+                        getattr(interpreter, "intrinsic_types", None), getattr(interpreter, "intrinsic_receiver", None))
+
+    def resume(self, thread):
+        interpreter = self.interpreter
+        (interpreter.temporaries, interpreter.type_arguments,
+         interpreter.intrinsic_types, interpreter.intrinsic_receiver) = thread.state
+        self.current = thread
+        if self.fatal is not None and thread.ident == 1:
+            fatal, self.fatal = self.fatal, None
+            raise fatal
+
+    def switch(self, me, target):
+        """Hand the baton to `target` and wait until some thread hands it back to `me`."""
+        self.save(me)
+        target.wake.release()
+        me.wake.acquire()
+        self.resume(me)
+
+    def spawn(self, closure, name):
+        child = GreenThread(self.next_ident, name)
+        self.next_ident += 1
+        child.wake = self.threading.Semaphore(0)
+        child.state = ([], self.interpreter.type_arguments, None, None)
+        self.threads[child.ident] = child
+        previous = self.threading.stack_size()
+        self.threading.stack_size(self.STACK_SIZE)
+        try:
+            worker = self.threading.Thread(target=self.run, args=(child, closure), daemon=True)
+            worker.start()
+        finally:
+            self.threading.stack_size(previous)
+        me = self.current
+        me.blocked_at = None
+        self.version += 1
+        self.ready.appendleft(me)
+        self.switch(me, child)
+        return child.ident
+
+    def run(self, thread, closure):
+        thread.wake.acquire()
+        interpreter = self.interpreter
+        try:
+            self.resume(thread)
+            thread.result = interpreter.call_value(closure)
+            if interpreter.track_drops:
+                interpreter.drop_value(closure)
+        except RustPanic as error:
+            thread.panicked = True
+            print(f"thread '{thread.name or '<unnamed>'}' panicked:\n{error}", file=sys.stderr)
+        except BaseException as error:
+            # Errors that end the process (exit, interpreter limits) surface on the main thread.
+            thread.finished = True
+            self.fatal = error
+            main = self.threads[1]
+            self.ready.remove(main)
+            main.wake.release()
+            return
+        thread.finished = True
+        self.version += 1
+        self.ready.popleft().wake.release()
+
+    def block(self):
+        """Let other threads run before rechecking a condition; False when none of them can change it."""
+        me = self.current
+        me.blocked_at = self.version
+        if all(thread.blocked_at == self.version for thread in self.ready):
+            return False
+        self.ready.append(me)
+        self.switch(me, self.ready.popleft())
+        return True
+
+    def yield_now(self):
+        me = self.current
+        me.blocked_at = None
+        if self.ready:
+            self.ready.append(me)
+            self.switch(me, self.ready.popleft())
+
+    def wait(self, ident):
+        thread = self.threads[ident]
+        while not thread.finished:
+            if not self.block():
+                raise RustPanic("deadlock: joined thread can never finish")
+        return thread
+
+
+@intrinsic
+def rust_green_spawn(interpreter, result, closure, name, named):
+    return GreenScheduler.of(interpreter).spawn(closure, text_of(name) if named else None)
+
+
+@intrinsic
+def rust_green_join(interpreter, result, ident):
+    thread = GreenScheduler.of(interpreter).wait(ident)
+    if thread.panicked:
+        return option(interpreter, result)
+    value, thread.result = thread.result, None
+    return option(interpreter, result, value)
+
+
+@intrinsic
+def rust_green_wait(interpreter, result, ident):
+    return GreenScheduler.of(interpreter).wait(ident).panicked
+
+
+@intrinsic
+def rust_green_finished(interpreter, result, ident):
+    return GreenScheduler.of(interpreter).threads[ident].finished
+
+
+@intrinsic
+def rust_green_block(interpreter, result):
+    return GreenScheduler.of(interpreter).block()
+
+
+@intrinsic
+def rust_green_yield(interpreter, result):
+    GreenScheduler.of(interpreter).yield_now()
+
+
+@intrinsic
+def rust_green_progress(interpreter, result):
+    scheduler = getattr(interpreter, "green_scheduler", None)
+    if scheduler is not None:
+        scheduler.version += 1
+
+
+@intrinsic
+def rust_green_current_id(interpreter, result):
+    scheduler = getattr(interpreter, "green_scheduler", None)
+    return 1 if scheduler is None else scheduler.current.ident
+
+
+@intrinsic
+def rust_green_current_name(interpreter, result):
+    scheduler = getattr(interpreter, "green_scheduler", None)
+    name = "main" if scheduler is None else scheduler.current.name
+    return option(interpreter, result) if name is None else option(interpreter, result, name)
+
+
+@intrinsic
+def rust_green_sleep(interpreter, result, nanos):
+    interpreter.clock_offset = getattr(interpreter, "clock_offset", 0) + nanos
+    if getattr(interpreter, "green_scheduler", None) is not None:
+        interpreter.green_scheduler.yield_now()
+
+
+@intrinsic
+def rust_green_local(interpreter, result, key):
+    scheduler = GreenScheduler.of(interpreter)
+    owner = map_of(key)
+    slot = scheduler.locals.get((scheduler.current.ident, id(owner)))
+    if slot is None:
+        value = interpreter.call_value(owner.fields[0])
+        slot = scheduler.locals[(scheduler.current.ident, id(owner))] = (owner, Binding(value, True))
+    return Address(slot[1])
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):

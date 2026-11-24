@@ -1,0 +1,6 @@
+0
+got 12 messages: [0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23]
+["CHERRY", "DATE", "apple", "banana"]
+consumer sum = 55
+recv error: RecvError / receiving on a closed channel
+answers [9, 16, 25], served 3

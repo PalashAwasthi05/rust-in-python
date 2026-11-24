@@ -1,0 +1,10 @@
+0
+[0, 1, 2, 100, 101, 102]
+try_send full: true
+try_recv: Ok("first")
+try_recv empty: Err(Empty)
+try_recv after drop: Err(Disconnected)
+rendezvous total 18
+send after receiver dropped: true
+returned value 7
+bounded fan-in [0, 1, 100, 101, 200, 201]

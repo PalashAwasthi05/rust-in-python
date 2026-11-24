@@ -1,0 +1,8 @@
+0
+submitted all jobs
+shut down worker 0
+shut down worker 1
+shut down worker 2
+pool ran 7 jobs
+results [1, 5, 21, 55, 144, 233, 610]
+sum 1069

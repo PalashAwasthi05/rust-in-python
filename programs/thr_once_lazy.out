@@ -1,0 +1,20 @@
+0
+before: None
+initializing config
+len 10
+len 10
+len 10
+after: Some("production")
+set again: Err("dev")
+main before table
+building table
+two = 2
+three = Some(3)
+total = 6
+one-time setup
+registry ["x", "y", "z"]
+setup done: true
+cell 5 Some(5)
+into_inner Some(5)
+lazy len 3
+forced [1, 2, 3]

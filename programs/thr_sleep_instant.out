@@ -1,0 +1,16 @@
+0
+[2, 4, 6]
+elapsed at least 5ms: true
+elapsed under a minute: true
+1.5s secs=1 millis=1500
+2.00025s 2000250
+60ms
+1.5µs
+0.25
+500
+monotonic: true
+since: true
+recv_timeout: Err(Timeout)
+recv_timeout with data: Ok(9)
+deadline in future: true
+done
