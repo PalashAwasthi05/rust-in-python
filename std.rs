@@ -45,6 +45,7 @@ pub mod intrinsics {
     pub fn range_next<A>(range: &mut crate::ops::Range<A>) -> Option<A>;
     pub fn range_length<A>(range: &crate::ops::Range<A>) -> usize;
     pub fn wrapping_op<T>(left: T, right: T, operator: u8) -> T;
+    pub fn wrapping_shift<T>(value: T, amount: usize, left: bool) -> T;
     pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
@@ -1362,8 +1363,11 @@ pub mod ops {
 
 pub mod num_wrapping {
     use crate::fmt;
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub struct Wrapping<T>(pub T);
+    impl<T: fmt::Debug> fmt::Debug for Wrapping<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.0, f) }
+    }
     impl<T: fmt::Display> fmt::Display for Wrapping<T> {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
     }
@@ -1387,6 +1391,63 @@ pub mod num_wrapping {
     }
     impl<T> crate::ops::MulAssign for Wrapping<T> {
         fn mul_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 2); }
+    }
+    impl<T> crate::ops::Div for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn div(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 3)) }
+    }
+    impl<T> crate::ops::DivAssign for Wrapping<T> {
+        fn div_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 3); }
+    }
+    impl<T> crate::ops::Rem for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn rem(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 4)) }
+    }
+    impl<T> crate::ops::RemAssign for Wrapping<T> {
+        fn rem_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 4); }
+    }
+    impl<T> crate::ops::BitAnd for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn bitand(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 6)) }
+    }
+    impl<T> crate::ops::BitAndAssign for Wrapping<T> {
+        fn bitand_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 6); }
+    }
+    impl<T> crate::ops::BitOr for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn bitor(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 7)) }
+    }
+    impl<T> crate::ops::BitOrAssign for Wrapping<T> {
+        fn bitor_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 7); }
+    }
+    impl<T> crate::ops::BitXor for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn bitxor(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 8)) }
+    }
+    impl<T> crate::ops::BitXorAssign for Wrapping<T> {
+        fn bitxor_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 8); }
+    }
+    impl<T: Copy> crate::ops::Neg for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn neg(self) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, self.0, 5)) }
+    }
+    impl<T: Copy> crate::ops::Not for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn not(self) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, self.0, 9)) }
+    }
+    impl<T> crate::ops::Shl<usize> for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn shl(self, amount: usize) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_shift(self.0, amount, true)) }
+    }
+    impl<T> crate::ops::Shr<usize> for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn shr(self, amount: usize) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_shift(self.0, amount, false)) }
+    }
+    impl<T> crate::ops::ShlAssign<usize> for Wrapping<T> {
+        fn shl_assign(&mut self, amount: usize) { self.0 = crate::intrinsics::wrapping_shift(self.0, amount, true); }
+    }
+    impl<T> crate::ops::ShrAssign<usize> for Wrapping<T> {
+        fn shr_assign(&mut self, amount: usize) { self.0 = crate::intrinsics::wrapping_shift(self.0, amount, false); }
     }
 }
 
@@ -1577,9 +1638,36 @@ pub mod char {
         pub fn from_u32(i: u32) -> Option<char>;
         pub fn from_digit(num: u32, radix: u32) -> Option<char>;
     }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TryFromCharError(());
+    impl crate::fmt::Display for TryFromCharError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "unicode code point out of range") }
+    }
+    impl crate::convert::TryFrom<char> for u8 {
+        type Error = TryFromCharError;
+        fn try_from(c: char) -> Result<u8, TryFromCharError> {
+            if (c as u32) < 256 { Ok(c as u8) } else { Err(TryFromCharError(())) }
+        }
+    }
+    impl crate::convert::TryFrom<char> for u16 {
+        type Error = TryFromCharError;
+        fn try_from(c: char) -> Result<u16, TryFromCharError> {
+            if (c as u32) < 65536 { Ok(c as u32 as u16) } else { Err(TryFromCharError(())) }
+        }
+    }
+    impl crate::convert::From<char> for u128 { fn from(value: char) -> u128 { value as u128 } }
+    pub fn from_u32(i: u32) -> Option<char> { char::from_u32(i) }
+    pub fn from_digit(num: u32, radix: u32) -> Option<char> { char::from_digit(num, radix) }
 }
 
 pub mod f64 {
+    pub const MAX: f64 = f64::MAX;
+    pub const MIN: f64 = f64::MIN;
+    pub const MIN_POSITIVE: f64 = f64::MIN_POSITIVE;
+    pub const EPSILON: f64 = f64::EPSILON;
+    pub const NAN: f64 = f64::NAN;
+    pub const INFINITY: f64 = f64::INFINITY;
+    pub const NEG_INFINITY: f64 = f64::NEG_INFINITY;
     pub mod consts {
         pub const PI: f64 = 3.14159265358979323846264338327950288_f64;
         pub const TAU: f64 = 6.28318530717958647692528676655900577_f64;
@@ -1600,6 +1688,13 @@ pub mod f64 {
 }
 
 pub mod f32 {
+    pub const MAX: f32 = f32::MAX;
+    pub const MIN: f32 = f32::MIN;
+    pub const MIN_POSITIVE: f32 = f32::MIN_POSITIVE;
+    pub const EPSILON: f32 = f32::EPSILON;
+    pub const NAN: f32 = f32::NAN;
+    pub const INFINITY: f32 = f32::INFINITY;
+    pub const NEG_INFINITY: f32 = f32::NEG_INFINITY;
     pub mod consts {
         pub const PI: f32 = 3.14159265358979323846264338327950288_f32;
         pub const TAU: f32 = 6.28318530717958647692528676655900577_f32;
@@ -1620,6 +1715,7 @@ pub mod convert {
     pub trait TryInto<T>: Sized { type Error; fn try_into(self) -> Result<T, Self::Error>; }
     pub trait AsRef<T> { fn as_ref(&self) -> &T; }
     pub trait AsMut<T> { fn as_mut(&mut self) -> &mut T; }
+    pub fn identity<T>(x: T) -> T { x }
 
     impl<T, U: From<T>> Into<U> for T {
         fn into(self) -> U { U::from(self) }
@@ -1655,6 +1751,12 @@ pub mod convert {
     impl From<bool> for u32 { fn from(value: bool) -> u32 { value as u32 } }
     impl From<bool> for i64 { fn from(value: bool) -> i64 { value as i64 } }
     impl From<bool> for u64 { fn from(value: bool) -> u64 { value as u64 } }
+    impl From<bool> for i8 { fn from(value: bool) -> i8 { value as i8 } }
+    impl From<bool> for i16 { fn from(value: bool) -> i16 { value as i16 } }
+    impl From<bool> for u16 { fn from(value: bool) -> u16 { value as u16 } }
+    impl From<bool> for i128 { fn from(value: bool) -> i128 { value as i128 } }
+    impl From<bool> for u128 { fn from(value: bool) -> u128 { value as u128 } }
+    impl From<bool> for isize { fn from(value: bool) -> isize { value as isize } }
     impl From<f32> for f64 { fn from(value: f32) -> f64 { value as f64 } }
     impl TryFrom<u32> for char {
         type Error = crate::num::TryFromIntError;
@@ -2499,5 +2601,91 @@ pub mod env {
     }
     pub fn var(key: &str) -> Result<String, VarError> {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
+    }
+}
+
+pub mod i8 {
+    pub const MIN: i8 = i8::MIN;
+    pub const MAX: i8 = i8::MAX;
+}
+pub mod i16 {
+    pub const MIN: i16 = i16::MIN;
+    pub const MAX: i16 = i16::MAX;
+}
+pub mod i32 {
+    pub const MIN: i32 = i32::MIN;
+    pub const MAX: i32 = i32::MAX;
+}
+pub mod i64 {
+    pub const MIN: i64 = i64::MIN;
+    pub const MAX: i64 = i64::MAX;
+}
+pub mod i128 {
+    pub const MIN: i128 = i128::MIN;
+    pub const MAX: i128 = i128::MAX;
+}
+pub mod isize {
+    pub const MIN: isize = isize::MIN;
+    pub const MAX: isize = isize::MAX;
+}
+pub mod u8 {
+    pub const MIN: u8 = u8::MIN;
+    pub const MAX: u8 = u8::MAX;
+}
+pub mod u16 {
+    pub const MIN: u16 = u16::MIN;
+    pub const MAX: u16 = u16::MAX;
+}
+pub mod u32 {
+    pub const MIN: u32 = u32::MIN;
+    pub const MAX: u32 = u32::MAX;
+}
+pub mod u64 {
+    pub const MIN: u64 = u64::MIN;
+    pub const MAX: u64 = u64::MAX;
+}
+pub mod u128 {
+    pub const MIN: u128 = u128::MIN;
+    pub const MAX: u128 = u128::MAX;
+}
+pub mod usize {
+    pub const MIN: usize = usize::MIN;
+    pub const MAX: usize = usize::MAX;
+}
+
+pub mod num_nonzero {
+    use crate::fmt;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct NonZero<T>(T);
+    impl<T: Copy + PartialEq + Default> NonZero<T> {
+        pub fn new(n: T) -> Option<NonZero<T>> { if n == T::default() { None } else { Some(NonZero(n)) } }
+        pub fn get(self) -> T { self.0 }
+    }
+    impl<T: fmt::Debug> fmt::Debug for NonZero<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.0, f) }
+    }
+    impl<T: fmt::Display> fmt::Display for NonZero<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
+    }
+}
+
+pub mod ascii_bytes {
+    impl u8 {
+        pub fn is_ascii(&self) -> bool { *self < 128 }
+        pub fn is_ascii_digit(&self) -> bool { (*self as char).is_ascii_digit() }
+        pub fn is_ascii_hexdigit(&self) -> bool { (*self as char).is_ascii_hexdigit() }
+        pub fn is_ascii_alphabetic(&self) -> bool { (*self as char).is_ascii_alphabetic() }
+        pub fn is_ascii_alphanumeric(&self) -> bool { (*self as char).is_ascii_alphanumeric() }
+        pub fn is_ascii_uppercase(&self) -> bool { (*self as char).is_ascii_uppercase() }
+        pub fn is_ascii_lowercase(&self) -> bool { (*self as char).is_ascii_lowercase() }
+        pub fn is_ascii_punctuation(&self) -> bool { (*self as char).is_ascii_punctuation() }
+        pub fn is_ascii_whitespace(&self) -> bool { (*self as char).is_ascii_whitespace() }
+        pub fn is_ascii_graphic(&self) -> bool { (*self as char).is_ascii_graphic() }
+        pub fn is_ascii_control(&self) -> bool { (*self as char).is_ascii_control() }
+        pub fn to_ascii_uppercase(&self) -> u8 { if *self >= b'a' && *self <= b'z' { *self - 32 } else { *self } }
+        pub fn to_ascii_lowercase(&self) -> u8 { if *self >= b'A' && *self <= b'Z' { *self + 32 } else { *self } }
+        pub fn make_ascii_uppercase(&mut self) { *self = self.to_ascii_uppercase(); }
+        pub fn make_ascii_lowercase(&mut self) { *self = self.to_ascii_lowercase(); }
+        pub fn eq_ignore_ascii_case(&self, other: &u8) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
     }
 }
