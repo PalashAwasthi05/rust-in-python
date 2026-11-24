@@ -4,14 +4,31 @@
 pub mod prelude {
     pub use crate::iter::Iterator;
     pub use crate::iter::IntoIterator;
-    pub use crate::cmp::Ordering;
+    pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
 }
 
 pub mod intrinsics {
-    pub fn vec_last<T>(vector: &Vec<T>) -> Option<&T>;
+    pub trait Concat {}
+    impl<T> Concat for Vec<T> {}
+    impl<T> Concat for [T] {}
+    pub trait Separator {}
+    impl Separator for &str {}
+    impl Separator for char {}
+    impl Separator for &String {}
+    impl<T> Separator for &[T] {}
+    impl<T> Separator for &Vec<T> {}
+    pub trait Join { type Output; }
+    impl Join for String { type Output = String; }
+    impl Join for &str { type Output = String; }
+    impl Join for &String { type Output = String; }
+    impl<T> Join for Vec<T> { type Output = Vec<T>; }
+
     pub fn iter_max<I: crate::iter::Iterator>(iter: I, last: bool) -> Option<I::Item>;
     pub fn iter_collect<I: crate::iter::Iterator>(iter: I) -> Vec<I::Item>;
+    pub fn range_next<A>(range: &mut crate::ops::Range<A>) -> Option<A>;
+    pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
+    pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
 }
@@ -488,13 +505,160 @@ pub mod iter {
 }
 
 pub mod cmp {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
     pub enum Ordering { Less, Equal, Greater }
+
+    impl Ordering {
+        pub fn is_eq(self) -> bool { self == Ordering::Equal }
+        pub fn is_ne(self) -> bool { self != Ordering::Equal }
+        pub fn is_lt(self) -> bool { self == Ordering::Less }
+        pub fn is_gt(self) -> bool { self == Ordering::Greater }
+        pub fn is_le(self) -> bool { self != Ordering::Greater }
+        pub fn is_ge(self) -> bool { self != Ordering::Less }
+        pub fn reverse(self) -> Ordering {
+            match self { Ordering::Less => Ordering::Greater, Ordering::Equal => Ordering::Equal, Ordering::Greater => Ordering::Less }
+        }
+        pub fn then(self, other: Ordering) -> Ordering {
+            match self { Ordering::Equal => other, _ => self }
+        }
+        pub fn then_with<F: FnOnce() -> Ordering>(self, f: F) -> Ordering {
+            match self { Ordering::Equal => f(), _ => self }
+        }
+    }
+
+    pub trait PartialEq {
+        fn eq(&self, other: &Self) -> bool;
+        fn ne(&self, other: &Self) -> bool { !self.eq(other) }
+    }
+
+    pub trait Eq: PartialEq {}
+
+    pub trait PartialOrd: PartialEq {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering>;
+        fn lt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(Ordering::Less) }
+        fn le(&self, other: &Self) -> bool {
+            match self.partial_cmp(other) { Some(Ordering::Less) | Some(Ordering::Equal) => true, _ => false }
+        }
+        fn gt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(Ordering::Greater) }
+        fn ge(&self, other: &Self) -> bool {
+            match self.partial_cmp(other) { Some(Ordering::Greater) | Some(Ordering::Equal) => true, _ => false }
+        }
+    }
+
+    pub trait Ord: Eq + PartialOrd {
+        fn cmp(&self, other: &Self) -> Ordering;
+        fn max(self, other: Self) -> Self where Self: Sized {
+            if other.cmp(&self) == Ordering::Less { self } else { other }
+        }
+        fn min(self, other: Self) -> Self where Self: Sized {
+            if other.cmp(&self) == Ordering::Less { other } else { self }
+        }
+        fn clamp(self, min: Self, max: Self) -> Self where Self: Sized {
+            if self.cmp(&min) == Ordering::Less { min } else if self.cmp(&max) == Ordering::Greater { max } else { self }
+        }
+    }
+
+    pub fn max<T: Ord>(v1: T, v2: T) -> T { v1.max(v2) }
+    pub fn min<T: Ord>(v1: T, v2: T) -> T { v1.min(v2) }
+    pub fn max_by_key<T, K: Ord, F: FnMut(&T) -> K>(v1: T, v2: T, f: F) -> T {
+        let mut f = f;
+        if f(&v2).cmp(&f(&v1)) == Ordering::Less { v1 } else { v2 }
+    }
+    pub fn min_by_key<T, K: Ord, F: FnMut(&T) -> K>(v1: T, v2: T, f: F) -> T {
+        let mut f = f;
+        if f(&v2).cmp(&f(&v1)) == Ordering::Less { v2 } else { v1 }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
+    pub struct Reverse<T>(pub T);
+    impl<T: PartialOrd> PartialOrd for Reverse<T> {
+        fn partial_cmp(&self, other: &Reverse<T>) -> Option<Ordering> { other.0.partial_cmp(&self.0) }
+    }
+    impl<T: Ord> Ord for Reverse<T> {
+        fn cmp(&self, other: &Reverse<T>) -> Ordering { other.0.cmp(&self.0) }
+    }
+}
+
+pub mod slice {
+    use crate::iter::Lazy;
+    use crate::cmp::Ordering;
+
+    impl<T> [T] {
+        pub fn first(&self) -> Option<&T>;
+        pub fn last(&self) -> Option<&T>;
+        pub fn first_mut(&mut self) -> Option<&mut T>;
+        pub fn last_mut(&mut self) -> Option<&mut T>;
+        pub fn get(&self, index: usize) -> Option<&T>;
+        pub fn get_mut(&mut self, index: usize) -> Option<&mut T>;
+        pub fn split_first(&self) -> Option<(&T, &[T])>;
+        pub fn split_last(&self) -> Option<(&T, &[T])>;
+        pub fn split_at(&self, mid: usize) -> (&[T], &[T]);
+        pub fn contains(&self, x: &T) -> bool where T: PartialEq;
+        pub fn starts_with(&self, needle: &[T]) -> bool where T: PartialEq;
+        pub fn ends_with(&self, needle: &[T]) -> bool where T: PartialEq;
+        pub fn swap(&mut self, a: usize, b: usize);
+        pub fn reverse(&mut self);
+        pub fn sort(&mut self) where T: Ord;
+        pub fn sort_unstable(&mut self) where T: Ord;
+        pub fn sort_by<F: FnMut(&T, &T) -> Ordering>(&mut self, compare: F);
+        pub fn sort_unstable_by<F: FnMut(&T, &T) -> Ordering>(&mut self, compare: F);
+        pub fn sort_by_key<K: Ord, F: FnMut(&T) -> K>(&mut self, f: F);
+        pub fn sort_unstable_by_key<K: Ord, F: FnMut(&T) -> K>(&mut self, f: F);
+        pub fn sort_by_cached_key<K: Ord, F: FnMut(&T) -> K>(&mut self, f: F);
+        pub fn binary_search(&self, x: &T) -> Result<usize, usize> where T: Ord;
+        pub fn binary_search_by<F: FnMut(&T) -> Ordering>(&self, f: F) -> Result<usize, usize>;
+        pub fn binary_search_by_key<B: Ord, F: FnMut(&T) -> B>(&self, b: &B, f: F) -> Result<usize, usize>;
+        pub fn partition_point<P: FnMut(&T) -> bool>(&self, pred: P) -> usize;
+        pub fn to_vec(&self) -> Vec<T> where T: Clone;
+        pub fn into_vec(&self) -> Vec<T> where T: Clone;
+        pub fn repeat(&self, n: usize) -> Vec<T> where T: Clone;
+        pub fn fill(&mut self, value: T) where T: Clone;
+        pub fn rotate_left(&mut self, mid: usize);
+        pub fn rotate_right(&mut self, k: usize);
+        pub fn copy_from_slice(&mut self, src: &[T]) where T: Copy;
+        pub fn clone_from_slice(&mut self, src: &[T]) where T: Clone;
+        pub fn windows(&self, size: usize) -> Lazy<&[T]>;
+        pub fn chunks(&self, size: usize) -> Lazy<&[T]>;
+        pub fn chunks_exact(&self, size: usize) -> Lazy<&[T]>;
+        pub fn rchunks(&self, size: usize) -> Lazy<&[T]>;
+        pub fn split<F: FnMut(&T) -> bool>(&self, pred: F) -> Lazy<&[T]>;
+        pub fn iter_positions(&self) -> usize { self.len() }
+        pub fn concat(&self) -> <T as crate::intrinsics::Join>::Output where T: crate::intrinsics::Join;
+        pub fn join<S: crate::intrinsics::Separator>(&self, separator: S) -> <T as crate::intrinsics::Join>::Output where T: crate::intrinsics::Join;
+        pub fn max_len(&self) -> usize { self.len() }
+    }
 }
 
 pub mod vec {
+    use crate::iter::Lazy;
+
     impl<T> Vec<T> {
-        pub fn last(&self) -> Option<&T> { crate::intrinsics::vec_last(self) }
+        pub fn with_capacity(capacity: usize) -> Vec<T> { Vec::new() }
+        pub fn capacity(&self) -> usize { self.len() }
+        pub fn reserve(&mut self, additional: usize) {}
+        pub fn shrink_to_fit(&mut self) {}
+        pub fn insert(&mut self, index: usize, element: T);
+        pub fn remove(&mut self, index: usize) -> T;
+        pub fn swap_remove(&mut self, index: usize) -> T;
+        pub fn append(&mut self, other: &mut Vec<T>);
+        pub fn extend_from_slice(&mut self, other: &[T]) where T: Clone;
+        pub fn extend<I: IntoIterator>(&mut self, iter: I);
+        pub fn retain<F: FnMut(&T) -> bool>(&mut self, f: F);
+        pub fn retain_mut<F: FnMut(&mut T) -> bool>(&mut self, f: F);
+        pub fn dedup(&mut self) where T: PartialEq;
+        pub fn dedup_by_key<K: PartialEq, F: FnMut(&mut T) -> K>(&mut self, key: F);
+        pub fn dedup_by<F: FnMut(&mut T, &mut T) -> bool>(&mut self, same_bucket: F);
+        pub fn split_off(&mut self, at: usize) -> Vec<T>;
+        pub fn resize(&mut self, new_len: usize, value: T) where T: Clone;
+        pub fn resize_with<F: FnMut() -> T>(&mut self, new_len: usize, f: F);
+        pub fn drain<R: crate::ops::RangeBounds>(&mut self, range: R) -> Lazy<T>;
+        pub fn into_boxed_slice(self) -> Vec<T> { self }
+        pub fn from_elem(elem: T, n: usize) -> Vec<T> where T: Clone { vec![elem; n] }
+        pub fn from_iter<I: IntoIterator>(iter: I) -> Vec<T> {
+            let mut items = Vec::new();
+            items.extend(iter);
+            items
+        }
     }
 }
 
@@ -719,6 +883,56 @@ pub mod result {
 }
 
 pub mod fmt {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Error;
+
+    pub type Result = core::result::Result<(), Error>;
+
+    pub struct Formatter { buf: String, alternate: bool }
+
+    impl Formatter {
+        pub fn write_str(&mut self, data: &str) -> Result {
+            self.buf.push_str(data);
+            Ok(())
+        }
+        pub fn write_fmt(&mut self, text: String) -> Result {
+            self.buf.push_str(&text);
+            Ok(())
+        }
+        pub fn write_char(&mut self, c: char) -> Result {
+            self.buf.push(c);
+            Ok(())
+        }
+        pub fn pad(&mut self, data: &str) -> Result { self.write_str(data) }
+        pub fn alternate(&self) -> bool { self.alternate }
+    }
+
+    pub trait Display {
+        fn fmt(&self, f: &mut Formatter) -> Result;
+    }
+
+    pub trait Debug {
+        fn fmt(&self, f: &mut Formatter) -> Result;
+    }
+
+    pub trait Write {
+        fn write_str(&mut self, s: &str) -> Result;
+        fn write_char(&mut self, c: char) -> Result {
+            let mut text = String::new();
+            text.push(c);
+            self.write_str(&text)
+        }
+        fn write_fmt(&mut self, text: String) -> Result {
+            self.write_str(&text)
+        }
+    }
+
+    impl Write for String {
+        fn write_str(&mut self, s: &str) -> Result {
+            self.push_str(s);
+            Ok(())
+        }
+    }
 }
 
 pub mod clone {
@@ -731,4 +945,83 @@ pub mod marker {
 }
 
 pub mod ops {
+    use crate::fmt;
+
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+    pub struct Range<Idx> { pub start: Idx, pub end: Idx }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct RangeInclusive<Idx> { start: Idx, end: Idx, exhausted: bool }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct RangeFrom<Idx> { pub start: Idx }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct RangeTo<Idx> { pub end: Idx }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct RangeToInclusive<Idx> { pub end: Idx }
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+    pub struct RangeFull;
+
+    impl<Idx> RangeInclusive<Idx> {
+        pub fn new(start: Idx, end: Idx) -> RangeInclusive<Idx> { RangeInclusive { start: start, end: end, exhausted: false } }
+        pub fn start(&self) -> &Idx { &self.start }
+        pub fn end(&self) -> &Idx { &self.end }
+        pub fn into_inner(self) -> (Idx, Idx) { (self.start, self.end) }
+    }
+
+    impl<Idx: PartialOrd> Range<Idx> {
+        pub fn contains(&self, item: &Idx) -> bool { *item >= self.start && *item < self.end }
+        pub fn is_empty(&self) -> bool { !(self.start < self.end) }
+    }
+    impl<Idx: PartialOrd> RangeInclusive<Idx> {
+        pub fn contains(&self, item: &Idx) -> bool { *item >= self.start && *item <= self.end }
+        pub fn is_empty(&self) -> bool { self.exhausted || !(self.start <= self.end) }
+    }
+    impl<Idx: PartialOrd> RangeFrom<Idx> {
+        pub fn contains(&self, item: &Idx) -> bool { *item >= self.start }
+    }
+    impl<Idx: PartialOrd> RangeTo<Idx> {
+        pub fn contains(&self, item: &Idx) -> bool { *item < self.end }
+    }
+    impl<Idx: PartialOrd> RangeToInclusive<Idx> {
+        pub fn contains(&self, item: &Idx) -> bool { *item <= self.end }
+    }
+
+    impl<A: Copy> Iterator for Range<A> {
+        type Item = A;
+        fn next(&mut self) -> Option<A> { crate::intrinsics::range_next(self) }
+    }
+    impl<A: Copy> Iterator for RangeInclusive<A> {
+        type Item = A;
+        fn next(&mut self) -> Option<A> { crate::intrinsics::range_inclusive_next(self) }
+    }
+    impl<A: Copy> Iterator for RangeFrom<A> {
+        type Item = A;
+        fn next(&mut self) -> Option<A> { crate::intrinsics::range_from_next(self) }
+    }
+
+    impl<Idx: fmt::Debug> fmt::Debug for Range<Idx> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..{:?}", self.start, self.end) }
+    }
+    impl<Idx: fmt::Debug> fmt::Debug for RangeInclusive<Idx> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..={:?}", self.start, self.end) }
+    }
+    impl<Idx: fmt::Debug> fmt::Debug for RangeFrom<Idx> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..", self.start) }
+    }
+    impl<Idx: fmt::Debug> fmt::Debug for RangeTo<Idx> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "..{:?}", self.end) }
+    }
+    impl fmt::Debug for RangeFull {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "..") }
+    }
+
+    pub trait RangeBounds {}
+    impl<T> RangeBounds for Range<T> {}
+    impl<T> RangeBounds for RangeInclusive<T> {}
+    impl<T> RangeBounds for RangeFrom<T> {}
+    impl<T> RangeBounds for RangeTo<T> {}
+    impl<T> RangeBounds for RangeToInclusive<T> {}
+    impl RangeBounds for RangeFull {}
+}
+
+pub mod hash {
 }
