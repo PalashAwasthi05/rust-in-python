@@ -30,11 +30,13 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 ## What runs
 
 - Functions and recursion, including destructured function and closure parameters
-- Typed bindings, mutability, and block expressions
+- Typed bindings, deferred initialization in `let` patterns, mutability, and block expressions
 - Conditionals, labeled loops and blocks, integer ranges, and value-producing `break`
 - Named, tuple, and unit structs, plus enums with payloads
+- Struct update syntax with partial moves from the base value
 - Tuples with positional fields, annotations, destructuring, and partial moves
-- Field access and mutation, destructuring, `if let`, `while let`, and `let-else`
+- Destructuring assignment for tuples, arrays, and structs, including ignored fields and initialization of existing bindings
+- Field access and mutation, destructuring, `if let`, `while let`, `let-else`, and Rust 2024 let chains
 - Exhaustive `match` with nested patterns, alternatives, integer ranges, and guards
 - Shared and mutable pattern bindings, explicit `ref` and `ref mut`, and reference patterns
 - `@` bindings on ranges and structural subpatterns
@@ -57,6 +59,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Collection iterators with `iter`, `iter_mut`, `into_iter`, `rev`, and lazy `map` with closures
 - Iterator `collect` into `Vec` and `String`, plus `count` and checked integer `sum`
 - Declarative `macro_rules!` with multiple arms, fragment forwarding, repetitions, and matcher follow-set checks
+- Built-in `concat!` and `stringify!` with literal text and token spacing
 - Shared, mutable, and boxed `dyn` objects with dynamic dispatch, associated-type bindings, supertrait upcasts, and consuming `Box<Self>` receivers
 - Generic associated types with specialized and higher-ranked equality constraints
 - Const expressions evaluated at specialization
@@ -242,7 +245,7 @@ python3 conformance.py --json src/main.rs examples/another_root.rs
 
 Pass each crate's root source file. The interpreter loads sibling modules from their `.rs` files or `mod.rs` directories. The conformance runner records the reference compiler version and checks acceptance before comparing standard output and exit status. It exits unsuccessfully on a mismatch, crash, or timeout. Exact diagnostic text is outside the comparison.
 
-Both commands accept `--edition`, which defaults to 2021 and selects the supported identifier and declarative macro rules. For example, 2024 adds top-level const blocks and underscores to `expr` fragments.
+Both commands accept `--edition`, which defaults to 2021. Edition 2024 enables let chains and adds top-level const blocks and underscores to `expr` macro fragments.
 
 ## Scope
 

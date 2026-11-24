@@ -15,6 +15,81 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("uninitialized patterns declare independent locals of the inferred field types", """
+        struct Record { a: u8, b: u16 }
+        fn main() {
+            let (number, flag);
+            (number, flag) = (5, true);
+            let _: u8 = number;
+            let [left, right];
+            [left, right] = [2, 3u16];
+            let Record { a, b };
+            (a, b) = (1, 256);
+            println!("{number} {flag} {left} {right} {a} {b}");
+        }
+    """, "5 true 2 3 1 256\n"),
+    ("struct update evaluates explicit fields before the base and moves only inherited fields", """
+        struct Pair<T> { replaced: T, retained: T }
+        fn value() -> String { print!("explicit "); String::from("replacement") }
+        fn base() -> Pair<String> {
+            print!("base ");
+            Pair { replaced: String::from("old"), retained: String::from("retained") }
+        }
+        fn main() {
+            let old = Pair { replaced: String::from("old"), retained: String::from("retained") };
+            let new = Pair { replaced: value(), ..old };
+            println!("{} {} {}", old.replaced, new.replaced, new.retained);
+            let replaced = Pair { replaced: value(), retained: String::from("explicit"), ..base() };
+            println!("{}", replaced.retained);
+        }
+    """, "explicit old replacement retained\nexplicit base explicit\n"),
+    ("destructuring assignment evaluates the right side before destination places", """
+        struct Record { first: i32, second: i32 }
+        struct Tuple(i32, i32, i32);
+        fn rhs() -> (u8, u8) { print!("rhs "); (7, 8) }
+        fn index() -> usize { print!("index "); 0 }
+        fn main() {
+            let (mut a, mut b) = (1u8, 2u8);
+            (a, b) = (b, a);
+            let mut slots = [0u8; 2];
+            (slots[index()], slots[1]) = rhs();
+            let piece;
+            [piece, ..] = [4, 5, 6];
+            let first;
+            let end;
+            Tuple(first, .., end) = Tuple(10, 20, 30);
+            let field;
+            Record { second: field, .. } = Record { first: 1, second: 6 };
+            println!("{a} {b} {slots:?} {piece} {first} {end} {field}");
+        }
+    """, "rhs index 2 1 [7, 8] 4 10 30 6\n"),
+    ("destructuring assignment skips discarded places and infers nested tuple elements", """
+        struct Marker;
+        fn main() {
+            let taken = (String::from("keep"), String::from("moved"));
+            let moved;
+            (_, moved) = taken;
+            _ = taken.0;
+            let a: u8;
+            let b: u64;
+            ((a, ..), .., b) = ((5, true), "ignored", 8);
+            (..) = (String::from("drop"),);
+            Marker = Marker;
+            println!("{} {moved} {a} {b}", taken.0);
+        }
+    """, "keep moved 5 8\n"),
+    ("built-in macro text preserves token boundaries and literal contents", """
+        macro_rules! original { ($item:expr) => { stringify!($item) }; }
+        macro_rules! merged {
+            ($left:ident, $right:ident) => { stringify!($left + $right) };
+        }
+        fn main() {
+            let combined = concat!("a", 'β', 0x20, 1_000, 1.20, 2f32, true, -12, 3.5e4);
+            let spaced = stringify!( foo /* comment */ +   bar );
+            let path = std::concat!(r#"raw"#, ':', stringify!(路径::函数));
+            println!("{combined}\n{spaced}\n{path}\n{} {}\n{:?}", original!(1+2), merged!(left, right), std::vec![1, 2]);
+        }
+    """, "aβ3210001.202true-123.5e4\nfoo + bar\nraw:路径::函数\n1+2 left + right\n[1, 2]\n"),
     ("local inner macros use the defining crate's exported helpers", """
         mod provider {
             #[macro_export]
@@ -2114,6 +2189,43 @@ VALID = [
 ]
 
 INVALID = [
+    ("uninitialized tuple bindings must each be assigned before use", """
+        fn main() {
+            let (left, right): (i32, i32);
+            left = 1;
+            println!("{left} {right}");
+        }
+    """, "uninitialized"),
+    ("struct update cannot inherit a moved field", """
+        struct Pair { a: String, b: String }
+        fn main() {
+            let old = Pair { a: String::new(), b: String::new() };
+            let _moved = old.b;
+            let _new = Pair { a: String::new(), ..old };
+        }
+    """, "use of moved value 'old.b'"),
+    ("struct update requires inherited fields to be visible", """
+        mod private {
+            pub struct Pair { pub a: u8, b: u8 }
+            pub fn base() -> Pair { Pair { a: 1, b: 2 } }
+        }
+        fn main() { let _new = private::Pair { a: 3, ..private::base() }; }
+    """, "field 'b' is private"),
+    ("destructuring assignment still checks destination mutability", """
+        fn main() { let a = 0; (a,) = (1,); }
+    """, "cannot assign to immutable binding"),
+    ("destructuring assignment requires an irrefutable constructor", """
+        fn main() { let mut a = 0; Some(a) = Some(1); }
+    """, "refutable let pattern"),
+    ("destructuring assignment rejects duplicate tuple rests", """
+        fn main() { let a; (.., a, ..) = (1, 2); }
+    """, "can contain only one"),
+    ("concat rejects byte literals", """
+        fn main() { println!("{}", concat!(b'a')); }
+    """, "cannot concatenate a byte literal"),
+    ("concat requires literal operands", """
+        fn main() { println!("{}", concat!(("parenthesized"))); }
+    """, "requires a literal"),
     ("macro_use does not import macros before the module declaration", """
         fn too_soon() { helper!(); }
         #[macro_use]
@@ -3352,7 +3464,7 @@ class InterpreterTests(unittest.TestCase):
                 self.assertEqual(output.getvalue(), expected)
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
-    def test_macro_editions(self):
+    def test_edition_rules(self):
         with TemporaryDirectory() as folder:
             folder = Path(folder)
             expressions = folder / "expressions.rs"
@@ -3386,6 +3498,36 @@ class InterpreterTests(unittest.TestCase):
                 fn alias<'r#type>(value: &'r#type i32) -> &'r#type i32 { value }
                 fn main() { println!("{}", alias(&9)); }
             """, encoding="utf-8")
+            chains = folder / "chains.rs"
+            chains.write_text("""
+                fn noisy() -> Option<i32> { println!("should never run"); Some(1) }
+                fn step(i: i32) -> Option<i32> { if i < 5 { Some(i) } else { None } }
+                fn choose<'a>(value: &'a Option<i32>, fallback: &'a i32) -> &'a i32 {
+                    if let Some(number) = value && *number > 2 { number } else { fallback }
+                }
+                fn main() {
+                    let number = 7;
+                    let shadowed = if let Some(number) = Some(0) && number > 0 { number } else { number };
+                    if false && let Some(value) = noisy() { println!("{value}"); }
+                    let mut at = 0;
+                    let mut total = 0;
+                    'next: while let Some(value) = step(at) && value < 4 {
+                        at += 1;
+                        if value == 2 { continue 'next; }
+                        total += value;
+                    }
+                    let option = Some(6);
+                    println!("{} {} {}", shadowed, total, choose(&option, &number));
+                }
+            """, encoding="utf-8")
+            move = folder / "chain_move.rs"
+            move.write_text("""
+                fn main() {
+                    let parcel = Some(String::from("owned"));
+                    if let Some(taken) = parcel && false { println!("{taken}"); }
+                    println!("{}", parcel.is_some());
+                }
+            """, encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             for edition, expected, pattern_outcome in (
                 ("2018", "2 3 5\n", "runtime_match"),
@@ -3394,15 +3536,20 @@ class InterpreterTests(unittest.TestCase):
             ):
                 with self.subTest(edition=edition):
                     report = subprocess.run([sys.executable, runner, "--json", f"--edition={edition}",
-                                             expressions, patterns, keywords, lifetimes], text=True, capture_output=True,
+                                             expressions, patterns, keywords, lifetimes, chains, move],
+                                            text=True, capture_output=True,
                                             timeout=15, check=False)
                     self.assertEqual(report.returncode, 0, report.stderr or report.stdout)
-                    exprs, pats, names, regions = json.loads(report.stdout)["cases"]
+                    exprs, pats, names, regions, chain, moved = json.loads(report.stdout)["cases"]
                     self.assertEqual(exprs["outcome"], "runtime_match")
                     self.assertEqual(exprs["run"]["python"]["stdout"], expected)
                     self.assertEqual(pats["outcome"], pattern_outcome)
                     self.assertEqual(names["outcome"], "both_rejected" if edition == "2024" else "runtime_match")
                     self.assertEqual(regions["outcome"], "both_rejected" if edition == "2018" else "runtime_match")
+                    self.assertEqual(chain["outcome"], "runtime_match" if edition == "2024" else "both_rejected")
+                    if edition == "2024":
+                        self.assertEqual(chain["run"]["python"]["stdout"], "7 4 6\n")
+                    self.assertEqual(moved["outcome"], "both_rejected")
 
     def test_invalid_programs(self):
         for name, source, message in INVALID:
@@ -3527,7 +3674,8 @@ class InterpreterTests(unittest.TestCase):
                     let mask = 2u8 << 3;
                     let repeated = vec![nested::value(); 2];
                     let list = vec![1, answer!()];
-                    let formatted = format!("{mask} {repeated:?} {list:?}");
+                    let name = stringify!(nested::value());
+                    let formatted = format!("{mask} {repeated:?} {list:?} {name}");
                     print!("{formatted}");
                     eprint!("proc");
                     eprintln!(" macros");

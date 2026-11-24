@@ -57,6 +57,8 @@ class Token:
     definition: int | None = None
     module: tuple = ()
     child_module: tuple | None = None
+    end: tuple[int, int] | None = field(default=None, compare=False, repr=False)
+    origin: object | None = field(default=None, compare=False, repr=False)
 
     @property
     def key(self):
@@ -71,6 +73,10 @@ class Token:
 
     def error(self, message):
         return RustError(f"{self.line}:{self.column}: {message}")
+
+    def followed_by(self, token):
+        return (self.origin is not None and self.origin is token.origin
+                and self.end == (token.line, token.column))
 
 
 INTEGER_WIDTHS = {f"{sign}{width}": width for sign in ("i", "u") for width in (8, 16, 32, 64, 128)}
@@ -138,7 +144,8 @@ PRECEDENCE = {
 }
 BITWISE = {"&": operator.and_, "|": operator.or_, "^": operator.xor}
 SHIFTS = {"<<", ">>"}
-BLOCK_EXPRESSIONS = {"block", "inline_const", "if", "while", "while_let", "loop", "for", "match"}
+BLOCK_EXPRESSIONS = {"block", "inline_const", "if", "if_chain", "while", "while_let", "while_chain", "loop",
+                     "for", "match"}
 PRIMITIVES = CONST_VALUE_TYPES | {"()"}
 NEVER = "!"
 SCALAR_CONSTANTS = {f"{kind}::{name}": (result, value)
@@ -176,6 +183,7 @@ def is_lifetime(text):
 
 def lex(source, *, edition="2021"):
     offset, line, column = 0, 1, 1
+    origin = object()
     while offset < len(source):
         match = TOKEN.match(source, offset)
         if match is None:
@@ -209,12 +217,13 @@ def lex(source, *, edition="2021"):
                     break
             if depth:
                 raise Token(word, line, column).error("unclosed block comment")
-        elif not (word.isspace() or word.startswith("//")):
-            yield Token(word, line, column)
         consumed = source[offset:end]
         lines = consumed.count("\n")
+        next_column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
+        if word != "/*" and not (word.isspace() or word.startswith("//")):
+            yield Token(word, line, column, end=(line + lines, next_column), origin=origin)
         line += lines
-        column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
+        column = next_column
         offset = end
     yield Token("", line, column)
 
@@ -256,17 +265,17 @@ def token_trees(tokens):
     raise AssertionError("missing end of input")
 
 
-def flatten_trees(trees):
+def flatten_trees(trees, *, group_fragments=True):
     for tree in trees:
         if isinstance(tree, TokenGroup):
             yield tree.opening
-            yield from flatten_trees(tree.items)
+            yield from flatten_trees(tree.items, group_fragments=group_fragments)
             yield tree.closing
         elif isinstance(tree, OpaqueFragment):
-            grouped = tree.fragment in {"expr", "expr_2021", "pat", "pat_param"}
+            grouped = group_fragments and tree.fragment in {"expr", "expr_2021", "pat", "pat_param"}
             if grouped:
                 yield replace(tree.token, text="(")
-            yield from flatten_trees(tree.items)
+            yield from flatten_trees(tree.items, group_fragments=group_fragments)
             if grouped:
                 yield replace(tree.token, text=")")
         else:
@@ -452,6 +461,7 @@ class MacroExpander:
                     index += 1
                 continue
             macro = macros.get(identifier_text(item.text)) if isinstance(item, Token) else None
+            builtin = identifier_text(item.text) if isinstance(item, Token) else None
             argument = index + 2
             if isinstance(item, Token) and index + 4 < len(items) and tree_text(items[index + 1]) == "::":
                 path = [identifier_text(item.text)]
@@ -460,6 +470,7 @@ class MacroExpander:
                     path.append(identifier_text(tree_text(items[position + 1])))
                     position += 2
                 macro = self.qualified.get(tuple(path))
+                builtin = path[1] if len(path) == 2 and path[0] in {"std", "core", "alloc"} else None
                 argument = position + 1
             if (macro and argument < len(items) and tree_text(items[argument - 1]) == "!"
                     and isinstance(items[argument], TokenGroup)):
@@ -487,13 +498,23 @@ class MacroExpander:
                 if (item_start or (item_scope and first is None)) and index < len(items) and tree_text(items[index]) == ";":
                     index += 1
                 continue
-            if (tree_text(item) in {"vec", "@host:vec"} and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
-                    and isinstance(items[index + 2], TokenGroup)):
-                group = items[index + 2]
-                result.append(replace(item, text="@vec"))
-                result.append(replace(group, items=self.expand(group.items, macros, depth)))
-                index += 3
-                continue
+            if (builtin and argument < len(items) and tree_text(items[argument - 1]) == "!"
+                    and isinstance(items[argument], TokenGroup)):
+                group = items[argument]
+                if builtin in {"vec", "@host:vec"}:
+                    result.append(replace(item, text="@vec"))
+                    result.append(replace(group, items=self.expand(group.items, macros, depth)))
+                    index = argument + 1
+                    continue
+                if builtin in {"concat", "stringify"}:
+                    if builtin == "concat":
+                        parts = self.expand(group.items, macros, depth + 1)
+                        value = self.concatenate(parts, item)
+                    else:
+                        value = self.stringify(group.items)
+                    result.append(replace(item, text=display(value, True), end=group.closing.end))
+                    index = argument + 1
+                    continue
             if isinstance(item, (TokenGroup, OpaqueFragment)):
                 item = replace(item, items=self.expand(item.items, macros, depth))
             result.append(item)
@@ -513,6 +534,42 @@ class MacroExpander:
                 item = replace(item, items=MacroExpander.qualify_inner(item.items, mark))
             result.append(item)
         return tuple(result)
+
+    @staticmethod
+    def stringify(items):
+        text = []
+        previous = None
+        for token in flatten_trees(items, group_fragments=False):
+            adjacent = previous is not None and previous.followed_by(token) and previous.context == token.context
+            if previous is not None and not adjacent:
+                text.append(" ")
+            text.append(token.text)
+            previous = token
+        return "".join(text)
+
+    @staticmethod
+    def concatenate(items, token):
+        values = []
+        tokens = iter(flatten_trees(items, group_fragments=False))
+        for literal_token in tokens:
+            negative = literal_token.text == "-"
+            if negative:
+                literal_token = next(tokens, token)
+            if literal_token.text.startswith(("b'", 'b"', 'br"', 'br#')):
+                raise literal_token.error("concat! cannot concatenate a byte literal")
+            literal = Parser.literal(literal_token, negative=negative)
+            if literal is None:
+                raise literal_token.error("concat! requires a literal")
+            kind, value = literal.args
+            if kind in FLOAT_TYPES:
+                number = FLOAT_SUFFIX.sub("", literal_token.text).replace("_", "")
+                values.append(("-" if negative else "") + number)
+            else:
+                values.append(display(value, False))
+            comma = next(tokens, None)
+            if comma is not None and comma.text != ",":
+                raise comma.error("expected ',' after concat! argument")
+        return "".join(values)
 
     def rules(self, group):
         items = group.items
@@ -648,8 +705,8 @@ class MacroExpander:
         try:
             if fragment in {"expr", "expr_2021"}:
                 modern = fragment == "expr" and self.edition >= "2024"
-                if first.text == "_":
-                    return modern and len(tokens) == 1
+                if first.text == "_" and (not modern or len(tokens) == 1):
+                    return modern
                 if first.text == "const" and not modern:
                     return False
                 parser.expression()
@@ -740,7 +797,10 @@ class MacroExpander:
                 else:
                     raise node.name.error(f"metavariable {node.name.text!r} has no value at this repetition depth")
             elif isinstance(node, TokenGroup):
-                yield replace(node, items=tuple(self.render(node.items, captures, path, mark)))
+                opening = replace(node.opening, context=(*node.opening.context, mark))
+                closing = replace(node.closing, context=(*node.closing.context, mark))
+                yield replace(node, opening=opening, closing=closing,
+                              items=tuple(self.render(node.items, captures, path, mark)))
             elif isinstance(node, MacroRepeat):
                 names = set(self.variables(node.body))
                 if not names:
@@ -3002,8 +3062,6 @@ class Parser:
                     annotation = self.type_name()
                 value = self.expression() if self.accept("=") else None
                 otherwise = self.block() if value and self.accept("else") else None
-                if value is None and (annotation is None or pattern.kind != "bind" or len(pattern.args) > 1):
-                    raise pattern.token.error("uninitialized let requires a name and explicit type")
                 if otherwise and value.kind in BLOCK_EXPRESSIONS:
                     raise value.token.error("parenthesize this expression before let-else")
                 if otherwise and value.kind == "binary" and value.token.text in {"&&", "||"}:
@@ -3127,6 +3185,8 @@ class Parser:
         if word.startswith("@host:"):
             word = word.removeprefix("@host:")
             token = replace(token, text=word)
+        if word in {"_", ".."}:
+            return Expr("wild" if word == "_" else "rest", token)
         if word == "const" and self.current.text == "{":
             return Expr("inline_const", token, (self.block(),))
         if word == "@vec":
@@ -3166,7 +3226,7 @@ class Parser:
                 if self.current.text == "(":
                     return Expr("call", path, self.arguments(), type_arguments=arguments)
                 if allow_record and self.current.text == "{":
-                    return Expr("record", path, (self.record_fields(self.expression, "name")[0],),
+                    return Expr("record", path, self.record_fields(self.expression, "name"),
                                 type_arguments=arguments)
                 return Expr("name", path, type_arguments=arguments)
             self.expect("::")
@@ -3185,17 +3245,23 @@ class Parser:
             labeled.label = token
             return labeled
         if word == "if":
-            pattern, condition = self.condition()
+            conditions = self.condition()
             yes = self.block()
             no = None
             if self.accept("else"):
                 no = self.prefix() if self.current.text == "if" else self.block()
+            if len(conditions) > 1:
+                return Expr("if_chain", token, (conditions, yes, no))
+            pattern, condition = conditions[0]
             if pattern:
                 return self.conditional_match(token, condition, pattern, yes, no)
             return Expr("if", token, (condition, yes, no))
         if word == "while":
-            pattern, condition = self.condition()
+            conditions = self.condition()
             body = self.block()
+            if len(conditions) > 1:
+                return Expr("while_chain", token, (conditions, body))
+            pattern, condition = conditions[0]
             if pattern:
                 return Expr("while_let", token, (condition, pattern, body))
             return Expr("while", token, (condition, body))
@@ -3291,7 +3357,7 @@ class Parser:
             if path.text in self.statics:
                 return Expr("static_item", path, (self.statics[path.text],))
             if allow_record and self.current.text == "{":
-                return Expr("record", path, (self.record_fields(self.expression, "name")[0],),
+                return Expr("record", path, self.record_fields(self.expression, "name"),
                             type_arguments=type_arguments)
             if self.current.text == "(":
                 return Expr("call", path, self.arguments(), type_arguments=type_arguments,
@@ -3657,8 +3723,8 @@ class Parser:
         fields = []
         rest = False
         while self.current.text != "}":
-            if shorthand == "bind" and self.accept(".."):
-                rest = True
+            if self.accept(".."):
+                rest = True if shorthand == "bind" or self.current.text == "}" else parse_value()
                 break
             by_reference = shorthand == "bind" and bool(self.accept("ref"))
             mutable = shorthand == "bind" and bool(self.accept("mut"))
@@ -3790,11 +3856,32 @@ class Parser:
         return Expr("match", token, (scrutinee, tuple(arms)))
 
     def condition(self):
-        pattern = None
-        if self.accept("let"):
-            pattern = self.pattern()
-            self.expect("=")
-        return pattern, self.expression(allow_record=False)
+        terms = []
+        delimiters = []
+        while True:
+            pattern = None
+            if self.accept("let"):
+                pattern = self.pattern()
+                self.expect("=")
+            term = self.expression(PRECEDENCE["&&"] + 1, allow_record=False)
+            terms.append((pattern, term))
+            separator = self.accept("&&")
+            if separator is None:
+                break
+            delimiters.append(separator)
+        if any(pattern is not None for pattern, _ in terms):
+            if len(terms) > 1 and self.edition != "2024":
+                raise delimiters[0].error("let chains require Rust 2024")
+            if self.current.text == "||":
+                raise self.current.error("let chain conditions cannot use unparenthesized '||'")
+            return tuple(terms)
+        condition = terms[0][1]
+        for separator, (_, right) in zip(delimiters, terms[1:]):
+            condition = Expr("binary", separator, (condition, right))
+        while separator := self.accept("||"):
+            right = self.expression(PRECEDENCE["||"] + 1, allow_record=False)
+            condition = Expr("binary", separator, (condition, right))
+        return ((None, condition),)
 
     @staticmethod
     def conditional_match(token, scrutinee, pattern, yes, no):
@@ -3945,7 +4032,7 @@ def reference_source(expr, annotation):
     expr = ungroup(expr)
     if is_static_str(annotation) or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
         return True
-    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference",
+    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "if_chain", "match", "dyn_reference",
                          "slice_reference", "string_reference", "byte_string", "vector_method",
                          "string_method", "clone"} or (
         expr.kind == "block" and not expr.label
@@ -4487,6 +4574,7 @@ class Checker:
         self.unary_operands = []
         self.integer_literals = []
         self.float_literals = []
+        self.deferred_binding_types = set()
         self.scalar_casts = []
         self.iterator_results = []
         self.parameters = {}
@@ -5467,7 +5555,10 @@ class Checker:
             args = ()
         style = kind.removeprefix("pattern_")
         if style == "array":
-            annotation = self.resolve(annotation)
+            if isinstance(annotation, TypeVariable) and all(child.kind != "rest" for child in args):
+                inferred = ArrayType(self.fill_holes(None, token), ConstValue(len(args), "usize"))
+                self.require(inferred, annotation, token)
+                annotation = inferred
             if isinstance(annotation, SliceType):
                 rest = [index for index, child in enumerate(args) if child.kind == "rest"]
                 if len(rest) > 1:
@@ -5580,7 +5671,11 @@ class Checker:
             scope = Scope(scope, {name: Binding(kind, mutable) for name, (kind, mutable) in bindings.items()})
         self.loops.append(target)
         try:
-            if kind in {"while", "while_let"}:
+            if kind == "while_chain":
+                target.in_condition = True
+                test, scope = self.chain_type(args[0], scope)
+                target.in_condition = False
+            elif kind in {"while", "while_let"}:
                 condition = args[0]
                 target.in_condition = True
                 test = self.type_of(condition, scope)
@@ -5602,6 +5697,21 @@ class Checker:
         if test == NEVER and not target.exit_types:
             return NEVER
         return "()"
+
+    def chain_type(self, conditions, scope):
+        inner = Scope(scope)
+        first = "bool"
+        for index, (source, expr) in enumerate(conditions):
+            actual = self.type_of(expr, inner, "bool" if source is None else None)
+            if index == 0 and actual == NEVER:
+                first = NEVER
+            if source is None:
+                self.require(actual, "bool", expr.token)
+            else:
+                pattern, bindings = self.prepare_pattern(source, actual)
+                self.program.patterns[id(source)] = pattern, bindings
+                inner.bindings.update({name: Binding(kind, mutable) for name, (kind, mutable) in bindings.items()})
+        return first, inner
 
     def type_of(self, expr, scope, expected=None):
         if id(expr) in self.program.call_functions or expr.kind in {
@@ -5690,6 +5800,75 @@ class Checker:
         if ctor and ctor.style == "unit" and not allow_temporary:
             raise expr.token.error("expected a local place")
 
+    def assignment_pattern(self, expr, scope, writes, operator, value=None):
+        original = expr
+        expr = ungroup(expr)
+        if expr is not original and expr.kind == "rest":
+            expr = Expr("tuple", original.token, (expr,))
+        kind, token, args = expr.kind, expr.token, expr.args
+        if kind in {"wild", "rest"}:
+            return expr, None
+        if kind == "literal" and args[0] == "()":
+            return expr, "()"
+        if kind in {"tuple", "array"}:
+            literal = ungroup(value) if value is not None else None
+            inputs = {}
+            if kind == "tuple" and literal is not None and literal.kind == "tuple":
+                positions = self.positional_patterns(args, len(literal.args), token, "tuple assignment")
+                inputs = {id(target): literal.args[index] for index, target in positions}
+            entries = [self.assignment_pattern(target, scope, writes, operator, inputs.get(id(target)))
+                       for target in args]
+            patterns = tuple(pattern for pattern, _ in entries)
+            rest = any(pattern.kind == "rest" for pattern in patterns)
+            if kind == "tuple":
+                pattern = Expr("pattern_anonymous_tuple", token, patterns)
+                if rest and not inputs:
+                    return pattern, None
+                length = len(literal.args) if rest else len(entries)
+                fields = [None] * length
+                hints = {id(child): hint for child, hint in entries}
+                for index, child in self.positional_patterns(patterns, length, token, "tuple assignment"):
+                    fields[index] = hints[id(child)]
+                return pattern, TupleType(tuple(self.fill_holes(field, token) for field in fields))
+            element = next((hint for _, hint in entries if hint is not None), TypeVariable("array element", token))
+            for _, hint in entries:
+                if hint is not None:
+                    self.require(hint, element, token)
+            length = TypeVariable("array length", token, "usize") if rest else ConstValue(len(entries), "usize")
+            return Expr("pattern_array", token, patterns), ArrayType(element, length)
+        if kind in {"record", "call"}:
+            style = "record" if kind == "record" else "tuple"
+            ctor = self.constructor(expr, style)
+            if style == "record":
+                fields, rest = args
+                if isinstance(rest, Expr):
+                    raise rest.token.error("a struct update value is only allowed on the right side")
+                indices = self.field_indices(ctor, fields, rest, token)
+                patterns = []
+                for index, (name, value) in zip(indices, fields):
+                    pattern, hint = self.assignment_pattern(value, scope, writes, operator)
+                    if hint is not None:
+                        self.require(hint, ctor.fields[index][1], value.token)
+                    patterns.append((name, pattern))
+                result = Expr("pattern_record", token, (tuple(patterns), rest), type_arguments=expr.type_arguments)
+            else:
+                patterns = [Expr("wild", token) for _ in ctor.fields]
+                for index, value in self.positional_patterns(args, len(ctor.fields), token, ctor.path):
+                    pattern, hint = self.assignment_pattern(value, scope, writes, operator)
+                    if hint is not None:
+                        self.require(hint, ctor.fields[index][1], value.token)
+                    patterns[index] = pattern
+                result = Expr("pattern_tuple", token, tuple(patterns), type_arguments=expr.type_arguments)
+            return result, self.resolve(ctor.annotation)
+        ctor = self.program.constructors.get(token.text) if kind == "name" else None
+        if ctor and ctor.style == "unit":
+            return Expr("pattern_unit", token, type_arguments=expr.type_arguments), ctor.annotation
+        annotation = self.type_of(expr, scope)
+        self.require_place(expr, write=True)
+        name = replace(token, text=f"@assignment:{len(writes)}")
+        writes.append(Expr("assign", operator, (expr, Expr("name", name))))
+        return Expr("bind", name, (False,)), annotation
+
     def check_expr(self, expr, scope, expected=None):
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "closure":
@@ -5699,6 +5878,8 @@ class Checker:
             return self.indirect_type(expr, scope, expected, callee)
         if kind in {"function_pointer", "closure_value", "box"}:
             return self.program.expr_types[id(expr)]
+        if kind in {"wild", "rest"}:
+            raise token.error(f"{token.text!r} is only allowed in an assignment target here")
         if kind == "box_deref":
             return self.type_of(args[0], scope).arguments[0]
         if kind == "try":
@@ -5750,14 +5931,16 @@ class Checker:
             if annotation in FLOAT_TYPES:
                 if expr.unsuffixed and hint in FLOAT_TYPES:
                     annotation = hint
-                elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.float_literal:
+                elif (expr.unsuffixed and isinstance(hint, TypeVariable)
+                      and (hint.float_literal or hint in self.deferred_binding_types)):
                     self.float_literals.append((hint, value, token))
                     return hint
                 float_literal_value(value, annotation, token)
                 return annotation
             if expr.unsuffixed and hint in INTEGER_TYPES:
                 annotation = hint
-            elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.integer_literal:
+            elif (expr.unsuffixed and annotation in INTEGER_TYPES and isinstance(hint, TypeVariable)
+                  and (hint.integer_literal or hint in self.deferred_binding_types)):
                 self.integer_literals.append((hint, value, token))
                 return hint
             if annotation in INTEGER_TYPES:
@@ -5889,14 +6072,24 @@ class Checker:
             self.obligation(annotation, "Clone", token)
             return annotation
         if kind == "record":
+            fields, update = args
+            if update is True:
+                raise token.error("'..' requires an assignment target or a struct update value")
             ctor = self.constructor(expr, "record", expected)
-            fields = args[0]
-            indices = self.field_indices(ctor, fields, False, token)
+            indices = self.field_indices(ctor, fields, bool(update), token)
             actual = [self.type_of(value, scope, ctor.fields[index][1])
                       for index, (_, value) in zip(indices, fields)]
             for index, kind in zip(indices, actual):
                 self.require(kind, ctor.fields[index][1], token)
-            return NEVER if NEVER in actual else ctor.annotation
+            if update:
+                if self.program.constructors[token.text].annotation != token.text:
+                    raise token.error("struct update requires a struct constructor")
+                for name, _ in ctor.fields:
+                    self.visible_field(ctor, replace(token, text=name))
+                base = self.type_of(update, scope, ctor.annotation)
+                self.require(base, ctor.annotation, update.token)
+                actual.append(base)
+            return NEVER if NEVER in actual else self.resolve(ctor.annotation)
         if kind == "match":
             return self.match_type(expr, scope, expected)
         if kind == "block":
@@ -5907,10 +6100,13 @@ class Checker:
                 diverges |= self.type_of(statement, inner) == NEVER
             result = self.type_of(tail, inner, expected) if tail else "()"
             return NEVER if diverges else result
-        if kind in {"let", "parameter_let"}:
+        if kind in {"let", "parameter_let", "assignment_let"}:
             source, annotation, value, otherwise = args
             parameter = kind == "parameter_let"
             expr.kind = "let"
+            if annotation is None and value is None:
+                annotation = TypeVariable(source.token.text, source.token)
+                self.variables.append(annotation)
             if annotation is not None:
                 annotation = self.fill_holes(annotation, token)
                 self.check_type(annotation, token)
@@ -5928,6 +6124,8 @@ class Checker:
                         literal.kind, literal.args = "literal", (number.args[0], -number.args[1])
                         literal.unsuffixed = True
             actual = self.type_of(value, scope, hint) if value else annotation
+            if kind == "assignment_let" and isinstance(actual, ReferenceType) and source.kind != "wild":
+                raise token.error("destructuring assignment does not implicitly dereference its source")
             if annotation:
                 self.require_argument(actual, annotation, token)
                 expr.args = (source, annotation, value, otherwise)
@@ -5937,8 +6135,12 @@ class Checker:
                 if value is None or (otherwise and source.kind in {"bind", "wild"}):
                     raise token.error("reference let requires a simple initialized binding")
             pattern, bindings = self.prepare_pattern(source, annotation)
-            if value is None and not bindings:
-                raise token.error("uninitialized let requires a local binding")
+            if value is None:
+                for kind, _ in bindings.values():
+                    if isinstance(kind, ReferenceType):
+                        raise token.error("reference let requires a simple initialized binding")
+                    if isinstance(kind, TypeVariable):
+                        self.deferred_binding_types.add(kind)
             self.program.patterns[id(source)] = (pattern, bindings)
             if otherwise:
                 self.require(self.type_of(otherwise, scope), NEVER, otherwise.token)
@@ -5958,11 +6160,15 @@ class Checker:
             if requires_unit:
                 self.require(actual, "()", token)
             return NEVER if actual == NEVER else "()"
-        if kind == "if":
+        if kind in {"if", "if_chain"}:
             condition, yes, no = args
-            test = self.type_of(condition, scope, "bool")
-            self.require(test, "bool", condition.token)
-            left = self.type_of(yes, scope, expected)
+            if kind == "if_chain":
+                test, inner = self.chain_type(condition, scope)
+            else:
+                test = self.type_of(condition, scope, "bool")
+                self.require(test, "bool", condition.token)
+                inner = scope
+            left = self.type_of(yes, inner, expected)
             right_hint = expected if expected is not None else (left if left != NEVER else None)
             right = self.type_of(no, scope, right_hint) if no else "()"
             if left != NEVER and not (shared_coercion(left, right) or shared_coercion(right, left)):
@@ -5970,7 +6176,7 @@ class Checker:
             if test == NEVER:
                 return NEVER
             return right if left == NEVER or shared_coercion(left, right) else left
-        if kind in {"while", "while_let", "loop", "for"}:
+        if kind in {"while", "while_let", "while_chain", "loop", "for"}:
             return self.loop_type(expr, scope)
         if kind == "return":
             actual = self.type_of(args[0], scope, self.result) if args[0] else "()"
@@ -6020,7 +6226,23 @@ class Checker:
             return "i32"
         if kind == "assign":
             left, right = args
-            annotation = self.type_of(left, scope)
+            target = ungroup(left)
+            ctor = self.program.constructors.get(target.token.text) if target.kind == "name" else None
+            parenthesized_rest = left.kind == "group" and target.kind == "rest"
+            pattern_target = (parenthesized_rest or target.kind in {"wild", "tuple", "array", "record", "call"}
+                              or target.kind == "literal" and target.args[0] == "()"
+                              or ctor and ctor.style == "unit")
+            if token.text == "=" and pattern_target:
+                writes = []
+                pattern, hint = self.assignment_pattern(left, scope, writes, token, right)
+                # Match the source once, then write destinations in source order.
+                bind = Expr("assignment_let", token, (pattern, hint, right, None))
+                expr.kind, expr.args = "block", ([bind, *writes], None)
+                return self.check_expr(expr, scope, expected)
+            annotation = self.program.expr_types.get(id(left))
+            if annotation is None:
+                annotation = self.type_of(left, scope)
+            annotation = self.resolve(annotation)
             self.require_place(left, write=True)
             CaptureContext.mark_mutable(scope, left)
             if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
@@ -7281,11 +7503,17 @@ class Ownership:
                 cursor = self.lower(statement, inner, cursor)
             cursor, loan = self.lower_reference(tail, inner, cursor, extend_to=extend_to)
             return self.leave_reference_scope(cursor, loan, inner, tail.token), loan
-        if expr.kind == "if":
+        if expr.kind in {"if", "if_chain"}:
             condition, yes, no = expr.args
-            cursor = self.lower(condition, scope, cursor)
-            yes_end, yes_loan = self.lower_reference(yes, scope, cursor, extend_to=extend_to)
-            no_end, no_loan = self.lower_reference(no, scope, cursor, extend_to=extend_to)
+            if expr.kind == "if_chain":
+                satisfied, failed, inner = self.lower_chain(condition, scope, cursor)
+            else:
+                satisfied = failed = self.lower(condition, scope, cursor)
+                inner = scope
+            yes_end, yes_loan = self.lower_reference(yes, inner, satisfied, extend_to=extend_to)
+            if inner is not scope:
+                yes_end = self.leave_reference_scope(yes_end, yes_loan, inner, yes.token)
+            no_end, no_loan = self.lower_reference(no, scope, failed, extend_to=extend_to)
             loans = tuple(loan for loan in (yes_loan, no_loan) if loan)
             return self.join(yes_end, no_end), self.merge_loans(loans, annotation.mutable)
         if expr.kind == "match":
@@ -7330,7 +7558,13 @@ class Ownership:
             style = {"name": "unit", "call": "tuple", "record": "record"}[expr.kind]
             if not ctor or ctor.style != style:
                 return False
-            values = (value for _, value in expr.args[0]) if expr.kind == "record" else expr.args
+            if expr.kind == "record":
+                fields, update = expr.args
+                values = [value for _, value in fields]
+                if update:
+                    values.append(update)
+            else:
+                values = expr.args
             return all(self.promotable(value) for value in values)
         if expr.kind in {"unary", "binary", "tuple"}:
             return all(self.promotable(operand) for operand in expr.args)
@@ -7625,13 +7859,17 @@ class Ownership:
             return end
         if kind == "discard":
             return self.lower(args[0], scope, cursor)
-        if kind == "if":
+        if kind in {"if", "if_chain"}:
             condition, yes, no = args
-            cursor = self.lower(condition, scope, cursor)
-            yes_end = self.lower(yes, scope, cursor)
-            no_end = self.lower(no, scope, cursor) if no else cursor
+            if kind == "if_chain":
+                satisfied, failed, inner = self.lower_chain(condition, scope, cursor)
+            else:
+                satisfied = failed = self.lower(condition, scope, cursor)
+                inner = scope
+            yes_end = self.lower(yes, inner, satisfied)
+            no_end = self.lower(no, scope, failed) if no else failed
             return self.join(yes_end, no_end)
-        if kind in {"while", "while_let", "loop", "for"}:
+        if kind in {"while", "while_let", "while_chain", "loop", "for"}:
             return self.lower_loop(expr, scope, cursor)
         if kind == "return":
             if args[0]:
@@ -7674,11 +7912,20 @@ class Ownership:
             right_end = self.lower(right, scope, cursor)
             return self.join(cursor, right_end) if token.text in {"&&", "||"} else right_end
         if kind == "record":
+            explicit, update = args
             layout = self.program.layout(self.annotation(expr))
             ctor = next((ctor for ctor in layout[1] if ctor.path == token.text), None) if layout else None
             fields = dict(ctor.fields) if ctor else {}
-            for name, value in args[0]:
+            for name, value in explicit:
                 cursor = self.lower_stored_value(value, fields.get(name.text), scope, cursor)
+            if update:
+                cursor, place = self.lower_address(update, scope, cursor)
+                if place is None:
+                    return self.lower(update, scope, cursor)
+                supplied = {name.text for name, _ in explicit}
+                for name, annotation in fields.items():
+                    if name not in supplied:
+                        cursor = self.access(cursor, place.child(name), annotation, update.token, consume=True)
             return cursor
         if kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, _ = self.lower_call(expr, scope, cursor)
@@ -7808,6 +8055,11 @@ class Ownership:
                 body_entry = self.lower(args[0], scope, restart)
                 target.in_condition = False
                 self.connect(body_entry, finish)
+            elif kind == "while_chain":
+                target.in_condition = True
+                body_entry, failed, scope = self.lower_chain(args[0], scope, restart)
+                target.in_condition = False
+                self.connect(failed, finish)
             elif kind == "while_let":
                 condition, source, _ = args
                 target.in_condition = True
@@ -7839,6 +8091,25 @@ class Ownership:
         finally:
             self.loops.pop()
         return finish
+
+    def lower_chain(self, conditions, scope, cursor):
+        inner = Scope(scope)
+        failures = []
+        for source, condition in conditions:
+            if source is None:
+                cursor = self.lower(condition, inner, cursor)
+                failures.append(cursor)
+                continue
+            cursor, origin, loan = self.lower_pattern_input(condition, inner, cursor, (source,), extend_to=inner)
+            pattern, types = self.program.patterns[id(source)]
+            annotation = self.annotation(condition)
+            access = self.pattern_accesses(pattern, origin, annotation)
+            cursor = self.read_pattern(cursor, access.tests | access.reads, source.token)
+            if uncovered([(pattern,)], (annotation,), self.program) is not None:
+                failures.append(cursor)
+            cursor = self.move_pattern(cursor, access.moves, source.token)
+            cursor = self.declare(source, types, inner, cursor, loan=loan, borrows=access.borrows)
+        return cursor, self.join(*failures), inner
 
     def lower_match(self, expr, scope, cursor, *, result_type=None, extend_to=None):
         scrutinee, arms = expr.args
@@ -8257,6 +8528,19 @@ class Interpreter:
                 scope[name] = Binding(item, mutable)
             yield scope
 
+    def eval_chain(self, conditions, scope):
+        inner = Scope(scope)
+        for source, condition in conditions:
+            if source is None:
+                if not self.eval(condition, inner):
+                    return None
+                continue
+            bindings = next(self.match_bindings(source, self.address(condition, inner)), None)
+            if bindings is None:
+                return None
+            inner.bindings.update(bindings)
+        return inner
+
     def clone_value(self, value):
         if isinstance(value, FunctionValue) and value.environment:
             bindings = dict(value.environment)
@@ -8648,10 +8932,12 @@ class Interpreter:
             aggregate = self.eval(value, scope)
             return aggregate.fields[aggregate.constructor.index(name)]
         if kind == "record":
+            explicit, update = args
             ctor = self.runtime_constructor(expr, self.program.constructors[token.text])
-            fields = [None] * len(ctor.fields)
-            for name, value in args[0]:
-                fields[ctor.index(name)] = self.eval(value, scope)
+            supplied = [(ctor.index(name), self.eval(value, scope)) for name, value in explicit]
+            fields = list(self.address(update, scope).read().fields) if update else [None] * len(ctor.fields)
+            for index, value in supplied:
+                fields[index] = value
             return Value(ctor, tuple(fields))
         if kind == "match":
             scrutinee, arms = args
@@ -8676,7 +8962,9 @@ class Interpreter:
         if kind == "let":
             source, annotation, value, otherwise = args
             if value is None:
-                scope.bindings[source.token.key] = Binding(self.placeholder(annotation), source.args[0])
+                _, types = self.program.patterns[id(source)]
+                for name, (kind, mutable) in types.items():
+                    scope.bindings[name] = Binding(self.placeholder(kind), mutable)
                 return None
             bindings = next(self.match_bindings(source, self.address(value, scope)), None)
             if bindings is None:
@@ -8692,7 +8980,11 @@ class Interpreter:
             condition, yes, no = args
             branch = yes if self.eval(condition, scope) else no
             return self.eval(branch, scope) if branch else None
-        if kind in {"while", "while_let", "loop"}:
+        if kind == "if_chain":
+            conditions, yes, no = args
+            inner = self.eval_chain(conditions, scope)
+            return self.eval(yes, inner) if inner is not None else self.eval(no, scope) if no else None
+        if kind in {"while", "while_let", "while_chain", "loop"}:
             body = args[-1]
             while True:
                 try:
@@ -8705,6 +8997,10 @@ class Interpreter:
                         if bindings is None:
                             return None
                         inner = Scope(scope, bindings)
+                    if kind == "while_chain":
+                        inner = self.eval_chain(args[0], scope)
+                        if inner is None:
+                            return None
                     self.eval(body, inner)
                 except Continue as signal:
                     if not handles_jump(expr, signal):
@@ -8865,10 +9161,7 @@ def render_source(trees):
     parts = []
     previous = None
     for token in flatten_trees(trees):
-        joined_shift = (previous is not None and previous.text in {"<", ">"}
-                        and token.text in {previous.text, previous.text + "="}
-                        and previous.line == token.line and previous.column + 1 == token.column)
-        if parts and not joined_shift:
+        if previous is not None and not previous.followed_by(token):
             parts.append(" ")
         parts.append(token.text)
         previous = token
