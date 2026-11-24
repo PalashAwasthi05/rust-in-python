@@ -3316,6 +3316,33 @@ INVALID = [
     ("base formatting does not accept floats", """
         fn main() { println!("{:x}", 1.5f32); }
     """, "base formatting requires an integer"),
+    ("cfg(test) items are removed from normal builds", """
+        #[cfg(test)]
+        fn helper() {}
+        fn main() { helper(); }
+    """, "unknown function 'helper'"),
+    ("cfg(test) fields are removed from normal builds", """
+        struct S { #[cfg(test)] a: i32, b: i32 }
+        fn main() { let s = S { a: 1, b: 2 }; }
+    """, "S has no field 'a'"),
+    ("pub(in path) fields are private outside that path", """
+        mod a {
+            pub mod b {
+                pub struct E { pub(in crate::a) n: i32 }
+                pub fn make() -> E { E { n: 1 } }
+            }
+        }
+        fn main() { let e = a::b::make(); println!("{}", e.n); }
+    """, "field 'n' is private"),
+    ("a private function sharing a module's name cannot be imported", """
+        mod parse { pub fn go() {} fn parse() {} }
+        use parse::parse;
+        fn main() {}
+    """, "'parse' is private"),
+    ("attributes on methods keep them private", """
+        mod m { pub struct S; impl S { #[inline] fn hidden(&self) {} } }
+        fn main() { m::S.hidden(); }
+    """, "method 'hidden' is private"),
 ]
 
 

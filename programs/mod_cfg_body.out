@@ -1,0 +1,8 @@
+0
+app 2
+debug unix-like
+always
+x = 2
+debug assertions on
+false
+two

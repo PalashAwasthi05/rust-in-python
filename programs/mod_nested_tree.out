@@ -1,0 +1,10 @@
+0
+outer at level 1
+middle at level 2 under [outer at level 1]
+inner at level 3 under [middle at level 2 under [outer at level 1]]
+root sum = 6
+grandparent = 1
+private via public = 103
+cousin: inner at level 3 under [middle at level 2 under [outer at level 1]]
+total = 60
+absolute = 3

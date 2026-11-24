@@ -1,0 +1,10 @@
+0
+square 16
+rect 15
+right 12
+iso 18
+circle 12
+ring 24
+sides 3 4 6
+inner scope 2
+{"a": 1, "b": 2} 0

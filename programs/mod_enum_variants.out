@@ -1,0 +1,12 @@
+0
+Red -> #f00
+Green -> #0f0
+Blue -> #00f
+Custom(1, 171, 255) -> #01abff
+true
+Go { seconds: 30 }
+Caution
+Stop
+Go { seconds: 30 }
+go for 30
+just 3
