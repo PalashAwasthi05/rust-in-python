@@ -1,0 +1,10 @@
+0
+5xapple, 1xpear
+5xapple, 5xpear, 7xfig
+total long-named 10
+apple=5 kiwi=0
+["apple", "pear", "fig"]
+("fig", 7)
+[-1, 0, 3, 3, 5] len=5 first=Some(-1) contains3=true
+-1<=0<=3<=3<=5
+[('l', 3), ('o', 2), ('d', 1)] distinct=7

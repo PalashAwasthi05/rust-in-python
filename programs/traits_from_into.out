@@ -1,0 +1,18 @@
+0
+3.048
+3.281
+3.000
+ok Even(42)
+ok Even(8)
+error: empty input
+error: bad number: invalid digit found in string
+error: negative: -4
+error: bad number: 7 is odd
+hi ann
+hi bo
+4
+true
+Ok(200)
+c [104, 101, 121] boxed
+Some(5)
+3

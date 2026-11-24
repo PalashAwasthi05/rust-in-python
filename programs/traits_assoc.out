@@ -1,0 +1,8 @@
+0
+stack (cap 4): [5, 4, 3, 2, 1] first=Some(5) full=true
+letters (cap 10): ['a', 'b', 'c'] first=Some('a') full=false
+stack
+[3, 4, 0, 1, 2, 3, 4]
+2.5k = 2500.0m
+3m = 4828.0m
+None false

@@ -1,0 +1,9 @@
+0
+Rex says woof on 4 legs (owner: Sam) Dog { name: "Rex", owner: "Sam" }
+parrot#12 says squawk on 2 legs (owner: the zoo) Parrot { words: 12 }
+longest name: parrot#12
+- Fido says woof on 4 legs
+- parrot#3 says squawk on 2 legs
+legs: 6
+<a|bc|d> <A|BC|D>
+<1.5|2>

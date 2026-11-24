@@ -1,0 +1,11 @@
+0
+Some(42) Some(true)
+[Some(1), None, Some(-7)] [Some(false), None, Some(true)]
+-6
+[Push(3), Dup, Mul, Push(4), Add]
+[13]
+Err("bad op \"sub\"")
+Err(ParseIntError { kind: PosOverflow })
+Ok([1.5, -2000.0])
+Some(5551) None
+Some("ann") None

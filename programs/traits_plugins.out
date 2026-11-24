@@ -1,0 +1,13 @@
+0
+> echo hi there  => hi there
+> sum 1 2 3      => 6
+> sum 4 x        => error: x: invalid digit found in string
+> repeat ab      => ab-ab-ab
+> repeat         => error: repeat needs a word
+> nope 1         => unknown command "nope"
+>                => empty
+> echo again     => again
+echo called 2 times; echo<Echo { count: 2 }>
+repeat called 0 times; repeat<Repeat { times: 3 }>
+sum called 0 times; sum<Sum>
+[Echo { count: 2 }, Repeat { times: 3 }, Sum]

@@ -1,0 +1,9 @@
+0
+Vec2 { x: 4, y: -2 } Vec2 { x: 2, y: -6 } Vec2 { x: -3, y: 4 }
+Vec2 { x: 9, y: -12 } Vec2 { x: 2, y: 4 }
+pos = Vec2 { x: 1, y: 2 }, dist = 3
+eq: true false
+S#..
+..##
+...#
+sum = Vec2 { x: 1, y: 2 }

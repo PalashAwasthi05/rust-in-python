@@ -1,0 +1,10 @@
+0
+circle with area 7.07 and perimeter 9.42
+rectangle with area 12.00 and perimeter 14.00
+square with area 4.00 and perimeter 8.00
+shape with area 6.00 and perimeter 12.00
+largest: Rect { w: 3.0, h: 4.0 }
+total = 17.566
+square < shape < circle < rectangle
+[Circle { r: 1.5 }, Rect { w: 3.0, h: 4.0 }, Rect { w: 2.0, h: 2.0 }, Triangle { a: 3.0, b: 4.0, c: 5.0 }]
+[Circle { r: 2.0 }, Rect { w: 1.0, h: 5.0 }]

@@ -1,0 +1,16 @@
+0
+[  1  4]
+[  2  5]
+[  3  6]
+(2, 3) -> (3, 2)
+[ 14 32]
+[ 32 77]
+trace = 91
+true
+3
+6 50
+pushed a
+pushed b
+pushed c
+full, dropped d
+[Some('a'), Some('b'), Some('c')] cap 3

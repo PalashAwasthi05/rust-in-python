@@ -5,6 +5,7 @@ pub mod prelude {
     pub use crate::iter::Iterator;
     pub use crate::iter::IntoIterator;
     pub use crate::iter::Extend;
+    pub use crate::iter::FromIterator;
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
@@ -328,8 +329,11 @@ pub mod iter {
         fn array_chunks_vec(self, size: usize) -> Lazy<Vec<Self::Item>> where Self: Sized { crate::intrinsics::iter_chunks(self, size) }
     }
 
-    // Extend carries no methods here; its impls let inference find a collection's element type.
-    pub trait Extend<A> {}
+    // The std impls below exist so inference can find a collection's element type; their extend is the
+    // built-in inherent method. User types implement extend themselves.
+    pub trait Extend<A> {
+        fn extend<I: IntoIterator<Item = A>>(&mut self, iter: I);
+    }
     impl<T> Extend<T> for Vec<T> {}
     impl<'a, T: Copy> Extend<&'a T> for Vec<T> {}
     impl Extend<char> for String {}
@@ -340,6 +344,19 @@ pub mod iter {
     impl<T> Extend<T> for crate::collections::BTreeSet<T> {}
     impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> {}
     impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> {}
+
+    // Collecting into built-in collections is built in; user types implement FromIterator.
+    pub trait FromIterator<A>: Sized {
+        fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
+    }
+
+    // Numeric sums are built in; these traits let user types opt into `iter.sum()` and `iter.product()`.
+    pub trait Sum<A = Self>: Sized {
+        fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
+    pub trait Product<A = Self>: Sized {
+        fn product<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
 
     pub trait IntoIterator {
         type Item;
@@ -1396,7 +1413,7 @@ pub mod hash {
         fn write(&mut self, bytes: &[u8]);
         fn write_u8(&mut self, i: u8) { self.write_u64(i as u64) }
         fn write_u32(&mut self, i: u32) { self.write_u64(i as u64) }
-        fn write_u64(&mut self, i: u64);
+        fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()) }
         fn write_usize(&mut self, i: usize) { self.write_u64(i as u64) }
         fn write_i32(&mut self, i: i32) { self.write_u64(i as u64) }
         fn write_i64(&mut self, i: i64) { self.write_u64(i as u64) }
@@ -1715,6 +1732,7 @@ pub mod collections {
     pub mod hash_map {
         pub use super::HashMap;
         pub use super::Entry;
+        pub use crate::hash::DefaultHasher;
     }
     pub mod btree_map {
         pub use super::BTreeMap;

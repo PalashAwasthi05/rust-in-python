@@ -1,0 +1,22 @@
+0
+cat
+box(cat)
+ref(cat)
+rc(int 7)
+some cat
+nothing
+<cat & int 3>
+[int 1; int 2; int 3]
+box(cat)
+BOX(CAT)
+BOX(INT 5)
+BOX(CAT)
+BOX(<INT 1 & CAT>)
+Rust true
+rust false
+Go true
+RUST false
+go false
+Zig true
+#Go #Rust #Zig
+true false true
