@@ -1,0 +1,33 @@
+0
+[P1] [P2] [P3] [P4]
+[ab] [      ab] [ab------] [   ab   ] [ab]
+[1.5] [    3.14] [+2] [-00001.2]
+w=None p=None fill=' ' alt=false plus=false zero=false align=None
+w=Some(10) p=Some(3) fill=' ' alt=false plus=false zero=false align=Some(Right)
+w=Some(8) p=None fill='*' alt=true plus=true zero=true align=Some(Center)
+w=None p=None fill=' ' alt=false plus=false zero=false align=Some(Left)
+[$12.34] [     $5.05]
+5 Alt[5]
+Alt { value: 255, hex: 0xff }
+Alt {
+    value: 255,
+    hex: 0xff,
+}
+ff 0x000a
+  1  20
+300   4
+[1, 2]
+[
+    1,
+    2,
+]
+Named { id: 9, tags: ["x"] }
+Named {
+    id: 9,
+    tags: [
+        "x",
+    ],
+}
+P1,P2
+2
+"pad"

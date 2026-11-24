@@ -1,0 +1,52 @@
+fn main() {
+    let name = "Ferris";
+    let age = 7;
+    println!("{0} is {1} years old; {0} likes {2}", name, age, "crabs");
+    println!("{1} {0} {1} {}", "a", "b");
+    println!("{} {} {0}", 1, 2);
+    println!("{name} is {age}");
+    println!("{name:?} {age:>4} {age:04} {age:#x}");
+    println!("{n} {m} {n}", n = 1, m = 2);
+    println!("{greeting}, {0}!", "world", greeting = "hello");
+    println!("{{literal}} {{{}}} }} {{", 5);
+    println!("{{}}");
+    let width = 6;
+    let precision = 2;
+    let pi = 3.14159265;
+    println!("[{pi:width$.precision$}]");
+    println!("[{:width$.precision$}]", pi);
+    println!("[{0:1$}] [{0:>1$}]", 7, 5);
+    println!("[{:>w$}]", "x", w = 3);
+    println!("[{:.*}] [{:.*}]", 1, 2.55, 3, 1.0);
+    println!("[{:>1$}]", "abc", width);
+    let v = vec![1, 2, 3];
+    println!("{v:?} {:?}", v.len());
+    let s = format!("{}-{}", "a", 1);
+    println!("{s}");
+    let x = 5;
+    let msg = format!("{x}{x}{x:?}{x:2}");
+    println!("{}", msg);
+    print!("no newline ");
+    print!("{} ", 1);
+    println!("then newline");
+    eprintln!("this goes to stderr {}", 42);
+    eprint!("also stderr");
+    println!("{}", format_args!("{} {}", 1, 2));
+    let mut out = String::new();
+    use std::fmt::Write;
+    write!(out, "{}+{}", 1, 2).unwrap();
+    writeln!(out, " = {}", 3).unwrap();
+    write!(&mut out, "[{:>4}]", "r").unwrap();
+    print!("{}", out);
+    println!();
+    println!("{:?}", format!("{:5}|{:<5}|{:^5}|{:>5}", 1, 2, 3, 4));
+    let r#type = "raw";
+    println!("{}", r#type);
+    println!("{}", concat!("a", 1, 'b', 2.5, true));
+    println!("{}", stringify!(x + y * 2));
+    println!("{:?}", line!() > 0);
+    let items = ["a", "b"];
+    for (i, item) in items.iter().enumerate() {
+        println!("{i}: {item}");
+    }
+}

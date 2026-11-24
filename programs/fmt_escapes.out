@@ -1,0 +1,26 @@
+0
+"tab\there \"quoted\" back\\slash\nnewline\r\0nul 'single'"
+50
+'a' '\'' '"' '\n' '\t' '\\' '\0' '\u{7f}' '\u{1b}' 'é' '日' '🦀' ' ' '\u{200b}' '\u{a0}' '\u{301}' 
+"\u{1}\u{2}\u{1f}\u{80}\u{9f}"
+"unicode kept: ñ ü ß Ω Ж 中文 😀"
+"e\u{301}"
+"\u{301}e"
+"zero\u{200d}width"
+"\u{feff}bom"
+"line\u{2028}sep"
+"owned \"string\""
+["a\nb", "c\"d"]
+('x', "y", '\n')
+(
+    "multi\nline",
+    '\t',
+)
+A
+"A"
+tab\t
+\u{e9}\n
+\u{e9}\u{a}
+Some("x\ty")
+'\r'
+"~\u{7f}"

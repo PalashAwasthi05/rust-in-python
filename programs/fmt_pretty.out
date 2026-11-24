@@ -1,0 +1,98 @@
+0
+Item {
+    name: "apple",
+    tags: [
+        "fruit",
+        "red",
+    ],
+    price: Some(
+        1.25,
+    ),
+}
+{
+    "empty": [],
+    "fruit": [
+        Item {
+            name: "apple",
+            tags: [
+                "fruit",
+                "red",
+            ],
+            price: Some(
+                1.25,
+            ),
+        },
+        Item {
+            name: "pear",
+            tags: [],
+            price: None,
+        },
+    ],
+}
+[
+    Start,
+    Move(
+        1,
+        -1,
+    ),
+    Say {
+        text: "hi\n",
+        loud: true,
+    },
+]
+Tuple(
+    7,
+    Unit,
+    [
+        1,
+        2,
+    ],
+)
+(
+    1,
+    "a",
+)
+(
+    1,
+)
+()
+[]
+Some(
+    Some(
+        3,
+    ),
+)
+Ok(
+    [
+        1,
+    ],
+)
+{
+    1: (
+        2.0,
+        '3',
+    ),
+}
+[
+    [
+        1,
+        2,
+    ],
+    [
+        3,
+        4,
+    ],
+]
+"str"
+1.0
+[
+    {
+        1: [
+            Unit,
+        ],
+    },
+]
+5
+RefCell {
+    value: 1,
+}

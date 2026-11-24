@@ -1318,6 +1318,9 @@ macro_rules! writeln {
         }
     };
 }
+macro_rules! format_args {
+    ($($argument:tt)*) => { std::fmt::Arguments::from_text(format!($($argument)*)) };
+}
 macro_rules! matches {
     ($value:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
         match $value { $pattern $(if $guard)? => true, _ => false }
@@ -6482,7 +6485,7 @@ FORMAT_SPECIFICATION = re.compile(
     r"(?:(?P<fill>[^{}])(?P<filled_alignment>[<^>])|(?P<alignment>[<^>]))?"
     r"(?P<sign>[+-])?(?P<alternate>#)?(?P<zero>0(?!\$))?"
     r"(?P<width>[^\s$.:]+\$|[0-9]+)?"
-    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<hex>[xX](?=\?$))?(?P<kind>[?boxXeE])?"
+    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<kind>[xX]\?|[?boxXeE])?"
 )
 
 
@@ -6501,7 +6504,7 @@ class FormatSpec:
     zero: bool
     width: int | FormatCount
     precision: int | FormatCount | None
-    hex: str = ""
+    debug_hex: str = ""
 
 
 @dataclass(frozen=True)
@@ -6526,9 +6529,10 @@ def parse_format_field(text, token):
         argument = int(argument) if argument.isdecimal() else argument or None
     except ValueError:
         raise token.error("format argument is out of range") from None
-    spec = FormatSpec(fields["kind"] or "", fields["fill"] or " ", fields["filled_alignment"] or fields["alignment"],
+    kind = fields["kind"] or ""
+    spec = FormatSpec(kind[-1:], fields["fill"] or " ", fields["filled_alignment"] or fields["alignment"],
                       fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision,
-                      fields["hex"] or "")
+                      kind[:-1])
     return FormatField(argument, spec)
 
 
@@ -7319,9 +7323,14 @@ class Checker:
             for field in parts:
                 if isinstance(field, FormatField):
                     annotation = self.resolve(field.annotation)
-                    if annotation != NEVER and field.spec.kind in {"b", "o", "x", "X"} and annotation not in INTEGER_TYPES:
+                    user_trait = FORMAT_TRAITS.get(field.spec.kind)
+                    if (user_trait and annotation not in NUMBER_TYPES and not isinstance(annotation, TypeParameter)
+                            and user_trait in self.program.traits
+                            and self.program.implementation(annotation, user_trait) is not None):
+                        pass
+                    elif annotation != NEVER and field.spec.kind in {"b", "o", "x", "X"} and annotation not in INTEGER_TYPES:
                         raise token.error(f"base formatting requires an integer, found {annotation}")
-                    if annotation != NEVER and field.spec.kind in {"e", "E"} and annotation not in NUMBER_TYPES:
+                    elif annotation != NEVER and field.spec.kind in {"e", "E"} and annotation not in NUMBER_TYPES:
                         raise token.error(f"exponent formatting requires a number, found {annotation}")
                     field = replace(field, annotation=annotation)
                 resolved.append(field)
@@ -11838,8 +11847,9 @@ def format_exponent(value, kind, precision):
     if isinstance(value, float) and not math.isfinite(value):
         return format_float(value, False)
     decimal = decimal_float(value) if isinstance(value, float) else Decimal(value)
-    if decimal.is_zero():
-        decimal = Decimal(0).copy_sign(decimal)
+    if decimal == 0:
+        sign = "-" if isinstance(value, float) and math.copysign(1.0, value) < 0 else ""
+        return f"{sign}0{'.' + '0' * precision if precision else ''}{kind}0"
     if precision is None:
         text = format(decimal, "e")
     elif isinstance(value, float):
@@ -11865,45 +11875,15 @@ def format_float(value, debug):
     return text + ".0" if debug and "." not in text else text
 
 
-def pretty_debug(value, indent=0):
-    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
-        value = value.read()
-    if USER_FORMAT is not None and isinstance(value, Value):
-        text = USER_FORMAT(value, True, alternate=True)
-        if text is not None:
-            return text.replace("\n", "\n" + " " * indent)
-    if isinstance(value, MapValue) and value.entries:
-        entries = MAP_ORDER(value)
-        if all(item[1] is MAP_MEMBER for item in entries):
-            lines = [pretty_debug(key, indent + 4) for key, _ in entries]
-        else:
-            lines = [f"{pretty_debug(key, indent + 4)}: {pretty_debug(item, indent + 4)}" for key, item in entries]
-        return "{\n" + "".join(" " * (indent + 4) + line + ",\n" for line in lines) + " " * indent + "}"
-    if isinstance(value, ArrayValue) and value.items:
-        opening, closing = "[", "]"
-        entries = [pretty_debug(item, indent + 4) for item in value.items]
-    elif isinstance(value, Value) and value.fields:
-        ctor = value.constructor
-        name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
-        entries = [pretty_debug(item, indent + 4) for item in value.fields]
-        if ctor.style == "record":
-            opening, closing = f"{name} {{", "}"
-            entries = [f"{field}: {entry}" for (field, _), entry in zip(ctor.fields, entries)]
-        else:
-            opening, closing = f"{name}(", ")"
-    else:
-        return display(value, True)
-    lines = "".join(" " * (indent + 4) + entry + ",\n" for entry in entries)
-    return opening + "\n" + lines + " " * indent + closing
-
-
 def format_value(value, annotation, spec):
     global DEBUG_SPEC
     while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         value = value.read()
-    if USER_FORMAT is not None and isinstance(value, Value) and spec.kind in {"", "?"}:
-        # A Display or Debug impl decides its own padding; Rust ignores width unless the impl uses it.
-        text = USER_FORMAT(value, spec.kind == "?", alternate=spec.alternate, spec=spec)
+    if spec.kind == "?":
+        return debug_format(value, annotation, spec)
+    if USER_FORMAT is not None and isinstance(value, Value):
+        # A Display impl decides its own padding; Rust ignores width unless the impl uses it.
+        text = USER_FORMAT(value, False, alternate=spec.alternate, spec=spec, trait=FORMAT_TRAITS.get(spec.kind))
         if text is not None:
             return text
     kind = spec.kind
@@ -11924,7 +11904,7 @@ def format_value(value, annotation, spec):
     prefix = ""
     if kind in {"b", "o", "x", "X"}:
         if value < 0:
-            value %= 1 << INTEGER_WIDTHS[annotation]
+            value %= 1 << INTEGER_WIDTHS.get(annotation, 32)
         text = format(value, kind)
         if spec.alternate:
             prefix = {"b": "0b", "o": "0o", "x": "0x", "X": "0x"}[kind]
@@ -11932,23 +11912,15 @@ def format_value(value, annotation, spec):
         text = format_exponent(value, kind, spec.precision)
     elif isinstance(value, float) and spec.precision is not None and math.isfinite(value):
         text = format(value, f".{spec.precision}f")
-    elif kind == "?" and spec.hex and isinstance(value, int) and not isinstance(value, bool):
-        return format_value(value, annotation, dataclass_replace(spec, kind=spec.hex, hex=""))
-    elif kind == "?" and not numeric and DEBUG_SPEC is None and (
-            spec.width or spec.precision is not None or spec.hex or spec.sign or spec.zero) and not isinstance(
-            value, (str, bool, int, float)):
-        # Debug options reach every scalar inside a collection or tuple, as `{:5.2?}` and `{:02x?}` do in Rust.
-        DEBUG_SPEC = spec
-        try:
-            return pretty_debug(value) if spec.alternate else display(value, True)
-        finally:
-            DEBUG_SPEC = None
-    elif kind == "?" and spec.alternate:
-        text = pretty_debug(value)
     else:
-        text = display(value, kind == "?")
-        if spec.precision is not None and not numeric and kind == "":
+        text = display(value, False)
+        if spec.precision is not None and not numeric:
             text = text[:spec.precision]
+    return pad_formatted(text, numeric, spec, prefix)
+
+
+def pad_formatted(text, numeric, spec, prefix=""):
+    """Apply sign, zero padding, fill, and alignment the way core::fmt does for primitives."""
     sign = ""
     if numeric and text.startswith("-"):
         sign, text = "-", text[1:]
@@ -11968,11 +11940,117 @@ def text_of_plain(value):
     return value
 
 
+def debug_element(annotation, index=0):
+    """The static type of a container's index-th element, when the container's type is known."""
+    while isinstance(annotation, ReferenceType):
+        annotation = annotation.inner
+    if isinstance(annotation, (ArrayType, SliceType)):
+        return annotation.element
+    if isinstance(annotation, TupleType):
+        return annotation.elements[index] if index < len(annotation.elements) else None
+    if isinstance(annotation, AppliedType) and annotation.arguments:
+        return annotation.arguments[min(index, len(annotation.arguments) - 1)]
+    return None
+
+
+def debug_format(value, annotation, spec):
+    """Debug formatting: like the std impls, every leaf sees the formatter's width, fill, and flags."""
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
+        value = value.read()
+    while isinstance(annotation, ReferenceType):
+        annotation = annotation.inner
+    if isinstance(value, WeakValue):
+        return "(Weak)"
+    if USER_FORMAT is not None and isinstance(value, Value):
+        text = USER_FORMAT(value, True, alternate=spec.alternate, spec=spec)
+        if text is not None:
+            return text
+    if isinstance(value, bool) or value is None:
+        return pad_formatted(display(value, True), False, spec)
+    if isinstance(value, int):
+        kind = annotation if annotation in INTEGER_TYPES else "i32"
+        return format_value(value, kind, replace(spec, kind=spec.debug_hex, precision=None,
+                                                 alternate=spec.alternate and bool(spec.debug_hex)))
+    if isinstance(value, float):
+        kind = annotation if annotation in FLOAT_TYPES else "f64"
+        if spec.precision is not None:
+            return format_value(value, kind, replace(spec, kind=""))
+        return pad_formatted(format_float(value, True), True, spec)
+    if isinstance(value, str):
+        # str and char Debug write their escaped text directly, ignoring width and precision.
+        return display(value, True)
+    if isinstance(value, ExitCodeValue):
+        return display(value, True)
+    if isinstance(value, MapValue):
+        entries = MAP_ORDER(value) if MAP_ORDER else list(value.entries.values())
+        key_type, item_type = debug_element(annotation, 0), debug_element(annotation, 1)
+        if all(item[1] is MAP_MEMBER for item in entries):
+            parts = [debug_format(key, key_type, spec) for key, _ in entries]
+        else:
+            parts = [f"{debug_format(key, key_type, spec)}: {debug_format(item, item_type, spec)}"
+                     for key, item in entries]
+        return debug_join("{", parts, "}", spec.alternate)
+    if isinstance(value, ArrayValue):
+        element = debug_element(annotation)
+        return debug_join("[", [debug_format(item, element, spec) for item in value.items], "]", spec.alternate)
+    if isinstance(value, Value):
+        ctor = value.constructor
+        name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
+        if ctor.style == "unit" or not ctor.fields:
+            return name if name else "()"
+        if not name:
+            parts = [debug_format(item, debug_element(annotation, index), spec)
+                     for index, item in enumerate(value.fields)]
+            if len(parts) == 1 and not spec.alternate:
+                return f"({parts[0]},)"
+            return debug_join("(", parts, ")", spec.alternate)
+        kinds = [kind if kind in NUMBER_TYPES else None for _, kind in ctor.fields]
+        parts = [debug_format(item, kind, spec) for item, kind in zip(value.fields, kinds)]
+        if ctor.style == "tuple":
+            return debug_join(f"{name}(", parts, ")", spec.alternate)
+        parts = [f"{field}: {part}" for (field, _), part in zip(ctor.fields, parts)]
+        if spec.alternate:
+            return debug_join(f"{name} {{", parts, "}", True)
+        return f"{name} {{ {', '.join(parts)} }}"
+    return display(value, True)
+
+
+def debug_join(opening, parts, closing, alternate):
+    if not alternate:
+        return opening + ", ".join(parts) + closing
+    if not parts:
+        return opening + closing
+    return opening + "\n" + "".join("    " + part.replace("\n", "\n    ") + ",\n" for part in parts) + closing
+
+
+def grapheme_extend(char):
+    code = ord(char)
+    return (unicodedata.category(char) in {"Mn", "Me"} or code in {0x200C, 0xFF9E, 0xFF9F}
+            or 0x1F3FB <= code <= 0x1F3FF or 0xE0020 <= code <= 0xE007F)
+
+
+def escape_debug_text(text, quotes, extended_from=None):
+    """char::escape_debug over text: quotes lists the quote characters that get a backslash, and
+    grapheme extenders at or after index extended_from stay unescaped (str::escape_debug keeps all but the first)."""
+    parts = []
+    for index, char in enumerate(text):
+        if char in quotes or char in {'\\', '\n', '\r', '\t', '\0'}:
+            parts.append("\\" + next(key for key, item in ESCAPES.items() if item == char))
+        elif not char.isprintable() or (grapheme_extend(char) and (extended_from is None or index < extended_from)):
+            parts.append(f"\\u{{{ord(char):x}}}")
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
 USER_FORMAT = None
 DEBUG_SPEC = None
 MAP_ORDER = None
 MAP_MEMBER = object()
 FORMATTER = MODULE_SEPARATOR.join(("std", "fmt", "Formatter"))
+# The std::fmt traits behind each non-Display, non-Debug format kind, for user impls and `Trait::fmt(&x, f)`.
+FORMAT_TRAITS = {kind: MODULE_SEPARATOR.join(("std", "fmt", name)) for kind, name in (
+    ("x", "LowerHex"), ("X", "UpperHex"), ("o", "Octal"), ("b", "Binary"), ("e", "LowerExp"), ("E", "UpperExp"))}
 
 
 def display(value, debug):
@@ -12022,16 +12100,7 @@ def display(value, debug):
         return format_float(value, debug)
     if debug and isinstance(value, str):
         quote = "'" if isinstance(value, Character) else '"'
-        parts = [quote]
-        for char in value:
-            if char in {quote, '\\', '\n', '\r', '\t', '\0'}:
-                escape = next(key for key, item in ESCAPES.items() if item == char)
-                parts.append("\\" + escape)
-            elif not char.isprintable():
-                parts.append(f"\\u{{{ord(char):x}}}")
-            else:
-                parts.append(char)
-        return "".join(parts) + quote
+        return quote + escape_debug_text(value, quote) + quote
     return str(value)
 
 
@@ -12594,7 +12663,8 @@ class Interpreter:
         align = {"<": 1, ">": 2, "^": 3}.get(spec.align if spec is not None else None, 0)
         return Value(ctor, ("", alternate, optional(width), optional(precision),
                             Character(spec.fill if spec is not None else " "), align,
-                            bool(spec is not None and spec.sign == "+"), bool(spec is not None and spec.zero)))
+                            bool(spec is not None and spec.sign == "+"), bool(spec is not None and spec.zero),
+                            " xX".index(spec.debug_hex) if spec is not None and spec.debug_hex else 0))
 
     def call_trait_method(self, trait, name, receiver, values):
         """Call a trait method on a concrete receiver type, using the trait's default body if needed."""
@@ -12637,9 +12707,9 @@ class Interpreter:
         arguments = specialized | {function.method_parameters[0]: source_type}
         return self.call(function.name.text, (collection,), arguments)
 
-    def user_format(self, value, debug, alternate=False, spec=None):
-        """Format a value through a Display or Debug impl written in Rust, if it has one."""
-        trait = "Debug" if debug else "Display"
+    def user_format(self, value, debug, alternate=False, spec=None, trait=None):
+        """Format a value through a Display or Debug (or other std::fmt trait) impl written in Rust, if it has one."""
+        trait = trait or ("Debug" if debug else "Display")
         if trait not in self.program.traits:
             return None
         implementation = self.program.implementation(value.constructor.annotation, trait)
@@ -12731,17 +12801,28 @@ class Interpreter:
             raise RustPanic("a formatting trait implementation returned an error when the underlying stream did not")
         return formatter.read().fields[0]
 
-    def builtin_fmt(self, value, formatter, debug, result):
+    @staticmethod
+    def formatter_spec(stored, kind):
+        """The FormatSpec a std::fmt::Formatter value carries."""
+        _, alternate, width, precision, fill, align, plus, zero, debug_hex = stored.fields
+        return FormatSpec(kind, str(fill), {1: "<", 2: ">", 3: "^"}.get(align),
+                          "+" if plus else None, alternate, zero,
+                          width.fields[0] if width.fields else 0, precision.fields[0] if precision.fields else None,
+                          " xX"[debug_hex].strip() if kind == "?" else "")
+
+    def builtin_fmt(self, value, formatter, debug, result, annotation=None, kind=None):
         """`x.fmt(f)` for a built-in x, honouring the formatter's width, fill, and precision as Rust does."""
         stored = formatter.read()
-        buffer, alternate, width, precision, fill, align, plus, zero = stored.fields
-        spec = FormatSpec("?" if debug else "", str(fill), {1: "<", 2: ">", 3: "^"}.get(align),
-                          "+" if plus else None, alternate, zero,
-                          width.fields[0] if width.fields else 0, precision.fields[0] if precision.fields else None)
+        buffer = stored.fields[0]
+        spec = self.formatter_spec(stored, kind or ("?" if debug else ""))
         while isinstance(value, (Address, DynAddress, BoxValue, RcValue)):
             value = value.read()
-        annotation = ("f64" if isinstance(value, float) else "i64" if isinstance(value, int)
-                      and not isinstance(value, bool) else None)
+        while isinstance(annotation, ReferenceType):
+            annotation = annotation.inner
+        if isinstance(value, float) and annotation not in FLOAT_TYPES:
+            annotation = "f64"
+        elif isinstance(value, int) and not isinstance(value, bool) and annotation not in INTEGER_TYPES:
+            annotation = "i64"
         text = format_value(value, annotation, spec)
         formatter.write(Value(stored.constructor, (buffer + text, *stored.fields[1:])))
         return self.variant(result, "Ok", None)
@@ -13694,7 +13775,7 @@ class Interpreter:
                     return self.call(HASH_BUILTIN, values, dict(zip(helper.type_parameters, (receiver, hasher))))
                 if implementation is None and trait in {"Display", "Debug"} and name == "fmt":
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
-                    return self.builtin_fmt(values[0], values[1], trait == "Debug", result)
+                    return self.builtin_fmt(values[0], values[1], trait == "Debug", result, receiver)
                 if implementation is None and trait == INTO_ITERATOR and name == "into_iter":
                     if isinstance(values[0], IteratorValue) or iteration_item(receiver) is None:
                         return values[0]
@@ -15060,10 +15141,20 @@ def method_is_ascii(interpreter, result, text):
 
 @intrinsic
 def method_escape_default(interpreter, result, text):
-    return display(text_of(text), True)[1:-1]
+    escapes = {"\t": "\\t", "\r": "\\r", "\n": "\\n", "'": "\\'", '"': '\\"', "\\": "\\\\"}
+    return "".join(escapes.get(char) or (char if " " <= char <= "~" else f"\\u{{{ord(char):x}}}")
+                   for char in text_of(text))
 
 
-INTRINSICS[".escape_debug"] = method_escape_default
+@intrinsic
+def method_escape_debug(interpreter, result, text):
+    text = text_of(text)
+    return escape_debug_text(text, "'\"", None if isinstance(text, Character) else 1)
+
+
+@intrinsic
+def method_escape_unicode(interpreter, result, text):
+    return "".join(f"\\u{{{ord(char):x}}}" for char in text_of(text))
 
 
 @intrinsic
@@ -15940,6 +16031,23 @@ def rust_map_range(interpreter, result, value, bounds):
 @intrinsic
 def rust_map_debug(interpreter, result, value, formatter):
     return interpreter.builtin_fmt(map_of(value), formatter, True, result)
+
+
+@intrinsic
+def rust_debug_entry(interpreter, result, value, formatter):
+    return debug_format(value, None, interpreter.formatter_spec(formatter.read(), "?"))
+
+
+@intrinsic
+def rust_arguments_text(interpreter, result, value):
+    # write_fmt receives either the String that write! formats or a format_args! Arguments wrapping one.
+    value = text_of(value)
+    return value if isinstance(value, str) else text_of(value.fields[0])
+
+
+@intrinsic
+def rust_kind_fmt(interpreter, result, value, formatter, kind):
+    return interpreter.builtin_fmt(value, formatter, False, result, interpreter.intrinsic_types[0], str(kind))
 
 
 @intrinsic

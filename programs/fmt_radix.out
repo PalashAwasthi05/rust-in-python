@@ -1,0 +1,35 @@
+0
+ff FF 10 101
+0xff 0xFF 0o10 0b101
+ff
+ffff
+ffffffff
+ffffffffffffffff
+ffffffffffffffffffffffffffffffff
+11111110
+37777777770
+0xFFFFFF01
+0b00000101
+0x000000ff
+00000000ff
+0x00ab
+00000101
+     101|
+0x1f    |
+   0b1010   |
+ffffffffffffffff
+ffffffffffffffffffffffffffffffff
+0b0
+0x8000000000000000
+ffffffffffffffff
+DEADBEEF
+[a, ff]
+0xff
+(A, B)
+01abff
+00:0F:10:FF
++f
+fed4 1111111011010100
+fffffffb
+fb
+0x61
