@@ -1630,6 +1630,41 @@ VALID = [
             println!("{words:?}");
         }
     """, '97\n206\n169\n33\nΩa [97, 206, 169, 33] 505 4 one two aΩ!\n["second", "first"]\n'),
+    ("floating-point arithmetic, NaN, constants, and saturating casts", """
+        const C: f32 = 0.1 + 0.2;
+        const COUNT: u8 = 1000.5 as u8;
+        #[derive(PartialEq, PartialOrd, Debug)]
+        struct Score { n: f64 }
+        fn main() {
+            let mut v: f32 = 0.1;
+            v += 0.2;
+            let items = [0.1, 0.2f32];
+            let t = (0, (v, 1.0));
+            println!("{v} {C:?} {items:?} {} {:?}", t.1.0, -0.0f64);
+            let nan = 0.0f64 / 0.0;
+            let a = Score { n: nan };
+            let b = Score { n: 1.0 };
+            println!("{} {} {} {} {:?} {} {COUNT}", a == b, a < b, a != b, nan > 0.0, nan, nan as i64);
+            println!("{} {} {:?} {} {}", 1.0f32 / -0.0, (-5.5f64) % 2.0, 1e-7f32, 1e-7f32, 3.0f64 as i32);
+            println!("{:?} {:?} {:?}", 1e8f32, 1e16f32, 1e-4f32);
+        }
+    """, "0.3 0.3 [0.1, 0.2] 0.3 -0.0\nfalse false true false NaN 0 255\n"
+         "-inf -1.5 1e-7 0.0000001 3\n100000000.0 1e16 0.0001\n"),
+    ("float methods and range patterns use binary32 and binary64 values", """
+        fn classify(x: f32) -> i32 {
+            match x { 0.0..=1.5 => 1, -5.0..0.0 => 2, _ => 3 }
+        }
+        fn show<const N: usize>() { println!("{N}"); }
+        fn main() {
+            let negative_zero = -0.0f32;
+            let root = 2f32.sqrt();
+            let invalid = (-4.0f64).sqrt();
+            let zero: f64 = Default::default();
+            println!("{root:?} {} {} {} {} {} {} {:?}", negative_zero.is_sign_negative(), invalid.is_nan(),
+                     f64::INFINITY.is_infinite(), f32::MAX.is_finite(), classify(1.5), classify(-0.2), zero.abs());
+            show::<5>();
+        }
+    """, "1.4142135 true true true true 1 2 0.0\n5\n"),
 ]
 
 INVALID = [
@@ -2416,6 +2451,18 @@ INVALID = [
             println!("{}", it.count());
         }
     """, "use of moved value 'it'"),
+    ("overflowing float literals are rejected", """
+        fn main() { let _ = 1e100f32; }
+    """, "floating-point literal is out of range for f32"),
+    ("floating-point types cannot derive Eq", """
+        #[derive(PartialEq, Eq)]
+        struct Bad(f64);
+        fn main() {}
+    """, "f64 does not implement Eq"),
+    ("float const parameter types are not allowed", """
+        fn invalid<const VALUE: f64>() {}
+        fn main() {}
+    """, "unsupported const parameter type"),
 ]
 
 
@@ -2527,12 +2574,16 @@ class InterpreterTests(unittest.TestCase):
                     println!("{text}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "floating_point.rs"
-            unsupported.write_text('''
+            floating = folder / "floating_point.rs"
+            floating.write_text('''
                 fn main() {
                     let n = 1.5f64;
                     println!("{}", n * 2.0);
                 }
+            ''', encoding="utf-8")
+            unsupported = folder / "format_precision.rs"
+            unsupported.write_text('''
+                fn main() { println!("{:.2}", 1.234f64); }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
@@ -2570,14 +2621,14 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, map_iterator, string, borrowed_string, collect, unsupported,
+                                     for_iteration, iterator, map_iterator, string, borrowed_string, collect, floating, unsupported,
                                      panics, bounds, overflow, shift, utf8, substring],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",

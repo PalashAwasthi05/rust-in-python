@@ -16,12 +16,15 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass, field, replace
+from decimal import Decimal
 import json
+import math
 import operator
 import os
 from pathlib import Path
 import re
 import string
+import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -66,6 +69,12 @@ INTEGER_SUFFIX = re.compile(f"(?:{'|'.join(INTEGER_WIDTHS)})$")
 INTEGER_BOUNDS = {kind: (-(1 << (width - 1)), 1 << (width - 1)) if kind.startswith("i") else (0, 1 << width)
                   for kind, width in INTEGER_WIDTHS.items()}
 CONST_TYPES = INTEGER_TYPES | {"bool", "char"}
+FLOAT_TYPES = {"f32", "f64"}
+NUMBER_TYPES = INTEGER_TYPES | FLOAT_TYPES
+CONST_VALUE_TYPES = CONST_TYPES | FLOAT_TYPES
+FLOAT_OPERATORS = {"+", "-", "*", "/", "%"}
+FLOAT_PREDICATES = {"is_nan": math.isnan, "is_finite": math.isfinite, "is_infinite": math.isinf,
+                    "is_sign_negative": lambda value: math.copysign(1.0, value) < 0}
 CHAR_LIMIT = 0x110000
 SURROGATES = range(0xD800, 0xE000)
 SCALAR_BOUNDS = {**INTEGER_BOUNDS, "char": (0, CHAR_LIMIT)}
@@ -75,11 +84,25 @@ class Character(str):
     """A Unicode scalar value, with its own Rust debug representation."""
 
 
+class Float32(float):
+    """A binary32 value stored exactly in a Python float."""
+
+
+DECIMAL_DIGITS = r"[0-9][0-9_]*"
+DECIMAL_EXPONENT = rf"[eE][+-]?{DECIMAL_DIGITS}"
+FLOAT_TOKEN = (rf"(?:{DECIMAL_DIGITS}\.{DECIMAL_DIGITS}(?:{DECIMAL_EXPONENT})?(?:f32|f64)?"
+               rf"|{DECIMAL_DIGITS}{DECIMAL_EXPONENT}(?:f32|f64)?|{DECIMAL_DIGITS}(?:f32|f64)"
+               rf"|{DECIMAL_DIGITS}\.(?![\w.]))")
+FLOAT_LITERAL = re.compile(FLOAT_TOKEN)
+FLOAT_SUFFIX = re.compile(r"f(?:32|64)$")
+
+
 TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|b?r(?P<hashes>#{0,255})"[\s\S]*?"(?P=hashes)|'
     r'b?"(?:(?:\\[\s\S])|[^"\\])*"|'
     r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|[^\r\n])|[^'\\\r\n\t])'|"
     r"'[A-Za-z_][A-Za-z_0-9]*|"
+    rf'{FLOAT_TOKEN}|'
     rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
     r'[A-Za-z_][A-Za-z_0-9]*|'
     r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%&|^\-]=|[{}()[\]#$@?.:,;=!+*/%&<>|^\-]'
@@ -101,7 +124,7 @@ PRECEDENCE = {
 BITWISE = {"&": operator.and_, "|": operator.or_, "^": operator.xor}
 SHIFTS = {"<<", ">>"}
 BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
-PRIMITIVES = CONST_TYPES | {"()"}
+PRIMITIVES = CONST_VALUE_TYPES | {"()"}
 NEVER = "!"
 SCALAR_CONSTANTS = {f"{kind}::{name}": (result, value)
                     for kind, (lo, hi) in INTEGER_BOUNDS.items()
@@ -109,6 +132,13 @@ SCALAR_CONSTANTS = {f"{kind}::{name}": (result, value)
                                                 ("BITS", "u32", INTEGER_WIDTHS[kind]))}
 SCALAR_CONSTANTS.update({"char::MIN": ("char", Character("\0")),
                          "char::MAX": ("char", Character(chr(CHAR_LIMIT - 1)))})
+for _kind, _precision, _max_exponent in (("f32", 24, 128), ("f64", 53, 1024)):
+    _maximum = math.ldexp(2 - 2.0 ** (1 - _precision), _max_exponent - 1)
+    SCALAR_CONSTANTS.update({f"{_kind}::{name}": (_kind, value) for name, value in (
+        ("MIN", -_maximum), ("MAX", _maximum), ("MIN_POSITIVE", math.ldexp(1.0, 2 - _max_exponent)),
+        ("EPSILON", 2.0 ** (1 - _precision)), ("NAN", math.nan),
+        ("INFINITY", math.inf), ("NEG_INFINITY", -math.inf),
+    )})
 
 
 def lex(source):
@@ -1152,6 +1182,7 @@ class TypeVariable:
     token: Token
     const_type: str | None = None
     integer_literal: bool = False
+    float_literal: bool = False
 
     def __str__(self):
         return self.name
@@ -1172,7 +1203,7 @@ def is_vector(annotation):
 
 @dataclass(frozen=True)
 class ConstValue:
-    value: int | bool | Character
+    value: int | bool | float | Character
     kind: str | None = field(default=None, compare=False)
     boolean: bool = field(init=False)
 
@@ -1239,7 +1270,7 @@ def fold_const(expression):
             checked(values[0], token, kind)
         result = complement(values[0], kind)
     elif len(values) == 1:
-        result = checked(-values[0], token, kind)
+        result = rounded_float(-values[0], kind) if kind in FLOAT_TYPES else checked(-values[0], token, kind)
     else:
         result = binary(word, *values, token, expression.integer or kind)
     return ConstValue(result, kind)
@@ -1461,6 +1492,8 @@ class Program:
     dispatches: dict = field(default_factory=dict)
     traits_in_scope: dict = field(default_factory=dict)
     values_in_scope: dict = field(default_factory=dict)
+    constants_in_scope: dict = field(default_factory=dict)
+    format_constants: dict = field(default_factory=dict)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -1588,6 +1621,8 @@ class Program:
             return trait in self.trait_closure({annotation.trait})
         if annotation == "str":
             return trait in {"Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord"}
+        if annotation in FLOAT_TYPES and trait in {"Eq", "Ord"}:
+            return False
         if trait == "Sized":
             return not isinstance(annotation, SliceType)
         if isinstance(annotation, FunctionType):
@@ -1768,7 +1803,7 @@ class Parser:
             self.expect(">")
             self.expect("::")
             return self.associated_projection(owner, trait)
-        if token.text in CONST_TYPES or token.text == "str":
+        if token.text in CONST_VALUE_TYPES or token.text == "str":
             return token.text
         if token.text == "[":
             element = self.type_name(static_string=static_string, signature=signature)
@@ -1935,14 +1970,15 @@ class Parser:
             raise name.error(f"duplicate constant {name.text!r}")
         self.expect(":")
         annotation = self.type_name()
-        if annotation not in CONST_TYPES:
+        if annotation not in CONST_VALUE_TYPES:
             raise name.error("unsupported constant type")
         self.expect("=")
         value = self.const_expression(self.expression(), annotation)
         if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
             raise name.error(f"expected a {annotation} constant")
         if ((annotation == "bool") != value.boolean
-                or (annotation == "char") != isinstance(value.value, Character)):
+                or (annotation == "char") != isinstance(value.value, Character)
+                or (annotation in FLOAT_TYPES) != isinstance(value.value, float)):
             raise name.error(f"expected a {annotation} constant")
         if annotation in INTEGER_TYPES:
             checked(value.value, name, annotation)
@@ -2409,6 +2445,11 @@ class Parser:
                 continue
             dot = self.expect(".")
             name = self.advance()
+            if re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", name.text):
+                first, second = name.text.split(".")
+                left = Expr("field", dot, (left, replace(name, text=first)))
+                dot = replace(name, text=".", column=name.column + len(first))
+                name = replace(name, text=second, column=dot.column + 1)
             if not (IDENT.fullmatch(name.text) or re.fullmatch(r'0|[1-9][0-9]*', name.text)):
                 raise name.error("expected a field name or tuple field index")
             type_arguments = None
@@ -2661,6 +2702,12 @@ class Parser:
     @staticmethod
     def literal(token, negative=False):
         word = token.text
+        if FLOAT_LITERAL.fullmatch(word):
+            suffix = FLOAT_SUFFIX.search(word)
+            kind = suffix.group() if suffix else "f64"
+            digits = (word[:suffix.start()] if suffix else word).replace("_", "")
+            value = float(digits)
+            return Expr("literal", token, (kind, -value if negative else value), unsuffixed=suffix is None)
         if word and word[0].isdigit():
             suffix = INTEGER_SUFFIX.search(word)
             kind = suffix.group() if suffix else "i32"
@@ -2760,16 +2807,22 @@ class Parser:
         expr = ungroup(expr)
         if expr.kind == "const_value":
             return expr.args[0]
-        if expr.kind == "literal" and expr.args[0] in CONST_TYPES:
+        if expr.kind == "literal" and expr.args[0] in CONST_VALUE_TYPES:
             kind, value = expr.args
+            if kind in FLOAT_TYPES:
+                target = hint if expr.unsuffixed and hint in FLOAT_TYPES else kind
+                value = float_literal_value(value, target, expr.token)
             return ConstValue(value, None if expr.unsuffixed else kind)
         if expr.kind == "cast":
             operand, target = expr.args
-            if target not in SCALAR_BOUNDS:
-                raise expr.token.error("constant cast requires an integer or char target")
+            if target not in SCALAR_BOUNDS and target not in FLOAT_TYPES:
+                raise expr.token.error("constant cast requires a numeric or char target")
             preferred = "u8" if target == "char" else target
             value = self.const_expression(operand, preferred)
-            actual = const_kind(value) or preferred
+            actual = const_kind(value)
+            if actual is None and isinstance(value, ConstValue) and isinstance(value.value, float):
+                actual = "f32" if isinstance(value.value, Float32) else "f64"
+            actual = actual or (preferred if preferred in INTEGER_TYPES else "i32")
             if not scalar_cast_supported(actual, target):
                 raise expr.token.error(f"cannot cast {actual} to {target}")
             return fold_const(ConstExpression("as", (value,), target, expr.token, actual))
@@ -2789,7 +2842,10 @@ class Parser:
                 if kind in INTEGER_TYPES:
                     checked(result, expr.token, kind)
                 return ConstValue(result, value.kind)
-            if kind in INTEGER_TYPES and kind.startswith("i"):
+            if isinstance(value, ConstValue) and isinstance(value.value, float):
+                width = kind if kind in FLOAT_TYPES else "f32" if isinstance(value.value, Float32) else "f64"
+                return ConstValue(rounded_float(-value.value, width), value.kind)
+            if kind in FLOAT_TYPES or kind in INTEGER_TYPES and kind.startswith("i"):
                 return ConstExpression("-", (value,), kind, expr.token)
         if expr.kind == "binary":
             left, right = (self.const_expression(arg, hint) for arg in expr.args)
@@ -2808,7 +2864,8 @@ class Parser:
                     raise expr.token.error("character comparison requires two characters")
                 if word in COMPARE or (kind == "bool" and word in {"&&", "||", *BITWISE}):
                     return ConstExpression(word, (left, right), "bool", expr.token, kind)
-                if kind in INTEGER_TYPES and word in {*ARITHMETIC, "/", "%"}:
+                if ((kind in INTEGER_TYPES and word in {*ARITHMETIC, "/", "%"})
+                        or (kind in FLOAT_TYPES and word in FLOAT_OPERATORS)):
                     return ConstExpression(word, (left, right), kind, expr.token, kind)
             if all(isinstance(arg, ConstValue) for arg in (left, right)):
                 if left.boolean and right.boolean and word in BITWISE:
@@ -2821,12 +2878,18 @@ class Parser:
                 ):
                     if isinstance(left.value, Character) != isinstance(right.value, Character):
                         raise expr.token.error("character comparison requires two characters")
+                    if isinstance(left.value, float) != isinstance(right.value, float):
+                        raise expr.token.error("float comparison requires two floats")
                     if type(left.value) is int:
                         kind = left.kind or right.kind or (hint if hint in INTEGER_TYPES else "i32")
                         checked(left.value, expr.token, kind)
                         checked(right.value, expr.token, kind)
                     return ConstValue(COMPARE[word](left.value, right.value), "bool")
                 kind = left.kind or right.kind
+                if (isinstance(left.value, float) and isinstance(right.value, float) and word in FLOAT_OPERATORS
+                        and (not left.kind or not right.kind or left.kind == right.kind)):
+                    width = kind or (hint if hint in FLOAT_TYPES else "f64")
+                    return ConstValue(float_binary(word, left.value, right.value, width), kind)
                 if (type(left.value) is int and type(right.value) is int and word in {*ARITHMETIC, "/", "%"}
                         and (not left.kind or not right.kind or left.kind == right.kind)):
                     return ConstValue(binary(word, left.value, right.value, expr.token,
@@ -3267,6 +3330,17 @@ class IntegerRange:
         return self.start <= ordinal(value) < self.stop
 
 
+@dataclass(frozen=True)
+class FloatRange:
+    start: float | None
+    stop: float | None
+    inclusive: bool
+
+    def contains(self, value):
+        return (not math.isnan(value) and (self.start is None or self.start <= value)
+                and (self.stop is None or value < self.stop or (self.inclusive and value == self.stop)))
+
+
 def ordinal(value):
     return ord(value) if isinstance(value, Character) else value
 
@@ -3324,7 +3398,7 @@ class Pattern:
             if positions is not None:
                 yield from self.field_bindings(tuple(value.items[index] for index in positions),
                                                address, tuple(map(str, positions)))
-        elif isinstance(self.tag, IntegerRange):
+        elif isinstance(self.tag, (IntegerRange, FloatRange)):
             if self.tag.contains(value):
                 yield {}
         elif value == self.tag[1]:
@@ -3577,6 +3651,7 @@ class Checker:
         self.numeric_operands = []
         self.unary_results = []
         self.array_integers = []
+        self.float_literals = []
         self.iterator_results = []
         self.parameters = {}
         self.ascriptions = []
@@ -3918,6 +3993,14 @@ class Checker:
             if resolved not in INTEGER_TYPES:
                 raise token.error(f"expected an integer, found {resolved}")
             checked(value, token, resolved)
+        for annotation, value, token in self.float_literals:
+            resolved = self.resolve(annotation)
+            if isinstance(resolved, TypeVariable):
+                self.require(resolved, "f64", token)
+                resolved = "f64"
+            if resolved not in FLOAT_TYPES:
+                raise token.error(f"expected a float, found {resolved}")
+            float_literal_value(value, resolved, token)
         for operand, result, token in self.unary_results:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
@@ -4299,11 +4382,39 @@ class Checker:
                 actual = hint
             if actual in INTEGER_TYPES:
                 checked(value, token, actual)
+            if actual in FLOAT_TYPES:
+                if expr.unsuffixed and hint in FLOAT_TYPES:
+                    actual = hint
+                if math.isnan(value):
+                    raise token.error("NaN cannot appear in a pattern")
+                value = float_literal_value(value, actual, token)
             self.require(actual, annotation, token)
             return Pattern(tag=(actual, value)), {}
         if kind == "pattern_range":
             first, last, inclusive = args
             scalar = self.resolve(annotation)
+            if scalar in FLOAT_TYPES or (isinstance(scalar, TypeVariable) and any(
+                endpoint and endpoint.args[0] in FLOAT_TYPES for endpoint in (first, last)
+            )):
+                if scalar not in FLOAT_TYPES:
+                    scalar = next(endpoint.args[0] for endpoint in (first, last)
+                                  if endpoint and endpoint.args[0] in FLOAT_TYPES)
+                self.require(scalar, annotation, token)
+                endpoints = []
+                for endpoint in (first, last):
+                    if endpoint is None:
+                        endpoints.append(None)
+                        continue
+                    actual, value = endpoint.args
+                    actual = scalar if endpoint.unsuffixed and actual in FLOAT_TYPES else actual
+                    self.require(actual, scalar, endpoint.token)
+                    if math.isnan(value):
+                        raise endpoint.token.error("NaN cannot appear in a range pattern")
+                    endpoints.append(float_literal_value(value, scalar, endpoint.token))
+                start, stop = endpoints
+                if start is not None and stop is not None and (start > stop or start == stop and not inclusive):
+                    raise token.error("empty floating-point range pattern")
+                return Pattern(tag=FloatRange(start, stop, inclusive)), {}
             if scalar not in SCALAR_BOUNDS:
                 scalar = next((endpoint.args[0] for endpoint in (first, last)
                                if endpoint and not endpoint.unsuffixed and endpoint.args[0] in SCALAR_BOUNDS), "i32")
@@ -4487,7 +4598,8 @@ class Checker:
 
     def type_of(self, expr, scope, expected=None):
         if id(expr) in self.program.call_functions or expr.kind in {
-            "length", "is_empty", "iterator", "reverse_iterator", "map_iterator", "string_iterator", "iterator_terminal"
+            "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
+            "string_iterator", "iterator_terminal"
         }:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
@@ -4596,8 +4708,8 @@ class Checker:
                 self.require_argument(result, target, token)
                 expr.kind, expr.args = "group", (value,)
                 return result
-            if target in SCALAR_BOUNDS:
-                hint = ("u8" if target == "char" else target) if self.unsuffixed_integer(value) else None
+            if target in SCALAR_BOUNDS or target in FLOAT_TYPES:
+                hint = ("u8" if target == "char" else target) if self.unsuffixed_number(value) else None
                 actual = self.type_of(value, scope, hint)
                 if actual == NEVER:
                     expr.kind, expr.args = "group", (value,)
@@ -4612,6 +4724,14 @@ class Checker:
         if kind == "literal":
             annotation, value = args
             hint = self.resolve(expected)
+            if annotation in FLOAT_TYPES:
+                if expr.unsuffixed and hint in FLOAT_TYPES:
+                    annotation = hint
+                elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.float_literal:
+                    self.float_literals.append((hint, value, token))
+                    return hint
+                float_literal_value(value, annotation, token)
+                return annotation
             if expr.unsuffixed and hint in INTEGER_TYPES:
                 annotation = hint
             elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.integer_literal:
@@ -4809,7 +4929,7 @@ class Checker:
         if kind == "unary":
             operand = args[0]
             hint = self.resolve(expected)
-            hint = hint if hint in CONST_TYPES else None
+            hint = hint if hint in CONST_VALUE_TYPES else None
             literal = ungroup(operand)
             if token.text == "-" and literal.kind == "literal" and literal.args[0] in INTEGER_TYPES:
                 kind, magnitude = literal.args
@@ -4823,6 +4943,10 @@ class Checker:
             actual = self.type_of(operand, scope, hint)
             if actual == NEVER:
                 return NEVER
+            if actual in FLOAT_TYPES:
+                if token.text != "-":
+                    raise token.error(f"cannot negate {actual} with '!'")
+                return actual
             if token.text == "!" and actual == "bool":
                 return "bool"
             if actual in INTEGER_TYPES:
@@ -4851,7 +4975,7 @@ class Checker:
                 raise token.error("cannot assign an unsized str value")
             operator = token.text.removesuffix("=")
             hint = STR_REFERENCE if annotation == STRING and token.text == "+=" else annotation if token.text == "=" or (
-                operator not in SHIFTS and self.unsuffixed_integer(right)
+                operator not in SHIFTS and self.unsuffixed_number(right)
             ) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
@@ -4863,11 +4987,11 @@ class Checker:
             hint = self.resolve(expected)
             if token.text in SHIFTS:
                 left, right = args
-                left_hint = hint if hint in INTEGER_TYPES and self.unsuffixed_integer(left) else None
+                left_hint = hint if hint in INTEGER_TYPES and self.unsuffixed_number(left) else None
                 return self.binary_type(token, self.type_of(left, scope, left_hint), self.type_of(right, scope))
             if token.text in {"&&", "||"}:
                 hint = "bool"
-            elif (hint not in INTEGER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
+            elif (hint not in NUMBER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
                 hint = None
             left, right = self.operand_types(*args, scope, hint, same_type=token.text in COMPARE)
             if left == STRING and token.text == "+":
@@ -4892,7 +5016,18 @@ class Checker:
             positional = iter(types)
             for mode, name in placeholders:
                 if name:
-                    actual = scope.find(replace(template.token, text=name)).value
+                    name_token = replace(template.token, text=name)
+                    binding = self.local_binding(scope, name_token)
+                    if binding is not None:
+                        actual = binding.value
+                    else:
+                        parameter = self.parameters.get(name)
+                        constant = parameter if parameter and parameter.const_type else (
+                            self.program.constants_in_scope.get(template.token.module, {}).get(name))
+                        if constant is None:
+                            raise name_token.error(f"unknown binding {name!r}")
+                        actual = const_kind(constant)
+                        self.program.format_constants.setdefault(id(expr), {})[name] = constant
                 else:
                     actual = next(positional)
                 if isinstance(actual, ReferenceType):
@@ -4906,21 +5041,21 @@ class Checker:
         raise AssertionError(kind)
 
     @staticmethod
-    def unsuffixed_integer(expr):
+    def unsuffixed_number(expr):
         expr = ungroup(expr)
         if expr.kind == "unary" and expr.token.text == "-":
-            return Checker.unsuffixed_integer(expr.args[0])
+            return Checker.unsuffixed_number(expr.args[0])
         if expr.kind == "binary" and expr.token.text in SHIFTS:
-            return Checker.unsuffixed_integer(expr.args[0])
+            return Checker.unsuffixed_number(expr.args[0])
         if expr.kind == "binary" and expr.token.text in {*ARITHMETIC, "/", "%"}:
-            return all(map(Checker.unsuffixed_integer, expr.args))
+            return all(map(Checker.unsuffixed_number, expr.args))
         return expr.unsuffixed
 
     def operand_types(self, left, right, scope, hint=None, *, same_type=False):
-        left_literal, right_literal = self.unsuffixed_integer(left), self.unsuffixed_integer(right)
+        left_literal, right_literal = self.unsuffixed_number(left), self.unsuffixed_number(right)
         if hint is None and left_literal and not right_literal:
             right_type = self.type_of(right, scope)
-            left_type = self.type_of(left, scope, right_type if right_type in INTEGER_TYPES else None)
+            left_type = self.type_of(left, scope, right_type if right_type in NUMBER_TYPES else None)
         else:
             left_type = self.type_of(left, scope, hint if hint == "bool" or left_literal else None)
             right_hint = left_type if left_type != NEVER else hint
@@ -4944,7 +5079,9 @@ class Checker:
         else:
             element = None
         if args and args[0].unsuffixed and (element is None or isinstance(element, TypeVariable)):
-            literal = TypeVariable("integer literal", token, integer_literal=True)
+            floating = args[0].kind == "literal" and args[0].args[0] in FLOAT_TYPES
+            literal = TypeVariable("float literal" if floating else "integer literal", token,
+                                   integer_literal=not floating, float_literal=floating)
             self.variables.append(literal)
             if element is not None:
                 self.require(literal, element, token)
@@ -5156,6 +5293,12 @@ class Checker:
             expr.kind, expr.args = "group", (original,)
             return NEVER
         base = actual.inner if isinstance(actual, ReferenceType) else actual
+        if base in FLOAT_TYPES and name in {*FLOAT_PREDICATES, "abs", "sqrt"} and not rest and expr.type_arguments is None:
+            if isinstance(actual, ReferenceType):
+                original = Expr("deref", original.token, (original, False))
+                self.type_of(original, scope)
+            expr.kind, expr.args = "float_method", (original,)
+            return "bool" if name in FLOAT_PREDICATES else base
         if isinstance(actual, IteratorType) and name in {"rev", "into_iter"} and not rest and expr.type_arguments is None:
             expr.kind, expr.args = ("reverse_iterator" if name == "rev" else "group"), (original,)
             return replace(actual, source=("rev", actual)) if name == "rev" else actual
@@ -5510,6 +5653,11 @@ class Checker:
         if word in SHIFTS:
             self.numeric_operands.extend(((left, None, token), (right, None, token)))
             return NEVER if NEVER in {left, right} else left
+        if word in FLOAT_OPERATORS and (left in FLOAT_TYPES or right in FLOAT_TYPES):
+            kind = left if left in FLOAT_TYPES else right
+            self.require(left, kind, token)
+            self.require(right, kind, token)
+            return NEVER if NEVER in {left, right} else kind
         if word in BITWISE and "bool" in {left, right}:
             self.require(left, "bool", token)
             self.require(right, "bool", token)
@@ -6078,7 +6226,8 @@ class Ownership:
             return cursor, Loan(place, function.result.mutable)
         return cursor, None
 
-    def lower_print(self, token, args, scope, cursor):
+    def lower_print(self, expr, scope, cursor):
+        token, args = expr.token, expr.args
         if not args:
             return cursor
         template, *values = args
@@ -6100,7 +6249,7 @@ class Ownership:
             cursor, holder = self.keep_loan(cursor, loan, value.token)
             temporaries.append(holder)
         for mode, name in format_parts(template.args[1], template.token):
-            if mode == "text" or not name:
+            if mode == "text" or not name or name in self.program.format_constants.get(id(expr), {}):
                 continue
             local = scope.find(replace(template.token, text=name))
             place = self.referent(local) if local.loan else Place(local)
@@ -6170,7 +6319,7 @@ class Ownership:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"length", "is_empty", "to_string"}:
+        if kind in {"length", "is_empty", "to_string", "float_method"}:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "range_index":
             for item in args[:3]:
@@ -6324,9 +6473,9 @@ class Ownership:
             return None if self.annotation(expr) == NEVER else cursor
         if kind in {"print", "panic"}:
             if kind == "panic":
-                self.lower_print(token, args, scope, cursor)
+                self.lower_print(expr, scope, cursor)
                 return None
-            return self.lower_print(token, args, scope, cursor)
+            return self.lower_print(expr, scope, cursor)
         raise AssertionError(kind)
 
     def lower_stored_value(self, expr, expected, scope, cursor):
@@ -6636,13 +6785,61 @@ def truncate_integer(value, annotation):
     return (value - lower) % (upper - lower) + lower
 
 
+def rounded_float(value, annotation):
+    value = float(value)
+    if annotation == "f64":
+        return value
+    try:
+        return Float32(struct.unpack("!f", struct.pack("!f", value))[0])
+    except OverflowError:
+        return Float32(math.copysign(math.inf, value))
+
+
+def float_literal_value(value, annotation, token):
+    rounded = rounded_float(value, annotation)
+    if token.text[:1].isdigit() and not math.isfinite(rounded):
+        raise token.error(f"floating-point literal is out of range for {annotation}")
+    return rounded
+
+
+def float_binary(word, left, right, annotation):
+    if word == "/":
+        if right == 0.0:
+            sign = math.copysign(1.0, left) * math.copysign(1.0, right)
+            value = math.nan if left == 0.0 or math.isnan(left) else math.copysign(math.inf, sign)
+        else:
+            value = left / right
+    elif word == "%":
+        value = math.nan if right == 0.0 or math.isinf(left) else math.fmod(left, right)
+    else:
+        value = ARITHMETIC[word](left, right)
+    return rounded_float(value, annotation)
+
+
 def scalar_cast_supported(actual, target):
-    return actual == "u8" if target == "char" else actual in CONST_TYPES
+    if target == "char":
+        return actual == "u8"
+    if target in FLOAT_TYPES:
+        return actual in NUMBER_TYPES
+    return actual in CONST_VALUE_TYPES
 
 
 def convert_scalar(value, target):
-    number = int(ordinal(value))
-    return Character(chr(number)) if target == "char" else truncate_integer(number, target)
+    number = ordinal(value)
+    if target in FLOAT_TYPES:
+        return rounded_float(number, target)
+    if target == "char":
+        return Character(chr(number))
+    if isinstance(number, float):
+        lower, upper = INTEGER_BOUNDS[target]
+        if math.isnan(number):
+            return 0
+        if number >= upper:
+            return upper - 1
+        if number <= lower:
+            return lower
+        return math.trunc(number)
+    return truncate_integer(int(number), target)
 
 
 def complement(value, annotation):
@@ -6650,6 +6847,8 @@ def complement(value, annotation):
 
 
 def binary(word, left, right, token, integer="i32", *, runtime=False):
+    if integer in FLOAT_TYPES:
+        return float_binary(word, left, right, integer)
     if word == "+" and integer == STRING:
         return left + display(right, False)
     if word in BITWISE and integer == "bool":
@@ -6675,6 +6874,27 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
     return quotient if word == "/" else left - quotient * right
 
 
+def format_float(value, debug):
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "-inf" if value < 0 else "inf"
+    text = repr(float(value))
+    if isinstance(value, Float32):
+        for digits in range(1, 10):
+            candidate = format(value, f".{digits}g")
+            if rounded_float(float(candidate), "f32") == value:
+                text = candidate
+                break
+    decimal = Decimal(text)
+    if debug and value != 0.0 and not -4 <= decimal.adjusted() < 16:
+        coefficient, exponent = format(decimal.normalize(), "e").split("e")
+        return f"{coefficient}e{int(exponent)}"
+    text = format(decimal, "f")
+    text = text.rstrip("0").rstrip(".") if "." in text else text
+    return text + ".0" if debug and "." not in text else text
+
+
 def display(value, debug):
     if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
         return display(value.read(), debug)
@@ -6694,6 +6914,8 @@ def display(value, debug):
         return "()"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float):
+        return format_float(value, debug)
     if debug and isinstance(value, str):
         quote = "'" if isinstance(value, Character) else '"'
         parts = [quote]
@@ -6823,6 +7045,8 @@ class Interpreter:
     def default_value(self, annotation):
         if annotation in INTEGER_TYPES:
             return 0
+        if annotation in FLOAT_TYPES:
+            return rounded_float(0.0, annotation)
         if annotation in PRIMITIVES:
             return {"bool": False, "char": Character("\0"), "()": None}[annotation]
         if is_str_reference(annotation):
@@ -6848,7 +7072,7 @@ class Interpreter:
         if isinstance(left, ArrayValue):
             for a, b in zip(left.items, right.items):
                 result = self.compare(a, b)
-                if result:
+                if result != 0:
                     return result
             return len(left.items) - len(right.items)
         if isinstance(left, FunctionValue):
@@ -6860,11 +7084,13 @@ class Interpreter:
                 return order[left.constructor.path] - order[right.constructor.path]
             for a, b in zip(left.fields, right.fields):
                 result = self.compare(a, b)
-                if result:
+                if result != 0:
                     return result
             return 0
         if left is None:
             return 0
+        if isinstance(left, float) and (math.isnan(left) or math.isnan(right)):
+            return None
         return (left > right) - (left < right)
 
     def runtime_constructor(self, expr, template):
@@ -7036,7 +7262,11 @@ class Interpreter:
         if kind in {"slice_reference", "string_reference"}:
             return self.eval(args[0], scope)
         if kind == "literal":
-            return Address(Binding(args[1], False)) if is_str_reference(args[0]) else args[1]
+            if is_str_reference(args[0]):
+                return Address(Binding(args[1], False))
+            if args[0] in FLOAT_TYPES:
+                return rounded_float(args[1], self.program.expr_types[id(expr)])
+            return args[1]
         if kind == "byte_string":
             return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
@@ -7045,6 +7275,12 @@ class Interpreter:
             return display(self.eval(args[0], scope), False) if args else ""
         if kind == "to_string":
             return display(self.eval(args[0], scope), False)
+        if kind == "float_method":
+            value = self.eval(args[0], scope)
+            if token.text in FLOAT_PREDICATES:
+                return FLOAT_PREDICATES[token.text](value)
+            result = abs(value) if token.text == "abs" else math.nan if value < 0 else math.sqrt(value)
+            return rounded_float(result, self.program.expr_types[id(expr)])
         if kind in {"array", "vector"}:
             return ArrayValue(tuple(self.eval(item, scope) for item in args))
         if kind == "tuple":
@@ -7186,6 +7422,8 @@ class Interpreter:
             value = self.eval(args[0], scope)
             annotation = self.program.expr_types[id(expr)]
             if token.text == "-":
+                if annotation in FLOAT_TYPES:
+                    return rounded_float(-value, annotation)
                 return checked(-value, token, annotation, runtime=True)
             return complement(value, annotation)
         if kind == "scalar_cast":
@@ -7209,7 +7447,8 @@ class Interpreter:
                 return value or self.eval(right, scope)
             if token.text in COMPARE:
                 other = self.eval(right, scope)
-                return COMPARE[token.text](self.compare(value, other), 0)
+                compared = self.compare(value, other)
+                return token.text == "!=" if compared is None else COMPARE[token.text](compared, 0)
             return binary(token.text, value, self.eval(right, scope), token,
                           self.program.expr_types[id(expr)], runtime=True)
         if kind == "call":
@@ -7250,7 +7489,9 @@ class Interpreter:
                     rendered.append(value)
                     continue
                 if value:
-                    item = scope.find(replace(template.token, text=value)).value
+                    constant = self.program.format_constants.get(id(expr), {}).get(value)
+                    item = (substitute(constant, self.type_arguments).value if constant is not None
+                            else scope.find(replace(template.token, text=value)).value)
                 else:
                     item = next(evaluated)
                 rendered.append(display(item, mode == "debug"))
@@ -7433,6 +7674,8 @@ def compile_program(source, *, proc_extern=(), source_path=None):
         }
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
                                               if symbol and symbol.kind == "fn"}
+        program.constants_in_scope[unit.path] = {name: modules.constants[symbol.name] for name, symbol in symbols.items()
+                                                 if symbol and symbol.kind == "const"}
     Checker(program).check()
     Ownership(program).check()
     return program
