@@ -1253,6 +1253,41 @@ VALID = [
             println!("{:?} {:?} {}", literal(), b"", payload(b"abc"));
         }
     """, 'A "# and \\n [65, 32, 92, 110]\n[65, 66, 255] [] 3\n'),
+    ("bitwise precedence, signed shifts, and compound assignment", """
+        const HIGH: u128 = 1u128 << 127u8;
+        const MASK: u8 = !0b11;
+        const TRUNCATED: u8 = 300u16 as u8;
+        const FLAG: bool = true ^ false;
+        fn selection(x: i16, amount: u8) -> i16 { (x >> amount) & 127i16 }
+        fn sample<const N: u8>() -> u8 { N }
+        macro_rules! right { ($n:expr, $p:expr) => { $n >> $p }; }
+        fn main() {
+            let mut x = 0b1111u8;
+            x <<= 6u16;
+            x ^= 48;
+            x &= 0b0111_1111;
+            x >>= 1;
+            x |= 3;
+            let mut flag = true;
+            flag &= false;
+            flag ^= true;
+            let n: u64 = (1 << 40) + 9;
+            let l = 1 + 2 << 2 & 15 ^ 8 | 1;
+            println!("{x} {flag} {n} {l}");
+            println!("{} {} {} {}", selection(-30, 2), HIGH, sample::<{ 1u8 << 7 }>(), right!(29u16, 2));
+            println!("{} {} {} {}", true | false & false, MASK, TRUNCATED, FLAG);
+        }
+    """, "59 true 1099511627785 5\n120 170141183460469231731687303715884105728 128 7\ntrue 252 44 true\n"),
+    ("symbolic shifts and casts in const generic array lengths", """
+        #![feature(generic_const_exprs)]
+        #![allow(incomplete_features)]
+        fn packet<const N: u8>() -> [u8; (N as usize) >> 1]
+        where [(); (N as usize) >> 1]:
+        {
+            [0u8; (N as usize) >> 1]
+        }
+        fn main() { println!("{:?}", packet::<6>()); }
+    """, "[0, 0, 0]\n"),
 ]
 
 INVALID = [
@@ -1834,6 +1869,13 @@ INVALID = [
     ("integer to character casts require a byte", """
         fn main() { let _ = 65u16 as char; }
     """, "cannot cast u16 to char"),
+    ("constant shifts are checked against the left operand width", """
+        const INVALID: u8 = 1 << 8;
+        fn main() { println!("{}", INVALID); }
+    """, "shift amount is outside the integer width"),
+    ("shift counts must be integers", """
+        fn main() { let _ = 2u8 << false; }
+    """, "expected an integer, found bool"),
 ]
 
 
@@ -1885,15 +1927,21 @@ class InterpreterTests(unittest.TestCase):
                 fn increase(n: u8) -> u8 { n + 1 }
                 fn main() { println!("before"); increase(u8::MAX); }
             ''', encoding="utf-8")
+            shift = folder / "shift.rs"
+            shift.write_text('''
+                fn rotate(n: u8, amount: i16) -> u8 { n << amount }
+                fn main() { println!("before"); rotate(1, -1); }
+            ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, unsupported, panics, bounds, overflow],
+                                     capture, slices, slice_pattern, unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match",
-                              "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match"])
+                              "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
 

@@ -81,7 +81,7 @@ TOKEN = re.compile(
     r"'[A-Za-z_][A-Za-z_0-9]*|"
     rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
     r'[A-Za-z_][A-Za-z_0-9]*|'
-    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}()[\]#$?.:,;=!+*/%&<>|\-]'
+    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%&|^\-]=|[{}()[\]#$?.:,;=!+*/%&<>|^\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
@@ -93,10 +93,12 @@ RESERVED = set("""
     final macro override priv try typeof unsized virtual yield _
 """.split())
 PRECEDENCE = {
-    "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1,
+    "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1, "&=": 1, "|=": 1, "^=": 1, "<<=": 1, ">>=": 1,
     "||": 2, "&&": 3, "==": 4, "!=": 4, "<": 4, "<=": 4, ">": 4, ">=": 4,
-    "+": 5, "-": 5, "*": 6, "/": 6, "%": 6,
+    "|": 5, "^": 6, "&": 7, "<<": 8, ">>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10,
 }
+BITWISE = {"&": operator.and_, "|": operator.or_, "^": operator.xor}
+SHIFTS = {"<<", ">>"}
 BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
 PRIMITIVES = CONST_TYPES | {"&str", "()"}
 NEVER = "!"
@@ -1151,6 +1153,15 @@ def fold_const(expression):
         result = values[0] or values[1]
     elif word in COMPARE:
         result = COMPARE[word](*values)
+    elif word == "as":
+        source = expression.integer
+        if source in INTEGER_TYPES:
+            checked(values[0], token, source)
+        result = convert_scalar(values[0], kind)
+    elif word == "!":
+        if kind in INTEGER_TYPES:
+            checked(values[0], token, kind)
+        result = complement(values[0], kind)
     elif len(values) == 1:
         result = checked(-values[0], token, kind)
     else:
@@ -2214,7 +2225,7 @@ class Parser:
                 self.expect(";")
                 statements.append(Expr("let", pattern.token, (pattern, annotation, value, otherwise)))
                 continue
-            value = self.expression()
+            value = self.expression(statement=True)
             if self.accept(";"):
                 statements.append(Expr("discard", value.token, (value, False)))
             elif self.current.text == "}":
@@ -2227,9 +2238,11 @@ class Parser:
         self.expect("}")
         return Expr("block", token, (statements, tail))
 
-    def expression(self, minimum=1, *, allow_record=True):
+    def expression(self, minimum=1, *, allow_record=True, statement=False):
         left = self.prefix(allow_record)
         while self.current.text in {".", "[", "?", "("}:
+            if statement and left.kind in BLOCK_EXPRESSIONS and self.current.text in {"[", "("}:
+                return left
             if self.current.text == "(":
                 left = Expr("indirect_call", left.token, (left, *self.arguments()))
                 continue
@@ -2262,12 +2275,20 @@ class Parser:
                 if type_arguments is not None:
                     raise name.error("explicit method arguments require a call")
                 left = Expr("field", dot, (left, name))
-        while minimum <= 6 and (cast := self.accept("as")):
+        if statement and left.kind in BLOCK_EXPRESSIONS:
+            return left
+        while minimum <= PRECEDENCE["*"] and (cast := self.accept("as")):
             left = Expr("cast", cast, (left, self.type_name()))
         compared = False
-        while PRECEDENCE.get(self.current.text, 0) >= minimum:
+        while True:
+            word, shift = self.binary_operator()
+            precedence = PRECEDENCE.get(word, 0)
+            if precedence < minimum:
+                break
             token = self.advance()
-            precedence = PRECEDENCE[token.text]
+            if shift:
+                self.advance()
+                token = replace(token, text=word)
             if precedence == 4:
                 if compared:
                     raise token.error("comparison operators cannot be chained")
@@ -2277,6 +2298,14 @@ class Parser:
             )
             left = Expr("assign" if precedence == 1 else "binary", token, (left, right))
         return left
+
+    def binary_operator(self):
+        first = self.current
+        if first.text in {"<", ">"} and self.peek() in {first.text, first.text + "="}:
+            second = self.lookahead[0]
+            if first.line == second.line and first.column + 1 == second.column:
+                return first.text + second.text, True
+        return first.text, False
 
     def skip_group(self):
         close = DELIMITERS[self.advance().text]
@@ -2381,10 +2410,10 @@ class Parser:
                 value = self.expression(allow_record=allow_record)
             return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
-            return Expr("unary", token, (self.expression(7, allow_record=allow_record),))
+            return Expr("unary", token, (self.expression(PRECEDENCE["*"] + 1, allow_record=allow_record),))
         if word in {"&", "*"}:
             mutable = bool(self.accept("mut")) if word == "&" else False
-            operand = self.expression(7, allow_record=allow_record)
+            operand = self.expression(PRECEDENCE["*"] + 1, allow_record=allow_record)
             return Expr("borrow" if word == "&" else "deref", token, (operand, mutable))
         if word == "(":
             if self.accept(")"):
@@ -2575,6 +2604,22 @@ class Parser:
         if expr.kind == "literal" and expr.args[0] in CONST_TYPES:
             kind, value = expr.args
             return ConstValue(value, None if expr.unsuffixed else kind)
+        if expr.kind == "cast":
+            operand, target = expr.args
+            if target not in SCALAR_BOUNDS:
+                raise expr.token.error("constant cast requires an integer or char target")
+            preferred = "u8" if target == "char" else target
+            value = self.const_expression(operand, preferred)
+            actual = const_kind(value) or preferred
+            if not scalar_cast_supported(actual, target):
+                raise expr.token.error(f"cannot cast {actual} to {target}")
+            return fold_const(ConstExpression("as", (value,), target, expr.token, actual))
+        if expr.kind == "unary" and expr.token.text == "!":
+            value = self.const_expression(expr.args[0], hint)
+            kind = const_kind(value) or hint or "i32"
+            if kind != "bool" and kind not in INTEGER_TYPES:
+                raise expr.token.error(f"cannot negate {kind} with '!'")
+            return fold_const(ConstExpression("!", (value,), kind, expr.token, kind))
         if expr.kind == "unary" and expr.token.text == "-":
             value = self.const_expression(expr.args[0], hint)
             kind = const_kind(value) or hint
@@ -2591,17 +2636,24 @@ class Parser:
             left, right = (self.const_expression(arg, hint) for arg in expr.args)
             word = expr.token.text
             left_kind, right_kind = const_kind(left), const_kind(right)
+            if word in SHIFTS:
+                kind = left_kind or (hint if hint in INTEGER_TYPES else "i32")
+                if kind not in INTEGER_TYPES or (right_kind and right_kind not in INTEGER_TYPES):
+                    raise expr.token.error("shift operands must be integers")
+                return fold_const(ConstExpression(word, (left, right), kind, expr.token, kind))
             if not all(isinstance(arg, ConstValue) for arg in (left, right)):
                 kind = left_kind or right_kind or hint or "i32"
                 if left_kind and right_kind and left_kind != right_kind:
                     raise expr.token.error("constant operands have different types")
                 if kind == "char" and (left_kind != kind or right_kind != kind):
                     raise expr.token.error("character comparison requires two characters")
-                if word in COMPARE or (kind == "bool" and word in {"&&", "||"}):
+                if word in COMPARE or (kind == "bool" and word in {"&&", "||", *BITWISE}):
                     return ConstExpression(word, (left, right), "bool", expr.token, kind)
                 if kind in INTEGER_TYPES and word in {*ARITHMETIC, "/", "%"}:
                     return ConstExpression(word, (left, right), kind, expr.token, kind)
             if all(isinstance(arg, ConstValue) for arg in (left, right)):
+                if left.boolean and right.boolean and word in BITWISE:
+                    return ConstValue(BITWISE[word](left.value, right.value), "bool")
                 if left.boolean and right.boolean and word in {"&&", "||"}:
                     return ConstValue((left.value and right.value) if word == "&&"
                                       else (left.value or right.value), "bool")
@@ -3231,7 +3283,7 @@ def format_parts(text, token):
     return parts
 
 
-ARITHMETIC = {"+": operator.add, "-": operator.sub, "*": operator.mul}
+ARITHMETIC = {"+": operator.add, "-": operator.sub, "*": operator.mul, **BITWISE}
 COMPARE = {
     "==": operator.eq, "!=": operator.ne, "<": operator.lt,
     "<=": operator.le, ">": operator.gt, ">=": operator.ge,
@@ -3668,7 +3720,12 @@ class Checker:
             if annotation != NEVER and not self.implements(annotation, trait):
                 raise token.error(f"{annotation} does not implement {trait}")
         for annotation, expected, token in self.numeric_operands:
-            self.require(annotation, expected, token)
+            if expected is None:
+                annotation = self.resolve(annotation)
+                if annotation != NEVER and annotation not in INTEGER_TYPES:
+                    raise token.error(f"expected an integer, found {annotation}")
+            else:
+                self.require(annotation, expected, token)
         for key, value in self.program.expr_types.items():
             self.program.expr_types[key] = self.resolve(value)
         for key, (types, arguments) in self.program.call_types.items():
@@ -4254,7 +4311,7 @@ class Checker:
                 if actual == NEVER:
                     expr.kind, expr.args = "group", (value,)
                     return NEVER
-                if (target == "char" and actual != "u8") or actual not in CONST_TYPES:
+                if not scalar_cast_supported(actual, target):
                     raise token.error(f"cannot cast {actual} to {target}")
                 expr.kind = "scalar_cast"
                 return target
@@ -4493,19 +4550,25 @@ class Checker:
                 raise token.error("reassigning reference bindings is unsupported")
             if isinstance(annotation, SliceType):
                 raise token.error("cannot assign an unsized slice value")
-            hint = annotation if token.text == "=" or self.unsuffixed_integer(right) else None
+            operator = token.text.removesuffix("=")
+            hint = annotation if token.text == "=" or (
+                operator not in SHIFTS and self.unsuffixed_integer(right)
+            ) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
                 self.require(actual, annotation, token)
             else:
-                integer = self.integer_pair(annotation, actual)
-                self.numeric_operands.extend(((annotation, integer, token), (actual, integer, token)))
+                self.binary_type(replace(token, text=operator), annotation, actual)
             return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
             hint = self.resolve(expected)
+            if token.text in SHIFTS:
+                left, right = args
+                left_hint = hint if hint in INTEGER_TYPES and self.unsuffixed_integer(left) else None
+                return self.binary_type(token, self.type_of(left, scope, left_hint), self.type_of(right, scope))
             if token.text in {"&&", "||"}:
                 hint = "bool"
-            elif hint not in INTEGER_TYPES or token.text in COMPARE:
+            elif (hint not in INTEGER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
                 hint = None
             left, right = self.operand_types(*args, scope, hint, same_type=token.text in COMPARE)
             return self.binary_type(token, left, right)
@@ -4544,6 +4607,8 @@ class Checker:
     def unsuffixed_integer(expr):
         expr = ungroup(expr)
         if expr.kind == "unary" and expr.token.text == "-":
+            return Checker.unsuffixed_integer(expr.args[0])
+        if expr.kind == "binary" and expr.token.text in SHIFTS:
             return Checker.unsuffixed_integer(expr.args[0])
         if expr.kind == "binary" and expr.token.text in {*ARITHMETIC, "/", "%"}:
             return all(map(Checker.unsuffixed_integer, expr.args))
@@ -4937,6 +5002,13 @@ class Checker:
             if left != NEVER and right != NEVER:
                 self.require(right, left, token)
                 self.obligation(left, "PartialEq" if word in {"==", "!="} else "PartialOrd", token)
+            return NEVER if NEVER in {left, right} else "bool"
+        if word in SHIFTS:
+            self.numeric_operands.extend(((left, None, token), (right, None, token)))
+            return NEVER if NEVER in {left, right} else left
+        if word in BITWISE and "bool" in {left, right}:
+            self.require(left, "bool", token)
+            self.require(right, "bool", token)
             return NEVER if NEVER in {left, right} else "bool"
         integer = self.integer_pair(left, right)
         self.numeric_operands.extend(((left, integer, token), (right, integer, token)))
@@ -5877,7 +5949,34 @@ def checked(value, token, integer="i32", *, runtime=False):
     return value
 
 
+def truncate_integer(value, annotation):
+    lower, upper = INTEGER_BOUNDS[annotation]
+    return (value - lower) % (upper - lower) + lower
+
+
+def scalar_cast_supported(actual, target):
+    return actual == "u8" if target == "char" else actual in CONST_TYPES
+
+
+def convert_scalar(value, target):
+    number = int(ordinal(value))
+    return Character(chr(number)) if target == "char" else truncate_integer(number, target)
+
+
+def complement(value, annotation):
+    return not value if annotation == "bool" else truncate_integer(~value, annotation)
+
+
 def binary(word, left, right, token, integer="i32", *, runtime=False):
+    if word in BITWISE and integer == "bool":
+        return BITWISE[word](left, right)
+    if word in SHIFTS:
+        if not 0 <= right < INTEGER_WIDTHS[integer]:
+            message = "shift amount is outside the integer width"
+            raise RustPanic(message) if runtime else token.error(message)
+        if not runtime:
+            checked(left, token, integer)
+        return truncate_integer(left << right, integer) if word == "<<" else left >> right
     if not runtime:
         checked(left, token, integer)
         checked(right, token, integer)
@@ -6248,23 +6347,16 @@ class Interpreter:
             annotation = self.program.expr_types[id(expr)]
             if token.text == "-":
                 return checked(-value, token, annotation, runtime=True)
-            if isinstance(value, bool):
-                return not value
-            lower, upper = INTEGER_BOUNDS[annotation]
-            return ~value if lower < 0 else (upper - 1) ^ value
+            return complement(value, annotation)
         if kind == "scalar_cast":
             value, target = args
-            number = int(ordinal(self.eval(value, scope)))
-            if target == "char":
-                return Character(chr(number))
-            lower, upper = INTEGER_BOUNDS[target]
-            return (number - lower) % (upper - lower) + lower
+            return convert_scalar(self.eval(value, scope), target)
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
             address = self.address(left, scope)
             if token.text != "=":
-                value = binary(token.text[0], address.read(), value, token,
+                value = binary(token.text[:-1], address.read(), value, token,
                                self.program.expr_types[id(left)], runtime=True)
             address.write(value)
             return None
