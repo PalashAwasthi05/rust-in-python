@@ -44,6 +44,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Partial moves, assignment after a move, and selected `Clone`, `Copy`, and `Debug` derives
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
+- Disjoint field reborrows through references selected by control flow
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments, associated-type constraints, and argument-position `impl Trait`
 - Opaque owned return types in free functions and inherent methods with `-> impl Trait` and associated-type bindings
@@ -72,6 +73,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
 - Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
 - Owned `String` values with concatenation and UTF-8-aware lengths and mutation
+- String searches with character and shared string patterns and UTF-8 byte offsets
 - Borrowed strings with lifetime checking, UTF-8 substring views, and `chars` and `bytes` iterators
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `f32` and `f64` arithmetic, comparisons, casts, and selected float methods
@@ -227,15 +229,15 @@ fn main() {
 }
 ```
 
-## Load procedural macros
+## Load compiled macros
 
-The optional host uses the installed Rust compiler to expand function-like, attribute, and derive macros from compiled Rust crates. Pass the name and path of each crate.
+The optional host uses the installed Rust compiler to expand declarative macros from compiled `.rlib` crates and procedural macros from dynamic libraries. Pass the name and path of each crate.
 
 ```sh
-python3 rust_in_python.py --proc-extern demo_macros=./libdemo_macros.so program.rs
+python3 rust_in_python.py --macro-extern rules=./librules.rlib --macro-extern demo_macros=./libdemo_macros.so program.rs
 ```
 
-On macOS, use the compiled `.dylib` path. The Python interpreter checks and runs the expanded program, including supported formatting and vector macros in file-backed modules. The host exchanges expanded source text, so compiler span metadata is lost at that boundary.
+On macOS, use the compiled `.dylib` path. `--proc-extern` is an alias for `--macro-extern`. Rustc supplies source spans to macro code in unmodified file-backed inputs. The host reads syntax contexts from rustc's expanded output to distinguish generated locals from caller locals. The Python checker still uses expanded-source coordinates for its own diagnostics, and user input that requires a rewrite can have different source positions.
 
 ## Compare a crate against rustc
 
@@ -258,6 +260,6 @@ Generic bodies are checked against their declared trait bounds. Const parameters
 
 Trait objects support shared and mutable references and `Box` ownership. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. Crate dependencies and cross-crate macro hygiene remain open.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. The optional host supports cross-crate macro expansion and generated local bindings. General external value and type resolution and full hygiene in exported expansions remain open.
 
 General reference types as type arguments, complete closure capture analysis and callable trait bounds, standard library coverage, Cargo integration, and native code generation remain incomplete. `Result` propagation currently requires the same error type at the call and return sites.

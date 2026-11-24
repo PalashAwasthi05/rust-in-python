@@ -15,6 +15,26 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("sibling fields stay disjoint through a borrow selected by a branch", """
+        struct Pair { x: i32, y: i32 }
+        fn exercise(pick: bool) -> i32 {
+            let mut left = Pair { x: 1, y: 2 };
+            let mut right = Pair { x: 3, y: 4 };
+            let selected = if pick { &mut left } else { &mut right };
+            let x = &mut selected.x;
+            selected.y = 10;
+            *x + selected.y
+        }
+        fn main() { println!("{} {}", exercise(true), exercise(false)); }
+    """, "11 13\n"),
+    ("string searches return UTF-8 byte offsets for character and string patterns", """
+        fn main() {
+            let text = String::from("é🦀β🦀");
+            let crab = String::from("🦀");
+            println!("{} {} {} {:?} {:?} {:?} {:?}", text.contains(&crab), text.starts_with('é'),
+                     text.ends_with("β🦀"), text.find('β'), text.rfind(&crab), text.find('x'), text.rfind(""));
+        }
+    """, "true true true Some(6) Some(8) None Some(12)\n"),
     ("uninitialized patterns declare independent locals of the inferred field types", """
         struct Record { a: u8, b: u16 }
         fn main() {
@@ -2189,6 +2209,25 @@ VALID = [
 ]
 
 INVALID = [
+    ("selected references still reject overlapping mutable field borrows", """
+        struct Pair { x: i32, y: i32 }
+        fn exercise(pick: bool) -> i32 {
+            let mut left = Pair { x: 1, y: 2 };
+            let mut right = Pair { x: 3, y: 4 };
+            let selected = if pick { &mut left } else { &mut right };
+            let x = &mut selected.x;
+            selected.x = 10;
+            *x
+        }
+        fn main() { println!("{}", exercise(true)); }
+    """, "mutably borrowed"),
+    ("string search rejects a mutable reference as a pattern", """
+        fn main() {
+            let mut text = String::from("test");
+            let pattern = text.as_mut_str();
+            println!("{}", "test".contains(pattern));
+        }
+    """, "supports character and shared string patterns"),
     ("uninitialized tuple bindings must each be assigned before use", """
         fn main() {
             let (left, right): (i32, i32);
@@ -3673,6 +3712,67 @@ class InterpreterTests(unittest.TestCase):
             timeout=30,
             env={**os.environ, "RUSTC_BOOTSTRAP": "1"} if "feature(generic_const_exprs)" in source else None,
         )
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_compiled_macro_hygiene_and_original_source_spans(self):
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            declarative = folder / "foreign.rs"
+            declarative.write_text("""
+                #[macro_export]
+                macro_rules! combine {
+                    ($value:expr) => {{
+                        let hidden = 7;
+                        hidden + $value
+                    }};
+                }
+                #[macro_export]
+                macro_rules! inner { () => { 11 }; }
+                #[macro_export(local_inner_macros)]
+                macro_rules! number { () => { inner!() }; }
+            """, encoding="utf-8")
+            rlib = folder / "libforeign.rlib"
+            subprocess.run(["rustc", "--edition=2021", "--crate-type", "rlib", declarative, "-o", rlib],
+                           capture_output=True, timeout=30, check=True)
+            procedural = folder / "spans.rs"
+            procedural.write_text("""
+                extern crate proc_macro;
+                use proc_macro::{Span, TokenStream};
+                #[proc_macro]
+                pub fn at(input: TokenStream) -> TokenStream {
+                    let invocation = Span::call_site();
+                    let arg = input.into_iter().next().unwrap().span();
+                    format!("({:?}, {}, {}, {}, {}, {:?})", invocation.file(), invocation.line(),
+                            invocation.column(), arg.line(), arg.column(), arg.source_text().unwrap())
+                        .parse().unwrap()
+                }
+            """, encoding="utf-8")
+            subprocess.run(["rustc", "--edition=2021", "--crate-type", "proc-macro",
+                            "--out-dir", folder, procedural], capture_output=True, timeout=30, check=True)
+            dylib = next(folder.glob("libspans.*"))
+            source = folder / "main.rs"
+            source.write_text(
+                'use spans::at; fn first() { println!("{:?}", at!(( 3 /* keep this text */ + 2 ))); }\n'
+                'use foreign::{combine, number};\n'
+                'macro_rules! inner { () => { 21 }; }\n'
+                'fn main() {\n'
+                '    let hidden = 5;\n'
+                '    first();\n'
+                '    println!("{} {} {} {}", combine!(hidden), number!(), inner!(), module_path!());\n'
+                '}\n', encoding="utf-8",
+            )
+            binary = folder / "native"
+            external = (f"foreign={rlib}", f"spans={dylib}")
+            flags = [part for item in external for part in ("--extern", item)]
+            subprocess.run(["rustc", "--edition=2021", *flags, source, "-o", binary],
+                           capture_output=True, timeout=30, check=True)
+            native = subprocess.run([binary], capture_output=True, text=True, timeout=10, check=True)
+            flags = [part for item in external for part in ("--macro-extern", item)]
+            runner = Path(__file__).with_name("rust_in_python.py")
+            python = subprocess.run([sys.executable, runner, *flags, source],
+                                    capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual(python.returncode, 0, python.stderr)
+            self.assertEqual(python.stdout, native.stdout)
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_procedural_macro_host(self):

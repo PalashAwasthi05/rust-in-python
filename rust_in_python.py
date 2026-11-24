@@ -183,7 +183,10 @@ def is_lifetime(text):
     return text.startswith("'") and is_identifier(text[1:])
 
 
-def lex(source, *, edition="2021", source_file=None):
+HOST_CONTEXT = re.compile(r"\s*/\*\s*\d+#(\d+)\s*\*/")
+
+
+def lex(source, *, edition="2021", source_file=None, host_contexts=None):
     offset, line, column = 0, 1, 1
     origin = object()
     while offset < len(source):
@@ -223,7 +226,10 @@ def lex(source, *, edition="2021", source_file=None):
         lines = consumed.count("\n")
         next_column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
         if word != "/*" and not (word.isspace() or word.startswith("//")):
-            yield Token(word, line, column, end=(line + lines, next_column), origin=origin,
+            context = ()
+            if host_contexts is not None and (mark := HOST_CONTEXT.match(source, end)):
+                context = host_contexts.get(int(mark[1]), ())
+            yield Token(word, line, column, context=context, end=(line + lines, next_column), origin=origin,
                         source_file=source_file)
         line += lines
         column = next_column
@@ -6755,6 +6761,18 @@ class Checker:
         if base in {STRING, "str"} and name in {"make_ascii_uppercase", "make_ascii_lowercase"}:
             return self.builtin_receiver_call(expr, scope, expected, actual, base, (),
                                               "()", kind="string_method", mutable=True)
+        if base in {STRING, "str"} and name in {"contains", "starts_with", "ends_with", "find", "rfind"}:
+            if len(rest) != 1:
+                raise expr.token.error(f"{name} takes one pattern argument")
+            pattern = self.type_of(rest[0], scope)
+            if pattern not in {"char", NEVER} and not (
+                isinstance(pattern, ReferenceType) and not pattern.mutable and pattern.inner in {"str", STRING}
+            ):
+                raise rest[0].token.error(f"{name} supports character and shared string patterns")
+            argument = "char" if pattern == "char" else STR_REFERENCE
+            result = AppliedType(OPTION, ("usize",)) if name in {"find", "rfind"} else "bool"
+            return self.builtin_receiver_call(expr, scope, expected, actual, base, (argument,),
+                                              result, kind="string_method", mutable=False)
         # There can be multiple inherent impl blocks on one target.
         for impl in self.program.impls:
             if impl.trait or name not in impl.methods:
@@ -7176,7 +7194,12 @@ class Place:
 
     def regions(self):
         if self.holder and self.holder.loan.possible:
-            return self.holder.loan.possible
+            loan = self.holder.loan
+            projection = self.fields[len(loan.place.fields):]
+            if projection:
+                return tuple(replace(origin, fields=(*origin.fields, *projection))
+                             if not origin.indexed else origin for origin in loan.possible)
+            return loan.possible
         return (self,)
 
     @property
@@ -7524,12 +7547,12 @@ class Ownership:
     def start_loan(self, cursor, place, mutable, token, *, two_phase=False, expiring=frozenset()):
         parent = place.holder.loan if place.holder else None
         parents = (parent,) if parent else ()
-        possible = parent.possible if parent else ()
+        possible = place.regions() if parent and parent.possible else ()
         if place.local.temporary:
             expiring = expiring | {place.local}
         if parent:
             expiring = expiring | parent.expiring
-        loan = Loan(Place(place.local, place.fields), mutable, parents, two_phase, possible, expiring)
+        loan = Loan(replace(place, holder=None), mutable, parents, two_phase, possible, expiring)
         protected = self.guard_borrows + self.guard_tests
         if mutable and (place.local in self.guarded or any(place.overlaps(item) for item in protected)):
             return self.emit(cursor, "guard_write", place, token), loan
@@ -8894,6 +8917,17 @@ class Interpreter:
                 return address
             arguments = tuple(self.eval(arg, scope) for arg in args[1:])
             value = address.read()
+            if token.text in {"contains", "starts_with", "ends_with", "find", "rfind"}:
+                pattern = display(arguments[0], False)
+                if token.text == "contains":
+                    return pattern in value
+                if token.text == "starts_with":
+                    return value.startswith(pattern)
+                if token.text == "ends_with":
+                    return value.endswith(pattern)
+                offset = value.find(pattern) if token.text == "find" else value.rfind(pattern)
+                found = (len(value[:offset].encode("utf-8")),) if offset >= 0 else ()
+                return self.option_value(expr, found)
             if token.text in {"push", "push_str"}:
                 address.write(value + display(arguments[0], False))
             elif token.text == "make_ascii_uppercase":
@@ -9214,17 +9248,6 @@ fn main() {
 """
 
 
-def render_source(trees):
-    parts = []
-    previous = None
-    for token in flatten_trees(trees):
-        if previous is not None and not previous.followed_by(token):
-            parts.append(" ")
-        parts.append(token.text)
-        previous = token
-    return "".join(parts)
-
-
 def rustc_source(source, libraries, source_path=None, *, edition="2021"):
     # Keep the interpreter's library entry points through rustc expansion.
     prefix = "__rust_in_python_host"
@@ -9236,9 +9259,14 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
     repeat_shim = f"{prefix}_vec_repeat"
     shims[repeat_shim] = "vec"
     trees, _ = token_trees(lex(source, edition=edition))
+    line_offsets = [0, *(match.end() for match in re.finditer("\n", source))]
+    edits = []
+
+    def offset(position):
+        line, column = position
+        return line_offsets[line - 1] + column - 1
 
     def keep_derives(items):
-        result = []
         index = 0
         while index < len(items):
             item = items[index]
@@ -9258,28 +9286,35 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
                         current.append(part)
                 if current:
                     pieces.append(tuple(current))
-                builtin = [part[0].text for part in pieces if len(part) == 1 and tree_text(part[0]) in DERIVABLE]
+                builtin = [part[0] for part in pieces if len(part) == 1 and tree_text(part[0]) in DERIVABLE]
                 if builtin:
-                    replacements, _ = token_trees(lex("#[doc=" + json.dumps(marker + ",".join(builtin)) + "]"))
-                    result.extend(replacements)
-                other = [part for part in pieces if not (len(part) == 1 and tree_text(part[0]) in DERIVABLE)]
-                if other:
-                    flattened = []
-                    for part in other:
-                        if flattened:
-                            flattened.append(replace(item, text=","))
-                        flattened.extend(part)
-                    result.extend((item, replace(attribute, items=(attribute.items[0],
-                                                               replace(derives, items=tuple(flattened))))))
+                    closing = offset(attribute.closing.end)
+                    annotation = "#[doc=" + json.dumps(marker + ",".join(part.text for part in builtin)) + "]"
+                    edits.append((closing, closing, annotation))
+                    if len(builtin) < len(pieces):
+                        removed = {id(part) for part in builtin}
+                        for position, part in enumerate(derives.items):
+                            if id(part) not in removed:
+                                continue
+                            first = offset((part.line, part.column))
+                            end = offset(part.end)
+                            edits.append((first, end, " " * (end - first)))
+                            if position + 1 < len(derives.items):
+                                comma = derives.items[position + 1]
+                                if tree_text(comma) == ",":
+                                    at = offset((comma.line, comma.column))
+                                    edits.append((at, at + 1, " "))
+                    else:
+                        first = offset((item.line, item.column))
+                        blank = re.sub(r"[^\n]", " ", source[first:closing])
+                        edits.append((first, closing, blank))
                 index += 2
                 continue
             if isinstance(item, TokenGroup):
-                item = replace(item, items=keep_derives(item.items))
-            result.append(item)
+                keep_derives(item.items)
             index += 1
-        return tuple(result)
 
-    source = render_source(keep_derives(trees))
+    keep_derives(trees)
     declarations = [f"fn {shim}() {{}}" for shim in shims]
     macros = [f"macro_rules! {name} {{ ($($args:tt)*) => {{ {prefix}_{name}($($args)*) }}; }}"
               for name in formats]
@@ -9289,27 +9324,60 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
                   "}")
     macro = " ".join((*declarations, *macros))
     # Inner attributes belong first in a crate.
-    trees, _ = token_trees(lex(source, edition=edition))
     start = 0
     while (start + 2 < len(trees) and tree_text(trees[start]) == "#" and tree_text(trees[start + 1]) == "!"
            and isinstance(trees[start + 2], TokenGroup)):
         start += 3
-    source = f"{render_source(trees[:start])} {macro} {render_source(trees[start:])}"
+    include_root = False
+    if source_path is not None and not edits and not start:
+        try:
+            include_root = Path(source_path).read_text(encoding="utf-8") == source
+        except (OSError, UnicodeError):
+            pass
+    insertion = offset(trees[start - 1].closing.end) if start else 0
+    edits.append((insertion, insertion, f" {macro} "))
+    for first, end, replacement in sorted(edits, reverse=True):
+        source = source[:first] + replacement + source[end:]
     with TemporaryDirectory(prefix="rust-in-python-") as folder:
         directory = Path(source_path).resolve().parent if source_path is not None else folder
-        args = ["rustc", f"--edition={edition}", "--crate-name", "rust_in_python_input",
-                "--crate-type", "lib", "-Zunpretty=expanded", "-"]
+        crate_name = Path(source_path).stem.replace("-", "_") if source_path else "rust_out"
+        args = ["rustc", f"--edition={edition}", "--crate-name", crate_name,
+                "--crate-type", "lib", "-Zunpretty=expanded,hygiene", "-"]
         for name, library in libraries.items():
             args.extend(("--extern", f"{name}={library}"))
+        expand = functools.partial(subprocess.run, args, text=True, capture_output=True, timeout=30,
+                                   env={**os.environ, "RUSTC_BOOTSTRAP": "1"}, check=False)
         try:
-            compiler = subprocess.run(args, cwd=directory, input=source, text=True, capture_output=True, timeout=30,
-                                      env={**os.environ, "RUSTC_BOOTSTRAP": "1"}, check=False)
+            if include_root:
+                # Read an unmodified crate root by name to preserve rustc spans.
+                wrapper = f"{macro} include!({display(os.fspath(source_path), True)});"
+                compiler = expand(cwd=Path.cwd(), input=wrapper)
+                # include! changes rustc's treatment of local exported macros.
+                if compiler.returncode and "macro_expanded_macro_exports_accessed_by_absolute_paths" in compiler.stderr:
+                    compiler = expand(cwd=directory, input=source)
+            else:
+                compiler = expand(cwd=directory, input=source)
         except subprocess.TimeoutExpired as error:
             raise RustError("procedural macro expansion exceeded 30 seconds") from error
         if compiler.returncode:
             raise RustError("rustc macro expansion failed\n" + compiler.stderr.strip())
-    output, end = token_trees(lex(compiler.stdout, edition=edition))
+    output, end = token_trees(lex(compiler.stdout, edition=edition,
+                                  host_contexts=expanded_contexts(compiler.stdout)))
     return strip_host_items(output, marker, shims, repeat_shim, libraries), end
+
+
+def expanded_contexts(source):
+    _, separator, table = source.rpartition("\nSyntaxContexts:\n")
+    if not separator:
+        raise RustError("rustc did not emit expanded syntax contexts")
+    contexts = {0: ()}
+    for current, parent, kind in re.findall(
+            r"(?m)^#(\d+): parent: #(\d+), outer_mark: \([^\n]*, (\w+)\)$", table):
+        index, ancestor = int(current), int(parent)
+        if index:
+            base = contexts[ancestor]
+            contexts[index] = base if kind == "Transparent" else (*base, (0, index))
+    return contexts
 
 
 def strip_host_items(items, marker, shims, repeat_shim, libraries, *, top=True):
@@ -9374,17 +9442,17 @@ def strip_host_items(items, marker, shims, repeat_shim, libraries, *, top=True):
     return tuple(result)
 
 
-def proc_libraries(values):
+def macro_libraries(values):
     libraries = {}
     for item in values:
         name, separator, file = item.partition("=")
         if not separator or not name.isascii() or not name.isidentifier() or not file:
-            raise RustError("expected a procedural macro library as NAME=PATH")
+            raise RustError("expected a compiled Rust macro crate as NAME=PATH")
         path = Path(file).resolve()
         if not path.is_file():
-            raise RustError(f"procedural macro library does not exist: {path}")
+            raise RustError(f"compiled Rust macro crate does not exist: {path}")
         if name in libraries:
-            raise RustError(f"duplicate procedural macro crate {name!r}")
+            raise RustError(f"duplicate macro crate {name!r}")
         libraries[name] = path
     return libraries
 
@@ -9393,7 +9461,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
-        trees, end = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
+        trees, end = rustc_source(source, macro_libraries(proc_extern), source_path, edition=edition)
     else:
         source_file = os.fspath(source_path) if source_path is not None else None
         trees, end = token_trees(lex(source, edition=edition, source_file=source_file))
@@ -9434,8 +9502,8 @@ def main():
     parser.add_argument("--demo", action="store_true", help="run a built-in Rust program")
     parser.add_argument("--check", action="store_true", help="check the source without running it")
     parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for syntax")
-    parser.add_argument("--proc-extern", action="append", default=[], metavar="NAME=PATH",
-                        help="load a compiled Rust procedural macro crate through rustc")
+    parser.add_argument("--proc-extern", "--macro-extern", action="append", default=[], metavar="NAME=PATH",
+                        help="load a compiled declarative or procedural macro crate through rustc")
     args = parser.parse_args()
     if args.demo == bool(args.source):
         parser.error("provide either a source file or --demo")
