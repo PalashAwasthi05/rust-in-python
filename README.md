@@ -45,6 +45,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
 - Const generic parameters and fixed-size arrays with length inference, indexing, repeat literals, and patterns
+- Borrowed slices, array-to-slice coercion, range indexing, and patterns on dereferenced slices
 - Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
 - Generic associated types and const expressions evaluated at specialization

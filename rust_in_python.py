@@ -1157,6 +1157,14 @@ class ArrayType:
 
 
 @dataclass(frozen=True)
+class SliceType:
+    element: object
+
+    def __str__(self):
+        return f"[{self.element}]"
+
+
+@dataclass(frozen=True)
 class AssociatedType:
     owner: object
     item: str
@@ -1283,6 +1291,8 @@ def substitute(annotation, arguments):
         return TupleType(tuple(substitute(kind, arguments) for kind in annotation.elements))
     if isinstance(annotation, ArrayType):
         return ArrayType(substitute(annotation.element, arguments), substitute(annotation.length, arguments))
+    if isinstance(annotation, SliceType):
+        return SliceType(substitute(annotation.element, arguments))
     if isinstance(annotation, AssociatedType):
         return replace(annotation, owner=substitute(annotation.owner, arguments),
                        arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments))
@@ -1374,6 +1384,8 @@ class Program:
             return TupleType(tuple(self.normalize(kind, seen) for kind in annotation.elements))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.normalize(annotation.element, seen), annotation.length)
+        if isinstance(annotation, SliceType):
+            return SliceType(self.normalize(annotation.element, seen))
         return annotation
 
     def trait_closure(self, bounds):
@@ -1429,7 +1441,7 @@ class Program:
         if isinstance(annotation, DynType):
             return trait in self.trait_closure({annotation.trait})
         if trait == "Sized":
-            return True
+            return not isinstance(annotation, SliceType)
         if isinstance(annotation, FunctionType):
             if annotation.closure:
                 captures = self.functions[annotation.closure].captures
@@ -1475,6 +1487,9 @@ class Program:
             if trait == "Default" and annotation.length.value == 0:
                 return True
             return self.implements(annotation.element, trait, assumed)
+        if isinstance(annotation, SliceType):
+            return trait in {"Debug", "PartialEq", "Eq", "PartialOrd", "Ord"} and self.implements(
+                annotation.element, trait, assumed)
         if annotation in PRIMITIVES:
             return trait != "Display" or annotation != "()"
         return trait in self.derives.get(annotation, {})
@@ -1596,6 +1611,8 @@ class Parser:
             return token.text
         if token.text == "[":
             element = self.type_name(static_string=static_string, signature=signature)
+            if self.accept("]"):
+                return SliceType(element)
             self.expect(";")
             length = self.const_expression(self.expression(), "usize")
             self.expect("]")
@@ -2194,9 +2211,16 @@ class Parser:
                 left = Expr("try", question, (left,))
                 continue
             if opening := self.accept("["):
-                index = self.expression()
+                index = None if self.current.text in {"..", "..="} else self.expression()
+                separator = self.accept("..") or self.accept("..=")
+                if separator:
+                    stop = None if self.current.text == "]" else self.expression()
+                    if separator.text == "..=" and stop is None:
+                        raise separator.error("inclusive range requires an end")
+                    left = Expr("range_index", opening, (left, index, stop, separator.text == "..="))
+                else:
+                    left = Expr("index", opening, (left, index))
                 self.expect("]")
-                left = Expr("index", opening, (left, index))
                 continue
             dot = self.expect(".")
             name = self.advance()
@@ -2327,7 +2351,7 @@ class Parser:
             if word != "return" and self.current.text.startswith("'"):
                 label = self.advance()
             value = None
-            if word != "continue" and self.current.text not in {";", "}", ")", ",", "=>", "else"}:
+            if word != "continue" and self.current.text not in {";", "}", ")", "]", ",", "=>", "else"}:
                 value = self.expression(allow_record=allow_record)
             return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
@@ -2807,14 +2831,14 @@ def ungroup(expr):
 
 def place_root(expr):
     root = ungroup(expr)
-    while root.kind in {"field", "index"}:
+    while root.kind in {"field", "index", "range_index"}:
         root = ungroup(root.args[0])
     return root
 
 
 def reference_source(expr):
     expr = ungroup(expr)
-    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference"} or (
+    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference", "slice_reference"} or (
         expr.kind == "block" and not expr.label
     )
 
@@ -2843,6 +2867,26 @@ class Address:
         if self.fields:
             value = self.binding.value.replace(self.fields, value)
         self.binding.value = value
+
+
+@dataclass(frozen=True)
+class SliceAddress:
+    address: Address
+    start: int
+    stop: int
+
+    @property
+    def length(self):
+        return self.stop - self.start
+
+    def child(self, token):
+        index = int(token.text)
+        if not 0 <= index < self.length:
+            raise RustPanic(f"index out of bounds: the len is {self.length} but the index is {index}")
+        return self.address.child(replace(token, text=str(self.start + index)))
+
+    def read(self):
+        return ArrayValue(self.address.read().items[self.start:self.stop])
 
 
 @dataclass(frozen=True)
@@ -2884,7 +2928,7 @@ class ArrayValue:
     def index(self, token):
         index = int(token.text)
         if not 0 <= index < len(self.items):
-            raise token.error(f"array index {index} out of bounds for length {len(self.items)}")
+            raise RustPanic(f"index out of bounds: the len is {len(self.items)} but the index is {index}")
         return index
 
     def at(self, token):
@@ -2907,6 +2951,24 @@ class IntegerRange:
 
 
 @dataclass(frozen=True)
+class SlicePattern:
+    annotation: SliceType
+    prefix: int
+    suffix: int | None
+
+    @property
+    def fields(self):
+        return tuple((str(index), self.annotation.element) for index in range(self.prefix + (self.suffix or 0)))
+
+    def positions(self, length):
+        if self.suffix is None:
+            return tuple(range(length)) if length == self.prefix else None
+        if length < self.prefix + self.suffix:
+            return None
+        return (*range(self.prefix), *range(length - self.suffix, length))
+
+
+@dataclass(frozen=True)
 class Pattern:
     tag: object = None
     children: tuple = ()
@@ -2925,6 +2987,10 @@ class Pattern:
                 yield from self.field_bindings(tuple(value.items[int(name)] for name, _ in self.tag.fields))
             elif isinstance(value, Value) and value.constructor.path == self.tag.path:
                 yield from self.field_bindings(value.fields)
+        elif isinstance(self.tag, SlicePattern):
+            positions = self.tag.positions(len(value.items))
+            if positions is not None:
+                yield from self.field_bindings(tuple(value.items[index] for index in positions))
         elif isinstance(self.tag, IntegerRange):
             if self.tag.contains(value):
                 yield {}
@@ -2968,6 +3034,8 @@ def uncovered(matrix, types, program):
                 explicit.append((option, tuple(tail)))
     if annotation == "i32" and explicit:
         return uncovered_integer(explicit, default, remaining_types, program)
+    if isinstance(annotation, SliceType) and explicit:
+        return uncovered_slice(explicit, default, annotation, remaining_types, program)
     if isinstance(annotation, ArrayType) and explicit:
         # Only positions mentioned by a pattern can distinguish its arms.
         positions = sorted({int(name) for first, _ in explicit for name, _ in first.tag.fields})
@@ -2994,6 +3062,34 @@ def specialized_pattern(pattern, signature):
         selected = dict(zip((name for name, _ in pattern.tag.fields), pattern.children))
         return tuple(selected.get(name, Pattern()) for name, _ in signature.fields)
     return pattern.children
+
+
+def uncovered_slice(explicit, default, annotation, types, program):
+    exact = [first.tag.prefix for first, _ in explicit if first.tag.suffix is None]
+    open_ended = [first.tag for first, _ in explicit if first.tag.suffix is not None]
+    # Beyond the final exact length, the longest prefix and suffix determine
+    # when the ends stop overlapping. All larger lengths have the same tests.
+    limit = max(max(exact, default=-1) + 1,
+                max((shape.prefix for shape in open_ended), default=0)
+                + max((shape.suffix for shape in open_ended), default=0))
+    inhabited = uncovered([], (annotation.element,), program) is not None
+    for length in range(limit + 1 if inhabited else 1):
+        concrete = ArrayType(annotation.element, ConstValue(length, "usize"))
+        rows = [(Pattern(), *tail) for tail in default]
+        for pattern, tail in explicit:
+            positions = pattern.tag.positions(length)
+            if positions is None:
+                continue
+            fields = tuple((str(index), annotation.element) for index in positions)
+            ctor = Constructor("[]", concrete, "array", fields)
+            rows.append((replace(pattern, tag=ctor), *tail))
+        missing = uncovered(rows, (concrete, *types), program)
+        if missing is not None:
+            if missing[0] is None:
+                fields = tuple((str(index), annotation.element) for index in range(length))
+                return ((Constructor("[]", concrete, "array", fields), (None,) * length), *missing[1:])
+            return missing
+    return None
 
 
 def uncovered_integer(explicit, default, types, program):
@@ -3302,6 +3398,8 @@ class Checker:
             return TupleType(tuple(map(self.resolve, annotation.elements)))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.resolve(annotation.element), self.resolve(annotation.length))
+        if isinstance(annotation, SliceType):
+            return SliceType(self.resolve(annotation.element))
         if isinstance(annotation, ConstExpression):
             return fold_const(replace(annotation, operands=tuple(map(self.resolve, annotation.operands))))
         if isinstance(annotation, DynType):
@@ -3324,6 +3422,8 @@ class Checker:
             return any(self.occurs(variable, kind) for kind in annotation.elements)
         if isinstance(annotation, ArrayType):
             return self.occurs(variable, annotation.element) or self.occurs(variable, annotation.length)
+        if isinstance(annotation, SliceType):
+            return self.occurs(variable, annotation.element)
         if isinstance(annotation, ConstExpression):
             return any(self.occurs(variable, value) for value in annotation.operands)
         if isinstance(annotation, AssociatedType):
@@ -3367,6 +3467,9 @@ class Checker:
         if isinstance(actual, ArrayType) and isinstance(expected, ArrayType):
             self.require(actual.element, expected.element, token)
             self.require(actual.length, expected.length, token)
+            return
+        if isinstance(actual, SliceType) and isinstance(expected, SliceType):
+            self.require(actual.element, expected.element, token)
             return
         if isinstance(actual, AssociatedType) and isinstance(expected, AssociatedType):
             if (actual.item, actual.trait, actual.owner, len(actual.arguments)) == (
@@ -3440,6 +3543,8 @@ class Checker:
             return replace(annotation, inner=self.fill_holes(annotation.inner, token))
         if isinstance(annotation, TupleType):
             return TupleType(tuple(self.fill_holes(kind, token) for kind in annotation.elements))
+        if isinstance(annotation, SliceType):
+            return SliceType(self.fill_holes(annotation.element, token))
         if isinstance(annotation, AppliedType):
             parameters = self.program.type_parameters.get(annotation.name, ())
             arguments = []
@@ -3528,6 +3633,8 @@ class Checker:
         if isinstance(tag, Constructor):
             tag = replace(tag, annotation=self.resolve(tag.annotation),
                           fields=tuple((name, self.resolve(kind)) for name, kind in tag.fields))
+        elif isinstance(tag, SlicePattern):
+            tag = replace(tag, annotation=self.resolve(tag.annotation))
         return replace(pattern, tag=tag, children=tuple(map(self.resolve_pattern, pattern.children)),
                        alternatives=tuple(map(self.resolve_pattern, pattern.alternatives)))
 
@@ -3603,11 +3710,18 @@ class Checker:
                 raise token.error("nested reference types are unsupported")
             if isinstance(annotation.inner, DynType):
                 self.check_dyn(annotation.inner, token)
+            elif isinstance(annotation.inner, SliceType):
+                element = annotation.inner.element
+                if isinstance(element, ReferenceType):
+                    raise token.error("reference elements in slices are unsupported")
+                self.check_type(element, token)
             else:
                 self.check_type(annotation.inner, token)
             return
         if isinstance(annotation, DynType):
             raise token.error("trait objects require a reference")
+        if isinstance(annotation, SliceType):
+            raise token.error("slice type requires a reference")
         if isinstance(annotation, AppliedType):
             parameters = self.program.type_parameters.get(annotation.name)
             if not parameters or len(parameters) != len(annotation.arguments):
@@ -3662,7 +3776,7 @@ class Checker:
             return True
         if isinstance(kind, ReferenceType):
             return Checker.mentions_self(kind.inner, self_type)
-        if isinstance(kind, ArrayType):
+        if isinstance(kind, (ArrayType, SliceType)):
             return Checker.mentions_self(kind.element, self_type)
         if isinstance(kind, TupleType):
             return any(Checker.mentions_self(element, self_type) for element in kind.elements)
@@ -3805,6 +3919,8 @@ class Checker:
         if kind == "bind":
             ctor = self.program.constructors.get(token.text)
             if not ctor or ctor.style != "unit":
+                if isinstance(self.resolve(annotation), SliceType):
+                    raise token.error("cannot bind an unsized slice value")
                 return Pattern(binding=token.key), {token.key: (annotation, args[0])}
             if args[0]:
                 raise token.error(f"cannot shadow unit struct {token.text!r}")
@@ -3813,17 +3929,26 @@ class Checker:
         style = kind.removeprefix("pattern_")
         if style == "array":
             annotation = self.resolve(annotation)
-            if not isinstance(annotation, ArrayType):
+            if isinstance(annotation, SliceType):
+                rest = [index for index, child in enumerate(args) if child.kind == "rest"]
+                if len(rest) > 1:
+                    raise args[rest[1]].token.error("a slice pattern can contain only one '..'")
+                prefix = rest[0] if rest else len(args)
+                suffix = len(args) - prefix - 1 if rest else None
+                ctor = SlicePattern(annotation, prefix, suffix)
+                assignments = enumerate(child for child in args if child.kind != "rest")
+            elif not isinstance(annotation, ArrayType):
                 raise token.error(f"expected an array pattern target, found {annotation}")
-            if not isinstance(annotation.length, ConstValue):
-                raise token.error("array pattern requires a fixed length")
-            pairs = self.positional_patterns(args, annotation.length.value, token, "array pattern")
-            pairs = tuple((index, child) for index, child in pairs if child.kind != "wild")
-            if not pairs:
-                return Pattern(), {}
-            fields = tuple((str(index), annotation.element) for index, _ in pairs)
-            ctor = Constructor("[]", annotation, "array", fields)
-            assignments = enumerate(child for _, child in pairs)
+            else:
+                if not isinstance(annotation.length, ConstValue):
+                    raise token.error("array pattern requires a fixed length")
+                pairs = self.positional_patterns(args, annotation.length.value, token, "array pattern")
+                pairs = tuple((index, child) for index, child in pairs if child.kind != "wild")
+                if not pairs:
+                    return Pattern(), {}
+                fields = tuple((str(index), annotation.element) for index, _ in pairs)
+                ctor = Constructor("[]", annotation, "array", fields)
+                assignments = enumerate(child for _, child in pairs)
         elif style == "anonymous_tuple":
             annotation = self.resolve(annotation)
             if annotation == "()" and len(args) == 1 and args[0].kind == "rest":
@@ -3846,15 +3971,19 @@ class Checker:
                 assignments = zip(indices, (value for _, value in fields))
             else:
                 assignments = self.positional_patterns(args, len(ctor.fields), token, ctor.path)
-        children = [Pattern()] * len(ctor.fields)
+        fields = ctor.fields
+        children = [Pattern()] * len(fields)
         bindings = {}
         for index, child in assignments:
-            child_pattern, added = self.prepare_pattern(child, ctor.fields[index][1])
+            child_pattern, added = self.prepare_pattern(child, fields[index][1])
             duplicate = bindings.keys() & added.keys()
             if duplicate:
                 raise child.token.error(f"duplicate pattern binding {sorted(duplicate, key=str)[0]!r}")
             bindings.update(added)
             children[index] = child_pattern
+        if isinstance(ctor, SlicePattern):
+            for annotation, _ in bindings.values():
+                self.obligation(annotation, "Copy", token)
         return Pattern(tag=ctor, children=tuple(children)), bindings
 
     def match_type(self, expr, scope, expected=None):
@@ -3931,7 +4060,7 @@ class Checker:
         return "()"
 
     def type_of(self, expr, scope, expected=None):
-        if id(expr) in self.program.call_functions or expr.kind == "length":
+        if id(expr) in self.program.call_functions or expr.kind in {"length", "is_empty"}:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
         elif expr.kind == "block" and expr.label:
@@ -3945,33 +4074,40 @@ class Checker:
         else:
             result = self.check_expr(expr, scope, expected)
         result = self.resolve(result)
-        result = self.coerce_dyn(expr, result, self.resolve(expected))
+        result = self.coerce_reference(expr, result, self.resolve(expected))
         if isinstance(result, ReferenceType) and not reference_source(expr):
             raise expr.token.error(f"reference result from {expr.kind} is unsupported")
         self.program.expr_types[id(expr)] = result
         return result
 
-    def coerce_dyn(self, expr, actual, expected):
-        if (not isinstance(expected, ReferenceType) or not isinstance(expected.inner, DynType)
-                or not isinstance(actual, ReferenceType) or actual.inner == expected.inner
+    def coerce_reference(self, expr, actual, expected):
+        if (not isinstance(expected, ReferenceType) or not isinstance(actual, ReferenceType)
+                or actual.inner == expected.inner
                 or (expected.mutable and not actual.mutable)):
             return actual
         target = expected.inner
-        self.check_dyn(target, expr.token)
-        self.obligation(actual.inner, target.trait, expr.token)
-        traits = self.program.trait_closure({target.trait})
-        for name, kind in target.bindings:
-            owners = [trait for trait in traits if trait in self.program.traits
-                      and name in self.program.traits[trait].associated]
-            if len(owners) != 1:
-                raise expr.token.error(f"ambiguous associated type {name!r}")
-            self.require(AssociatedType(actual.inner, name, owners[0]), kind, expr.token)
+        if isinstance(target, SliceType) and isinstance(actual.inner, ArrayType):
+            self.require(actual.inner.element, target.element, expr.token)
+            conversion = "slice_reference"
+        elif isinstance(target, DynType):
+            self.check_dyn(target, expr.token)
+            self.obligation(actual.inner, target.trait, expr.token)
+            traits = self.program.trait_closure({target.trait})
+            for name, kind in target.bindings:
+                owners = [trait for trait in traits if trait in self.program.traits
+                          and name in self.program.traits[trait].associated]
+                if len(owners) != 1:
+                    raise expr.token.error(f"ambiguous associated type {name!r}")
+                self.require(AssociatedType(actual.inner, name, owners[0]), kind, expr.token)
+            conversion = "dyn_reference"
+        else:
+            return actual
         original = replace(expr)
         for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
             if id(expr) in table:
                 table[id(original)] = table.pop(id(expr))
         self.program.expr_types[id(original)] = actual
-        expr.kind = "dyn_reference"
+        expr.kind = conversion
         expr.args = (original, actual.inner)
         return expected
 
@@ -4030,7 +4166,7 @@ class Checker:
             self.require_argument(result, target, token)
             expr.kind, expr.args = "group", (value,)
             return result
-        if kind == "dyn_reference":
+        if kind in {"dyn_reference", "slice_reference"}:
             return self.program.expr_types[id(expr)]
         if kind == "literal":
             annotation, value = args
@@ -4058,18 +4194,24 @@ class Checker:
             if hint is not None:
                 self.require(result, hint, token)
             return self.resolve(result)
-        if kind == "index":
-            base, index = args
+        if kind in {"index", "range_index"}:
+            base, *bounds = args
             annotation = self.type_of(base, scope)
             if isinstance(annotation, ReferenceType):
                 base = Expr("deref", base.token, (base, False))
-                expr.args = (base, index)
+                expr.args = (base, *bounds)
                 annotation = self.type_of(base, scope)
-            if not isinstance(annotation, ArrayType):
+            if annotation != NEVER and not isinstance(annotation, (ArrayType, SliceType)):
                 raise token.error(f"cannot index {annotation}")
-            actual = self.type_of(index, scope, "usize")
-            self.require(actual, "usize", index.token)
-            return NEVER if actual == NEVER else annotation.element
+            diverges = annotation == NEVER
+            for index in (bounds if kind == "index" else bounds[:2]):
+                if index is not None:
+                    actual = self.type_of(index, scope, "usize")
+                    self.require(actual, "usize", index.token)
+                    diverges |= actual == NEVER
+            if diverges:
+                return NEVER
+            return annotation.element if kind == "index" else SliceType(annotation.element)
         if kind == "default":
             return self.program.expr_types[id(expr)]
         if kind == "method":
@@ -4240,6 +4382,8 @@ class Checker:
             CaptureContext.mark_mutable(scope, left)
             if isinstance(annotation, ReferenceType):
                 raise token.error("reassigning reference bindings is unsupported")
+            if isinstance(annotation, SliceType):
+                raise token.error("cannot assign an unsized slice value")
             hint = annotation if token.text == "=" or right.unsuffixed else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
@@ -4281,6 +4425,8 @@ class Checker:
                     actual = next(positional)
                 if isinstance(actual, ReferenceType):
                     actual = actual.inner
+                elif isinstance(actual, SliceType):
+                    raise token.error("formatting an unsized slice requires a reference")
                 if mode == "display" and actual == "()":
                     raise token.error("() requires debug formatting")
                 self.obligation(actual, "Debug" if mode == "debug" else "Display", token)
@@ -4290,7 +4436,7 @@ class Checker:
     def array_type(self, expr, scope, expected):
         kind, token, args = expr.kind, expr.token, expr.args
         expected = self.resolve(expected)
-        element = expected.element if isinstance(expected, ArrayType) else None
+        element = expected.element if isinstance(expected, (ArrayType, SliceType)) else None
         if args and args[0].unsuffixed and (element is None or isinstance(element, TypeVariable)):
             literal = TypeVariable("integer literal", token, integer_literal=True)
             self.variables.append(literal)
@@ -4321,7 +4467,7 @@ class Checker:
             return NEVER
         result = ArrayType(element, length)
         self.check_type(result, token)
-        if expected is not None:
+        if expected is not None and not isinstance(expected, SliceType):
             self.require(result, expected, token)
         return self.resolve(result)
 
@@ -4492,12 +4638,12 @@ class Checker:
             result = self.prelude_method(expr, scope, original, actual, base, rest)
             if result is not None:
                 return result
-        if isinstance(base, ArrayType) and name == "len" and not rest:
+        if isinstance(base, (ArrayType, SliceType)) and name in {"len", "is_empty"} and not rest:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", expr.token, (original, False))
                 self.type_of(original, scope)
-            expr.kind, expr.args = "length", (original,)
-            return "usize"
+            expr.kind, expr.args = ("length" if name == "len" else name), (original,)
+            return "usize" if name == "len" else "bool"
         # There can be multiple inherent impl blocks on one target.
         for impl in self.program.impls:
             if impl.trait or name not in impl.methods:
@@ -4993,11 +5139,14 @@ class Ownership:
             cursor, place = self.lower_address(base, scope, cursor)
             if place is not None:
                 return cursor, place.child(name.text)
-        if expr.kind == "index":
-            base, index = expr.args
+        if expr.kind in {"index", "range_index"}:
+            base, *bounds = expr.args
             cursor, place = self.lower_address(base, scope, cursor)
             if place is not None:
-                return self.lower(index, scope, cursor), replace(place, indexed=True)
+                for index in (bounds if expr.kind == "index" else bounds[:2]):
+                    if index is not None:
+                        cursor = self.lower(index, scope, cursor)
+                return cursor, replace(place, indexed=True)
         if expr.kind == "deref":
             value = ungroup(expr.args[0])
             if value.kind == "name":
@@ -5040,7 +5189,7 @@ class Ownership:
         annotation = self.annotation(expr)
         if annotation == NEVER:
             return self.lower(expr, scope, cursor), None
-        if expr.kind == "dyn_reference":
+        if expr.kind in {"dyn_reference", "slice_reference"}:
             return self.lower_reference(expr.args[0], scope, cursor, reborrow=reborrow,
                                         two_phase=two_phase, extend_to=extend_to)
         if expr.kind in {"call", "indirect_call"}:
@@ -5098,6 +5247,9 @@ class Ownership:
             return all(self.promotable(value) for value in values)
         if expr.kind in {"unary", "binary", "tuple"}:
             return all(self.promotable(operand) for operand in expr.args)
+        if expr.kind in {"array", "array_repeat"}:
+            elements = expr.args[:1] if expr.kind == "array_repeat" else expr.args
+            return all(self.promotable(value) for value in elements)
         if expr.kind == "block":
             statements, tail = expr.args
             return not statements and (tail is None or self.promotable(tail))
@@ -5253,7 +5405,7 @@ class Ownership:
         if kind == "macro_definition":
             scope.remember(token)
             return cursor
-        if kind == "dyn_reference":
+        if kind in {"dyn_reference", "slice_reference"}:
             return self.lower(args[0], scope, cursor, consume=consume)
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
@@ -5267,8 +5419,13 @@ class Ownership:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind == "length":
+        if kind in {"length", "is_empty"}:
             return self.lower(args[0], scope, cursor, consume=False)
+        if kind == "range_index":
+            for item in args[:3]:
+                if item is not None:
+                    cursor = self.lower(item, scope, cursor)
+            return cursor
         if kind in {"array", "tuple", "index", "array_repeat"}:
             for item in (args[:1] if kind == "array_repeat" else args):
                 cursor = self.lower(item, scope, cursor)
@@ -5552,6 +5709,11 @@ class Ownership:
             for child, (field, kind) in zip(pattern.children, ctor.fields):
                 projected = place if opaque or variant else place.child(field)
                 self.collect_pattern(child, projected, reads, moves, tests, kind, opaque=opaque or variant)
+        elif isinstance(pattern.tag, SlicePattern):
+            projected = replace(place, indexed=True)
+            tests[projected] = None
+            for child in pattern.children:
+                self.collect_pattern(child, projected, reads, moves, tests, annotation.element, opaque=True)
         elif pattern.tag is not None:
             tests[place] = None
 
@@ -5597,7 +5759,7 @@ def binary(word, left, right, token, integer="i32"):
 
 
 def display(value, debug):
-    if isinstance(value, (Address, DynAddress)):
+    if isinstance(value, (Address, DynAddress, SliceAddress)):
         return display(value.read(), debug)
     if isinstance(value, ArrayValue):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
@@ -5697,7 +5859,7 @@ class Interpreter:
         return Value(ctor, tuple(self.default_value(kind) for _, kind in ctor.fields))
 
     def compare(self, left, right):
-        if isinstance(left, Address):
+        if isinstance(left, (Address, SliceAddress)):
             return self.compare(left.read(), right.read())
         if isinstance(left, ArrayValue):
             for a, b in zip(left.items, right.items):
@@ -5744,6 +5906,17 @@ class Interpreter:
             root = self.address(base, scope)
             offset = self.eval(index, scope)
             return root.child(replace(expr.token, text=str(offset)))
+        if expr.kind == "range_index":
+            base, first, last, inclusive = expr.args
+            root = self.address(base, scope)
+            length = root.length if isinstance(root, SliceAddress) else len(root.read().items)
+            start = self.eval(first, scope) if first else 0
+            stop = self.eval(last, scope) + int(inclusive) if last else length
+            if not 0 <= start <= stop <= length:
+                raise RustPanic(f"slice range {start}..{stop} is out of bounds for length {length}")
+            if isinstance(root, SliceAddress):
+                return SliceAddress(root.address, root.start + start, root.start + stop)
+            return SliceAddress(root, start, stop)
         return Address(Binding(self.eval(expr, scope), True))
 
     def eval(self, expr, scope):
@@ -5794,6 +5967,8 @@ class Interpreter:
                 return value
             concrete = self.program.normalize(substitute(args[1], self.type_arguments))
             return DynAddress(value, concrete)
+        if kind == "slice_reference":
+            return self.eval(args[0], scope)
         if kind == "literal":
             return args[1]
         if kind == "const_value":
@@ -5811,13 +5986,12 @@ class Interpreter:
             if count > 1_000_000:
                 raise token.error("array exceeds interpreter allocation limit")
             return ArrayValue((item,) * count)
-        if kind == "index":
-            base, index = args
-            value = self.eval(base, scope)
-            offset = self.eval(index, scope)
-            return value.at(replace(token, text=str(offset)))
-        if kind == "length":
-            return len(self.eval(args[0], scope).items)
+        if kind in {"index", "range_index"}:
+            return self.address(expr, scope).read()
+        if kind in {"length", "is_empty"}:
+            root = self.address(args[0], scope)
+            length = root.length if isinstance(root, SliceAddress) else len(root.read().items)
+            return length if kind == "length" else length == 0
         if kind == "default":
             annotation = self.program.expr_types[id(expr)]
             return self.default_value(self.program.normalize(substitute(annotation, self.type_arguments)))

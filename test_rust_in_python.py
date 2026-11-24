@@ -1138,6 +1138,65 @@ VALID = [
             println!("{first:?} {last:?}");
         }
     """, "Item(1) Item(2)\n"),
+    ("arrays coerce to shared, mutable, and static slices", """
+        fn view<const N: usize>(data: &[i32; N]) -> &[i32] { data }
+        fn replace<T: Copy>(values: &mut [T], item: T) -> T {
+            let old = values[0];
+            values[0] = item;
+            old
+        }
+        fn second(values: &[i32]) -> i32 { values[1] }
+        fn permanent() -> &'static [i32] { &[3, 4] }
+        fn main() {
+            let mut values = [3, 5, 6];
+            println!("{} {}", replace(&mut values, 7), second(&values));
+            let borrowed = view(&values);
+            println!("{borrowed:?} {}", borrowed.len());
+            println!("{:?}", permanent());
+            println!("{values:?}");
+        }
+    """, "3 5\n[7, 5, 6] 3\n[3, 4]\n[7, 5, 6]\n"),
+    ("subslice ranges share storage and keep their own bounds", """
+        fn inside(input: &mut [i32], start: usize, stop: usize) -> &mut [i32] {
+            &mut input[start..stop]
+        }
+        fn main() {
+            let mut a = [3, 4, 5, 6, 7];
+            let view = inside(&mut a, 1, 4);
+            let middle = &mut view[1..=2];
+            middle[0] += 10;
+            middle[1] += 20;
+            println!("{middle:?} {}", middle.len());
+            let tail = &view[2..];
+            println!("{tail:?} {}", tail.is_empty());
+            println!("{a:?} {:?}", &a[..=1]);
+            let empty: &[bool] = &[];
+            println!("{}", empty.is_empty());
+        }
+    """, "[15, 26] 2\n[26] false\n[3, 4, 15, 26, 7] [3, 4]\ntrue\n"),
+    ("slice exhaustiveness accounts for length and overlapping ends", """
+        fn ends(s: &[bool]) -> i32 {
+            match *s {
+                [] => 0,
+                [true] => 1,
+                [false] => 2,
+                [true, .., true] => 3,
+                [false, ..] => 4,
+                [.., false] => 5,
+            }
+        }
+        fn outer(s: &[i32]) -> i32 {
+            let [first, .., last] = *s else { return 0; };
+            first + last
+        }
+        fn main() {
+            println!("{} {} {} {}", ends(&[]), ends(&[false]),
+                     ends(&[true, false]), ends(&[true, false, true]));
+            let a = [1, 2, 3, 4];
+            if let [start, ..] = a[1..] { println!("{start} {}", outer(&a)); }
+            assert!(matches!(a[..], [1, ..]));
+        }
+    """, "0 2 5 3\n2 5\n"),
 ]
 
 INVALID = [
@@ -1658,6 +1717,43 @@ INVALID = [
             let [other, ..] = items;
         }
     """, "use of moved value 'items.0'"),
+    ("borrowed slices preserve the array's lifetime", """
+        fn view(values: &[i32; 2]) -> &[i32] { values }
+        fn main() {
+            let mut a = [1, 2];
+            let slice = view(&a);
+            a[0] = 3;
+            println!("{slice:?}");
+        }
+    """, "immutably borrowed"),
+    ("subslice of a local cannot escape", """
+        fn invalid() -> &'static [i32] {
+            let a = [1, 2];
+            &a[..]
+        }
+        fn main() {}
+    """, "outlives its block"),
+    ("slice values cannot be bound without indirection", """
+        fn main() {
+            let a = [1, 2];
+            let unsized_value = a[..];
+        }
+    """, "cannot bind an unsized slice value"),
+    ("formatting a slice requires a reference", """
+        fn main() { let a = [1, 2]; println!("{:?}", a[..]); }
+    """, "formatting an unsized slice requires a reference"),
+    ("empty slice missing from an otherwise exhaustive match", """
+        fn incomplete(s: &[bool]) -> bool { match *s { [first, ..] => first } }
+        fn main() {}
+    """, r"non-exhaustive match, missing \[\]"),
+    ("matching a borrowed slice cannot move non-Copy elements", """
+        struct Item(i32);
+        fn first(s: &[Item]) -> i32 {
+            let [item, ..] = *s else { return 0; };
+            item.0
+        }
+        fn main() {}
+    """, "Item does not implement Copy"),
 ]
 
 
@@ -1683,19 +1779,38 @@ class InterpreterTests(unittest.TestCase):
             capture = folder / "capture.rs"
             capture.write_text('fn main() { let x = 1; let r = &x; let f = || *r; println!("{}", f()); }',
                                encoding="utf-8")
-            unsupported = folder / "slice.rs"
-            unsupported.write_text('fn main() { let numbers: &[i32] = &[1, 2]; println!("{}", numbers[0]); }',
-                                   encoding="utf-8")
+            slices = folder / "slice.rs"
+            slices.write_text('fn main() { let numbers: &[i32] = &[1, 2]; println!("{}", numbers[0]); }',
+                              encoding="utf-8")
+            slice_pattern = folder / "slice_pattern.rs"
+            slice_pattern.write_text('fn main() { let a = [1, 2]; assert!(matches!(a[..], [1, ..])); }',
+                                     encoding="utf-8")
+            unsupported = folder / "pattern_ergonomics.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let a: &[i32] = &[1, 2];
+                    let first = match a { [n, ..] => *n, _ => 0 };
+                    println!("{first}");
+                }
+            ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
+            bounds = folder / "bounds.rs"
+            bounds.write_text('''
+                fn read(data: &[i32], at: usize) -> i32 { data[at] }
+                fn main() { let a = [1, 2, 3]; println!("{}", read(&a[..1], 2)); }
+            ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
-            report = subprocess.run([sys.executable, runner, "--json", root, bad, capture, unsupported, panics],
+            report = subprocess.run([sys.executable, runner, "--json", root, bad,
+                                     capture, slices, slice_pattern, unsupported, panics, bounds],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
-                             ["runtime_match", "both_rejected", "runtime_match", "acceptance_mismatch", "runtime_match"])
+                             ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match",
+                              "acceptance_mismatch", "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
+            self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
 
     def test_valid_programs(self):
         for name, source, expected in VALID:
