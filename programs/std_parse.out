@@ -1,0 +1,41 @@
+0
+Ok(42)
+Ok(-17)
+Ok(8)
+Err(ParseIntError { kind: PosOverflow })
+Err(ParseIntError { kind: InvalidDigit })
+Err(ParseIntError { kind: Empty })
+Err(ParseIntError { kind: InvalidDigit })
+Err(ParseIntError { kind: NegOverflow })
+Ok(18446744073709551615)
+Ok(340282366920938463463374607431768211455)
+Ok(3.25)
+Ok(1000.0)
+Ok(-0.5)
+Ok(inf)
+Err(ParseFloatError { kind: Invalid })
+Ok('x')
+Err(ParseCharError { kind: TooManyChars })
+Ok(true)
+Err(ParseBoolError)
+Ok(99)
+error: number too large to fit in target type
+error: cannot parse integer from empty string
+error: invalid digit found in string
+error: invalid float literal
+error: provided string was not `true` or `false`
+error: too many characters in string
+Ok(46)
+Err(ParseIntError { kind: InvalidDigit })
+Ok(-255)
+Ok(5)
+Ok(1295)
+Ok(5)
+Err(ParseIntError { kind: InvalidDigit })
+Ok([1, 2, 3])
+Err(ParseIntError { kind: InvalidDigit })
+[5, 12, 9]
+77 -1
+5
+kind: InvalidDigit
+kind: PosOverflow / number too large to fit in target type

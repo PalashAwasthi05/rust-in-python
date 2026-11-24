@@ -1,0 +1,31 @@
+0
+Stats {
+    lines: 4,
+    words: 48,
+    letters: 174,
+    punctuation: 8,
+    longest_word: "foolishness",
+}
+ 1. it         8 ########
+ 2. of         8 ########
+ 3. the        8 ########
+ 4. was        8 ########
+ 5. age        2 ##
+ 6. epoch      2 ##
+len 11: foolishness, incredulity
+len 8: darkness
+len 6: belief, season, wisdom
+line lengths [52, 56, 60, 58], longest line index Some(2)
+average line length 56.50
+first words ["It", "it"]
+capitals "ILD"
+vowels 68 ratio 0.391
+acronym IWTBOTIWTWOT
+dlrow wen evarb olleh
+[     a tale of two cities     ]
+|It was the best of times, it was the    |
+|worst of times, it was the age of       |
+|wisdom, it was the age of foolishness,  |
+|it was the epoch of belief, it was the  |
+|epoch of incredulity, it was the season |
+|of Light, it was the season of Darkness.|

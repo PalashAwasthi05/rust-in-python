@@ -1,0 +1,95 @@
+0
+Scene { name: "root \"main\"", origin: Point { x: 0, y: 0 }, shapes: [Circle { radius: 1.5 }, Rect(2, 3), Empty], tags: {"a": [], "b": [1, 2]}, parent: Some(Scene { name: "child", origin: Point { x: -1, y: 2 }, shapes: [], tags: {}, parent: None, marker: Unit }), marker: Unit }
+Scene {
+    name: "root \"main\"",
+    origin: Point {
+        x: 0,
+        y: 0,
+    },
+    shapes: [
+        Circle {
+            radius: 1.5,
+        },
+        Rect(
+            2,
+            3,
+        ),
+        Empty,
+    ],
+    tags: {
+        "a": [],
+        "b": [
+            1,
+            2,
+        ],
+    },
+    parent: Some(
+        Scene {
+            name: "child",
+            origin: Point {
+                x: -1,
+                y: 2,
+            },
+            shapes: [],
+            tags: {},
+            parent: None,
+            marker: Unit,
+        },
+    ),
+    marker: Unit,
+}
+Wrapper(
+    [
+        7,
+        8,
+    ],
+)
+Wrapper(
+    [],
+)
+(
+    Unit,
+    Some(
+        Point {
+            x: 1,
+            y: 1,
+        },
+    ),
+    Ok(
+        3,
+    ),
+)
+[
+    Rect(
+        1,
+        1,
+    ),
+    Empty,
+]
+{'e', 'h', 'l', 'o'}
+{
+    'e',
+    'h',
+    'l',
+    'o',
+}
+{1: "one"}
+{
+    1: "one",
+}
+[[Some((1, 'a')), None], []]
+[
+    [
+        Some(
+            (
+                1,
+                'a',
+            ),
+        ),
+        None,
+    ],
+    [],
+]
+[[0, 0], [0, 0]] ()
+[] "x"
+Empty|1       |

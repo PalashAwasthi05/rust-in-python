@@ -1,0 +1,50 @@
+0
+zip Some((4, 'x')) None
+xor Some(4) None None
+or Some(9) or_else Some(10) and Some("y")
+and_then Some(8) None
+map_or 5 0 map_or_else -1
+filter Some(4) None
+ok_or Ok(4) Err("missing")
+ok_or_else Err("err 42")
+unwrap_or_default 0 Config { name: "", retries: 0 }
+unwrap_or_else 42
+is_some_and true is_none true
+flatten Some(3) None
+transpose Ok(Some(5))
+transpose back None
+iter over option [4]
+for over option 4
+flatten options [1, 3]
+collect options None
+sum options Some(3)
+take Some(3) None
+replace None Some(8)
+get_or_insert 8
+get_or_insert_with Some([5])
+as_mut Some(9) as_ref map Some(18)
+as_deref Some("ferris") len Some(6)
+copied Some(1) cloned Some("ferris")
+first_even_square Some(36) None
+lookup_chain Some(5) None
+pair 3 4
+error: no comma in "3 4"
+error: bad left: invalid digit found in string
+error: bad right: invalid digit found in string
+map Ok(5) map_err Err(4)
+and_then Ok(10)
+or_else Ok(0)
+ok Some(10) err Some("boom")
+unwrap_or -1 unwrap_or_else 4
+unwrap_or_default 0
+map_or 30 is_ok_and true is_err_and false
+iter Some(10) None
+as_ref Err("BOOM")
+partitioned [1, 3] ["a", "b"]
+collect result Err("first")
+default Config { name: "x", retries: 0 } eq false
+copied err Err(())
+expect works
+contains-like true
+cmp true true
+then Some(1) None then_some Some('k')

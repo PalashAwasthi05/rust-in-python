@@ -1,0 +1,51 @@
+0
+window sums: [8, 6, 10, 15, 16, 17, 13, 14, 13]
+chunk [3, 1, 4, 1]
+chunk [5, 9, 2, 6]
+chunk [5, 3, 5]
+remainder: [3, 5]
+exact products: [12, 45, 60]
+rchunks: [[6, 5, 3, 5], [1, 5, 9, 2], [3, 1, 4]]
+split_at: [3, 1, 4, 1] | [5, 9, 2, 6, 5, 3, 5]
+first Some(3) last Some(5)
+split_first Some((3, [1, 4, 1, 5, 9, 2, 6, 5, 3, 5]))
+split_last Some((1, []))
+contains 9: true, starts_with [3,1]: true, ends_with [5]: true
+position of 5: Some(4), rposition: Some(10)
+max_by: Some(3)
+min_by_key: Some(4)
+sorted: [1, 1, 2, 3, 3, 4, 5, 5, 5, 6, 9]
+binary_search 5: true
+binary_search 7: Err(10)
+binary_search 0: Err(0)
+dedup: [1, 2, 3, 4, 5, 6, 9]
+partition_point: 3
+by priority desc: ["ship", "write", "test", "lint"]
+by priority then id desc: [4, 2, 1, 3]
+binary_search_by_key: Ok("ship")
+binary_search_by: Ok(2)
+dedup_by_key: ["lint", "write", "ship"]
+retain: [Task { id: 4, priority: 1, name: "lint" }, Task { id: 3, priority: 3, name: "ship" }]
+drained [3, 4, 5] left [1, 2, 6, 7, 8, 9, 10]
+splice removed [2, 6] now [1, 100, 200, 300, 7, 8, 9, 10]
+rotate_left: [200, 300, 7, 8, 9, 10, 1, 100]
+rotate_right: [10, 1, 100, 200, 300, 7, 8, 9]
+swap+reverse: [9, 8, 7, 300, 200, 100, 10, 1]
+first/last mut: [-9, 8, 7, 300, 200, 100, 10, 1001]
+fill: [-9, 8, 0, 0, 0, 100, 10, 1001]
+w [8, 2, -9] removed 1 swap_removed 42
+resize: [8, 7, 7, 7]
+split_off: [8, 7] [7, 7]
+concat: [1, 2, 3]
+join: a-b-c [1, 2, 0, 3, 4]
+to_vec: [4, 1]
+rev enumerate 0 5
+rev enumerate 1 3
+rev enumerate 2 5
+grid: [[1, 1, 1], [1, 1, 6]]
+arr: [1, 2, 3, 4, 5] len 5 false
+split_at_mut: [30, 2, 3, 4, 5]
+repeat: [1, 2, 1, 2, 1, 2]
+iter sum 44 min Some(2) max Some(30)
+cap ['x']
+contains str: true

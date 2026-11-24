@@ -1,0 +1,18 @@
+0
+skip: unknown dept "hr"
+skip: bad salary "abc"
+skip: number too large to fit in target type
+skip: expected 4 fields, got 3
+ann    Eng/120000.50 (7y)
+bob    Sales/ 65000.00
+cy     Eng/ 98000.00 (3y)
+dee    Ops/ 72000.25 (12y)
+ida    Eng/131000.00 (9y)
+Eng n=3 total= 349000.50 avg=116333.50 median=Some(120000.5) top=ida
+Sales n=1 total=  65000.00 avg= 65000.00 median=Some(65000.0) top=bob
+Ops n=1 total=  72000.25 avg= 72000.25 median=Some(72000.25) top=dee
+senior Some(3) junior Some(2)
+avg years 7.750
+[("ANN", 124200.52), ("BOB", 67275.0)]
+Err("unknown dept \"x\"")
+ann, bob, cy, dee, ida

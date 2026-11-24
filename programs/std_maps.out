@@ -1,0 +1,25 @@
+0
+{"and": 1, "cat": 1, "end": 2, "hat": 1, "the": 4}
+top: [("the", 4), ("end", 2)]
+stock: [("apple", 27), ("fig", 85), ("kiwi", 3), ("melon", 21), ("plum", 11)]
+get apple Some(27) missing None
+contains plum true len 5
+remove fig Some(0) again None
+insert returns None Some(1)
+keys ["apple", "kiwi", "melon", "new", "plum"]
+total 64
+first Some((60, "dee")) last Some((99, "eve"))
+range 70..90 [(75, "bob"), (82, "cy")]
+range 80.. ["cy", "ann", "eve"]
+range ..=82 [60, 75, 82]
+pop_first Some((60, "dee")) pop_last Some((99, "eve"))
+rev [90, 82, 75]
+into_values ["bob", "cy", "ann"]
+into_keys [75, 82, 90]
+index cy
+grouped {1: ["a", "d"], 2: ["bb", "cc"], 3: ["eee"]}
+inverted {"ann": 90, "bob": 75, "cy": 82}
+counts [('i', 4), ('s', 4), ('p', 2), ('m', 1)]
+into_values [1, 4, 9]
+bt {1: 'A', 2: 'b', 3: 'c'} empty false
+{"x": [1, 2]}
