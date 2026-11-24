@@ -1,0 +1,6 @@
+0
+bag has 2 kinds: [("fig", 1), ("pear", 5)]
+evens kept 5: [2, 4, 6, 8, 10] sum=30
+lengths: [1, 5, 5]
+scaled: ["1.5", "3.0", "4.5", "6.0"]
+single: -14.0

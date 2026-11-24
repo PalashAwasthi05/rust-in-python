@@ -1,0 +1,15 @@
+0
+consumed 3 names
+shared still usable: 10
+  closing config.toml
+  sorted [1, 2, 3]
+  shared copy 20
+call_twice: (6, 7)
+c2 third call: 205
+Hello, Ferris! / Yo, crab!
+once_only gave [1, 2, 3]
+log ["A", "B", "C"]
+borrowed sum 10 and data still [1, 2, 3, 4]
+moved sum of squares 30
+ran task: 42
+task left? false

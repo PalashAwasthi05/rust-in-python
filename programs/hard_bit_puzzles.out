@@ -1,0 +1,18 @@
+0
+powers of two < 70: [1, 2, 4, 8, 16, 32, 64]
+single number: 9
+reverse_bits(1) = 0b10000000000000000000000000000000
+reverse_bits(43261596) = 964176192
+popcount(0) = 0 (builtin 0)
+popcount(7) = 3 (builtin 3)
+popcount(255) = 8 (builtin 8)
+popcount(1099511627776) = 1 (builtin 1)
+popcount(18446744073709551615) = 64 (builtin 64)
+gray codes: 000 001 011 010 110 111 101 100
+subsets of [a,b,c]: [[], ['a'], ['b'], ['a', 'b'], ['c'], ['a', 'c'], ['b', 'c'], ['a', 'b', 'c']]
+after xor swap: a=99 b=12
+flags: rw- -> r-- -> -wx
+lowest set bit of 40: 8, highest: 5
+rotate_left(0x80000001, 4) = 0x18
+i8 -1 as u8 = 255, -128 >> 2 = -32, 0xF0u8 >> 4 = 15
+next power of two of 100: 128

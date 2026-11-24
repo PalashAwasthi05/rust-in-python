@@ -1,0 +1,10 @@
+0
+1 + 2 * 3                          = Ok(7.0)  [5 nodes]
+(1 + 2) * 3                        = Ok(9.0)  [5 nodes]
+10 - (4 - 1)                       = Ok(7.0)  [5 nodes]
+x ^ 2                              = Ok(9.0)  [3 nodes]
+-(x + 1)                           = Ok(-4.0)  [4 nodes]
+(let y = x * 2 in y / 4)           = Ok(1.5)  [7 nodes]
+1 / (x - 3)                        = Err("divide by zero")  [5 nodes]
+z + 1                              = Err("unbound z")  [3 nodes]
+env after: {"x": 3.0}

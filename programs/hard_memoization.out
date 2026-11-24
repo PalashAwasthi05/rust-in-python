@@ -1,0 +1,15 @@
+0
+fib(10) = 55
+fib(50) = 12586269025
+fib(100) = 354224848179261915075
+fib(150) = 9969216677189303386214405760200
+memo entries: 149
+grid paths 3x3: 20
+grid paths 16x16: 601080390
+grid paths 4x4 blocked (2,2): 34
+edit("kitten", "sitting") = 3
+edit("flaw", "lawn") = 2
+edit("rust", "rust") = 0
+edit("", "abc") = 3
+ways to make 100 from [1,5,10,25,50]: 292
+ways to make 7 from [2,4]: 0

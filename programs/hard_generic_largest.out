@@ -1,0 +1,15 @@
+0
+largest i32: 100
+largest f64: 9.75
+largest char: y
+largest tuple: (2, 'b')
+largest score: Score { points: 10, time: 5.5 }
+largest string: Some("zucchini")
+largest of empty: None
+min_max: Some((-3, 12))
+min_max f32: Some((2.5, 2.5))
+min_max empty: None
+top 3: [9, 9, 7]
+top 2 strs: ["d", "c"]
+clamped: [-5.0, 5.5, 35.0, 20.0, -3.0]
+clamped bytes: [10, 100, 99]

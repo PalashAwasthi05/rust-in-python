@@ -1,0 +1,13 @@
+0
+clamp   3 ->   3, -4 ->  -4
+double  3 ->   6, -4 ->  -8
+negate  3 ->  -3, -4 ->   4
+offset  3 ->   8, -4 ->   1
+square  3 ->   9, -4 ->  16
+double square          => 36
+offset negate clamp    => -8
+square square double   => 162
+double halve           => error: unknown op 'halve'
+stacked: [1, 2, 3]
+pipeline(0) = 123
+composed over 0..5: [-2, 1, 6, 13, 22]

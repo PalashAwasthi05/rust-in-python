@@ -1,0 +1,19 @@
+0
+sorted severities: [Low, Low, Medium, High, Critical]
+High > Medium: true, max: Some(Critical)
+  Low 30d typo
+  High  3d data loss
+  High  3d login fails
+  High 10d slow page
+  Critical  1d outage
+top ticket: outage
+heap order: [outage] [slow page] [login fails] [data loss] [typo]
+peek: Some("deploy")
+job order: ["deploy", "hotfix", "report", "backup", "cleanup"]
+3 smallest: [1, 2, 3]
+into_sorted_vec: [1, 3, 4, 7]
+Dot < Circle(0): true
+Circle(2) vs Circle(1): Some(Greater)
+Rect cmp: Some(Greater)
+NaN cmp: None
+tuple ord: Greater

@@ -1,0 +1,20 @@
+0
+[]: nothing
+[4]: just 4
+[1, 2]: 1 then 2
+[7, 3, 7]: 3 items bookended by 7
+[1, 2, 3, 4, 5]: 1..5 with middle sum 9
+recursive sum 18
+sorted? true false
+get name         -> GET name
+set name ferris  -> SET name=ferris
+del a b c        -> DEL a,b,c
+del              -> unknown "del" (0 args)
+ping             -> unknown "ping" (0 args)
+                 -> empty
+first two: x y
+head 10 tail [20, 30, 40]
+shadowed value: 166
+label big tier 83 config (32, "BIG")
+outer x 5 y 16
+total 30 s 5

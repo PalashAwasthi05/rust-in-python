@@ -1,0 +1,11 @@
+101
+checked small: Some(60)
+checked big: None
+wrapping big: 5
+checked bump 50: Some(250)
+checked bump 60: None
+bumping by 30
+gauge now reads 230
+bumping by 20
+gauge now reads 250
+bumping by 10

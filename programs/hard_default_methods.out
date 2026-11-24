@@ -1,0 +1,11 @@
+0
+Rex (quadruped, 4 legs) -> Rex says woof
+  Rex: woof-woof-woof
+Bird (biped, 2 legs) -> Bird sings tweet!
+  Bird: tweet-tweet-tweet
+Snake[140cm] (legless, 0 legs) -> Snake[140cm] says hiss
+  Snake[140cm]: hiss-hiss-hiss
+total legs: 6
+total=20 best=Some(9) avg=5.00
+total=0 best=None avg=0.00
+total=230 best=Some(100) avg=76.67

@@ -281,6 +281,16 @@ pub mod iter {
             }
             Some(best)
         }
+        fn rposition<P>(self, predicate: P) -> Option<usize> where Self: Sized, P: FnMut(Self::Item) -> bool {
+            let mut items = crate::intrinsics::iter_collect(self);
+            let mut predicate = predicate;
+            let mut index = items.len();
+            while let Some(item) = items.pop() {
+                index -= 1;
+                if predicate(item) { return Some(index); }
+            }
+            None
+        }
         fn rev(self) -> Rev<Self::Item> where Self: Sized {
             Rev { items: crate::intrinsics::iter_collect(self) }
         }
@@ -313,6 +323,7 @@ pub mod iter {
     }
 
     pub trait IntoIterator {
+        type Item;
         type IntoIter: Iterator;
         fn into_iter(self) -> Self::IntoIter;
     }
@@ -414,6 +425,21 @@ pub mod iter {
                 self.peeked = Some(self.iter.next());
             }
             match &self.peeked {
+                Some(Some(item)) => Some(item),
+                _ => None,
+            }
+        }
+        pub fn next_if_eq(&mut self, expected: &I::Item) -> Option<I::Item> where I::Item: PartialEq {
+            let item = self.next()?;
+            if item == *expected { return Some(item); }
+            self.peeked = Some(Some(item));
+            None
+        }
+        pub fn peek_mut(&mut self) -> Option<&mut I::Item> {
+            if self.peeked.is_none() {
+                self.peeked = Some(self.iter.next());
+            }
+            match &mut self.peeked {
                 Some(Some(item)) => Some(item),
                 _ => None,
             }
@@ -612,21 +638,21 @@ pub mod cmp {
         }
     }
 
-    pub trait PartialEq {
-        fn eq(&self, other: &Self) -> bool;
-        fn ne(&self, other: &Self) -> bool { !self.eq(other) }
+    pub trait PartialEq<Rhs: ?Sized = Self> {
+        fn eq(&self, other: &Rhs) -> bool;
+        fn ne(&self, other: &Rhs) -> bool { !self.eq(other) }
     }
 
     pub trait Eq: PartialEq {}
 
-    pub trait PartialOrd: PartialEq {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering>;
-        fn lt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(Ordering::Less) }
-        fn le(&self, other: &Self) -> bool {
+    pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
+        fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+        fn lt(&self, other: &Rhs) -> bool { self.partial_cmp(other) == Some(Ordering::Less) }
+        fn le(&self, other: &Rhs) -> bool {
             match self.partial_cmp(other) { Some(Ordering::Less) | Some(Ordering::Equal) => true, _ => false }
         }
-        fn gt(&self, other: &Self) -> bool { self.partial_cmp(other) == Some(Ordering::Greater) }
-        fn ge(&self, other: &Self) -> bool {
+        fn gt(&self, other: &Rhs) -> bool { self.partial_cmp(other) == Some(Ordering::Greater) }
+        fn ge(&self, other: &Rhs) -> bool {
             match self.partial_cmp(other) { Some(Ordering::Greater) | Some(Ordering::Equal) => true, _ => false }
         }
     }
@@ -757,6 +783,13 @@ pub mod vec {
 }
 
 pub mod mem {
+    pub fn size_of<T>() -> usize;
+    pub fn align_of<T>() -> usize;
+    pub fn size_of_val<T: ?Sized>(value: &T) -> usize;
+    pub fn discriminant<T>(value: &T) -> Discriminant;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Discriminant(usize);
+
     pub fn replace<T>(dest: &mut T, src: T) -> T;
     pub fn swap<T>(x: &mut T, y: &mut T);
     pub fn take<T: Default>(dest: &mut T) -> T { replace(dest, T::default()) }
@@ -873,6 +906,22 @@ pub mod option {
         }
         pub fn copied(self) -> Option<T> {
             match self { Some(value) => Some(value.clone()), None => None }
+        }
+    }
+
+    impl Option<String> {
+        pub fn as_deref(&self) -> Option<&str> {
+            match self { Some(value) => Some(value.as_str()), None => None }
+        }
+    }
+    impl<T> Option<Box<T>> {
+        pub fn as_deref(&self) -> Option<&T> {
+            match self { Some(value) => Some(&**value), None => None }
+        }
+    }
+    impl<T> Option<Vec<T>> {
+        pub fn as_deref(&self) -> Option<&[T]> {
+            match self { Some(value) => Some(value.as_slice()), None => None }
         }
     }
 
@@ -1562,14 +1611,17 @@ pub mod collections {
                 pub fn range<R: RangeBounds>(&self, range: R) -> Lazy<(&K, &V)> { crate::intrinsics::map_range(self, range) }
             }
             impl<K, V> IntoIterator for $map<K, V> {
+                type Item = (K, V);
                 type IntoIter = Lazy<(K, V)>;
                 fn into_iter(self) -> Lazy<(K, V)> { crate::intrinsics::map_items(self) }
             }
             impl<K, V> IntoIterator for &$map<K, V> {
+                type Item = (&K, &V);
                 type IntoIter = Lazy<(&K, &V)>;
                 fn into_iter(self) -> Lazy<(&K, &V)> { crate::intrinsics::map_items(self) }
             }
             impl<K, V> IntoIterator for &mut $map<K, V> {
+                type Item = (&K, &mut V);
                 type IntoIter = Lazy<(&K, &mut V)>;
                 fn into_iter(self) -> Lazy<(&K, &mut V)> { crate::intrinsics::map_items(self) }
             }
@@ -1618,10 +1670,12 @@ pub mod collections {
                 pub fn range<R: RangeBounds>(&self, range: R) -> Lazy<&T> { crate::intrinsics::set_range(self, range) }
             }
             impl<T> IntoIterator for $set<T> {
+                type Item = T;
                 type IntoIter = Lazy<T>;
                 fn into_iter(self) -> Lazy<T> { crate::intrinsics::map_keys(self) }
             }
             impl<T> IntoIterator for &$set<T> {
+                type Item = &T;
                 type IntoIter = Lazy<&T>;
                 fn into_iter(self) -> Lazy<&T> { crate::intrinsics::map_keys(self) }
             }
@@ -1679,10 +1733,12 @@ pub mod collections {
         fn index_mut(&mut self, index: usize) -> &mut T { &mut self.items[index] }
     }
     impl<T> IntoIterator for VecDeque<T> {
+        type Item = T;
         type IntoIter = Lazy<T>;
         fn into_iter(self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.items) }
     }
     impl<T> IntoIterator for &VecDeque<T> {
+        type Item = &T;
         type IntoIter = Lazy<&T>;
         fn into_iter(self) -> Lazy<&T> { crate::intrinsics::lazy_elements(&self.items) }
     }
@@ -1755,6 +1811,7 @@ pub mod collections {
         fn from(items: Vec<T>) -> BinaryHeap<T> { BinaryHeap::from_vec(items) }
     }
     impl<T> IntoIterator for BinaryHeap<T> {
+        type Item = T;
         type IntoIter = Lazy<T>;
         fn into_iter(self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.items) }
     }
@@ -1847,10 +1904,12 @@ pub mod sync {
         }
         use crate::iter::Lazy;
         impl<T> IntoIterator for Receiver<T> {
+            type Item = T;
             type IntoIter = Lazy<T>;
             fn into_iter(self) -> Lazy<T> { self.iter() }
         }
         impl<T> IntoIterator for &Receiver<T> {
+            type Item = T;
             type IntoIter = Lazy<T>;
             fn into_iter(self) -> Lazy<T> { self.iter() }
         }

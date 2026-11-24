@@ -1,0 +1,11 @@
+0
+(3, 4)     -> Point { x: 3, y: 4 }
+ (-10,7)   -> Point { x: -10, y: 7 }
+3,4        -> error: expected (x, y)
+(a, 2)     -> error: bad number "a"
+(1; 2)     -> error: expected (x, y)
+sorted versions: 0.9.12 < 1.2.3 < 1.2.10 < 1.10.0
+Err("need 3 parts in \"1.2\"")
+Err("\"1.x.3\": invalid digit found in string")
+[Ok(Red), Ok(Blue), Ok(Hex(16746496)), Err(()), Err(())]
+sum of x*y: 44

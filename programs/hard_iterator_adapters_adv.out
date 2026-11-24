@@ -1,0 +1,21 @@
+0
+busy thu price 12.4 vol 800
+busy fri price 12.1 vol 650
+busy sat price 13.0 vol 900
+best 13 worst 10.5
+fold tuple: sum=3700 count=7 max=900 avg=528.6
+changes: ["+0.7", "-0.3", "+1.5", "-0.3", "+0.9", "-0.3"]
+step_by(2): ["mon", "wed", "fri", "sun"]
+chain: ["sat", "sun", "mon", "tue", "wed", "thu", "fri"]
+cycle().take(7): ["ann", "bo", "cy", "ann", "bo", "cy", "ann"]
+rev().enumerate(): 0 sun
+rev().enumerate(): 1 sat
+rev().enumerate(): 2 fri
+enumerate().rev(): [(6, "sun"), (5, "sat")]
+increasing runs: [[300, 450], [200, 800], [650, 900], [400]]
+next_if stopped before Some("="), got ["let", "x"]
+zip infinite: [('a', 1), ('b', 2), ('c', 3)]
+partition: [300, 450, 200, 400] [800, 650, 900]
+last rise index: Some(4)
+total turnover: 44935.00
+flatten: [1, 2, 3], product: 720

@@ -1,0 +1,9 @@
+0
+[Num(12), Op('+'), LParen, Num(3), Op('*'), Num(45), RParen, Op('-'), Num(6)]
+ops=3 big_nums=2 parens=2
+3 4 + 2 * = 14
+10 2 / 3 - = 2
+2 3 4 * + = 14
+grades: ABCFA
+is small some: true
+all assertions passed

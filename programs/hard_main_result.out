@@ -1,0 +1,13 @@
+0
+loaded 3 employees
+  skipped line 2: number too large to fit in target type
+  skipped line 4: name must not be empty
+  skipped line 5: line: expected 4 fields, got 3
+  skipped line 7: invalid digit found in string
+eng   136000
+ops    59000
+oldest: Ed (51)
+parsed 17 and 255
+payroll error: payroll overflow
+u8 parse: number too large to fit in target type
+done

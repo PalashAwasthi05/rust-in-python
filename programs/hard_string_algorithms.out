@@ -1,0 +1,22 @@
+0
+"aaabccddddde" -> "3ab2c5de" -> roundtrip ok: true
+"abc" -> "abc" -> roundtrip ok: true
+"zzzzzzzzzzzz" -> "12z" -> roundtrip ok: true
+"" -> "" -> roundtrip ok: true
+act     ["cat", "act", "tac"]
+dgo     ["dog"]
+eggloo  ["google", "gooegl"]
+eilnst  ["listen", "Silent", "enlist"]
+width 20:
+|The quick brown fox |
+|jumps over the lazy |
+|dog and keeps       |
+|running far beyond  |
+|the hills           |
+width 32:
+|The quick brown fox jumps over  |
+|the lazy dog and keeps running  |
+|far beyond the hills            |
+lcp: "inter"
+lcp none: ""
+vowels 21 caps "T"

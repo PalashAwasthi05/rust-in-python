@@ -1,0 +1,11 @@
+101
+wrapped 0 -> north
+wrapped 1 -> east
+wrapped 2 -> south
+wrapped 3 -> west
+wrapped 4 -> north
+wrapped 5 -> east
+try_get(2): Some("south")
+try_get(9): None
+raw 1 -> east (seen 1)
+raw 3 -> west (seen 2)

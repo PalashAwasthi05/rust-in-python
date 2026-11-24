@@ -1,0 +1,8 @@
+101
+quote Order { item: "pear", qty: 2 }: Some(110)
+quote Order { item: "apple", qty: 3 }: Some(120)
+quote Order { item: "mango", qty: 1 }: None
+quote Order { item: "plum", qty: 5 }: Some(150)
+cheapest: Some("plum")
+charged pear x2 = 110 (total 110)
+charged apple x3 = 120 (total 230)

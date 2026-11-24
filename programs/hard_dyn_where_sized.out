@@ -1,0 +1,12 @@
+0
+1:upper
+"tag":repeat2
+upper+reverse+repeat2 -> CBACBA
+running 5 plugins on "rust":
+  upper                  "RUST"
+  reverse                "tsur"
+  repeat3                "rustrustrust"
+  reverse+upper          "TSUR"
+  upper+reverse+repeat2  "TSURTSUR"
+process_many via dyn: ["eno", "owt", "eerht"]
+names: upper, reverse, repeat3, reverse+upper, upper+reverse+repeat2

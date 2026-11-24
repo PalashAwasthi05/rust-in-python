@@ -1,0 +1,14 @@
+0
+flushed [1, 2, 3], buffer now Buffer { name: "log", data: [], flushes: 1 }
+old name log, new Buffer { name: "audit", data: [9, 9], flushes: 1 }
+swapped a=[10, 20, 30] b=[1, 2]
+rotated: y z x
+prev Active { id: 7, sent: 1024 }, now Closed("timeout")
+prev Closed("timeout"), now Closed("again")
+took Closed("again"), left Idle
+taken "beta", words ["alpha", "", "gamma"]
+slice swap ["gamma", "", "alpha"]
+Option::take -> Some(5), left None
+Option::replace -> None, now Some(11)
+before 100 after 0, size_of u64=8 Option<Box<u8>>=8
+list [] sorted [1, 2, 3]

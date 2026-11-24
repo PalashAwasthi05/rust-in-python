@@ -1,0 +1,18 @@
+0
+Meters(3.048) == Feet(10.0): true
+Feet(10.0) == Meters(3.048): true
+Meters(1) == Feet(3): false
+Meters(1) > Feet(3): true
+Meters(1) < Feet(4): true
+Meters eq Meters: true
+u == "ferris": true
+"FERRIS" == u: true
+u != "crab": true
+found bob at Some(1)
+Ok == 200: true
+NotFound == 200: false
+NotFound == 404: true
+Other(503) == 503: true
+Code eq Code: true true
+error codes: 3
+String == &str: true, Vec == array: true

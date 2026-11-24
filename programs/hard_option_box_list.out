@@ -1,0 +1,10 @@
+0
+len 5 peek Some("e")
+items: ["e", "d", "c", "b", "a"]
+after peek_mut: Some("e!!")
+reversed: "abcde!!"
+remove c: true, remove z: false
+pop Some("a") pop Some("b")
+left ["d", "e!!"] len 2
+sum 91 max Some(36)
+stopped with Some(4), empty? false

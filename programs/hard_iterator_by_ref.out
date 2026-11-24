@@ -1,0 +1,10 @@
+0
+head ["header", ":", "v1"]
+body ["body", "a", "b", "c"]
+rest ["footer", "z"]
+first ["line1", "line2", "line3"], after skip Some("line6"), remaining 4
+exhausted: None
+small sum 10 (5 was consumed), evens [6, 8, 10], next Some(11)
+binding ["let", "total"] expr "price * ( qty + 1 ) ;"
+key "key" value "value=more"
+token counts: [2, 0, 5, 2]

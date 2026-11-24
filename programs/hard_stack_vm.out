@@ -1,0 +1,7 @@
+0
+fact: Ok(()) output [3628800] steps 119
+fib: Ok(()) output [0, 1, 1, 2, 3, 5, 8, 13]
+arith     Ok(()) out=[16] stack=[]
+underflow Err(StackUnderflow(2)) out=[] stack=[]
+divzero   Err(DivZero(2)) out=[] stack=[]
+badjump   Err(BadJump(99)) out=[] stack=[]

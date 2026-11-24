@@ -1,0 +1,11 @@
+0
+Request { method: Get, url: "/users", headers: [("Accept", "text/plain")], timeout_ms: 3000, retries: 0, body: None }
+Post /items retries=3 timeout=500
+headers: [("Content-Type", "application/json")]
+body: {"id":1}
+Err("GET cannot have a body")
+Err("bad url \"nope\"")
+default url=/ timeout=3000
+base     Style { bold: false, italic: false, size: 12, color: (0, 0, 0) }
+heading  Style { bold: true, italic: false, size: 20, color: (0, 0, 0) }
+warn     Style { bold: true, italic: true, size: 20, color: (200, 30, 0) }

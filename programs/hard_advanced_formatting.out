@@ -1,0 +1,55 @@
+0
+[       right]
+[left        ]
+[   3.142    ]
+[    mid     ]
+[0003.142] [-003.142] [+0003.14]
+[+1.23456e5] [4.2e-4] [-9.5E0] [6.022e23]
+[   +2.5000] [100.0     ] [    +7    ]
+[######42] [~~~~x~~~~] [00007] [00003]
+[0x00ff] [0b00000101] [100] [BEEF]
+apples     |   3 |   0.50 |    1.50
+kiwis      |  12 |   0.25 |    3.00
+watermelon |   1 |   4.00 |    4.00
+Suspended { days: 3 }
+User {
+    id: 17,
+    name: "dana",
+    tags: [
+        "admin",
+        "beta",
+    ],
+    status: Suspended {
+        days: 3,
+    },
+    address: Address {
+        city: "Oslo",
+        zip: Some(
+            150,
+        ),
+    },
+    scores: {
+        "art": 78.0,
+        "math": 91.5,
+    },
+}
+[
+    Active,
+    Banned(
+        "spam",
+    ),
+]
+{
+    1: [
+        Some(
+            (
+                1,
+                "a",
+            ),
+        ),
+        None,
+    ],
+    2: [],
+}
+{1: [Some((1, "a")), None], 2: []}
+    inline|5   |  5  |(5, "inline")

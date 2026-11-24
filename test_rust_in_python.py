@@ -2227,7 +2227,7 @@ INVALID = [
             let pattern = text.as_mut_str();
             println!("{}", "test".contains(pattern));
         }
-    """, "supports character and shared string patterns"),
+    """, "supports character and shared string patterns|does not implement std§str§Pattern"),
     ("uninitialized tuple bindings must each be assigned before use", """
         fn main() {
             let (left, right): (i32, i32);
