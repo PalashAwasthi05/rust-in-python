@@ -1,0 +1,16 @@
+0
+hits = 2000
+ready = true
+global = 5
+fetch_sub returned 10
+swap returned 7
+cas ok: Ok(-4)
+cas fail: Err(99)
+max: 99
+now 150
+fetch_and true -> false
+fetch_xor false -> true
+into_inner 150
+max seen 17
+ticket 10 after 0 retries
+fetch_update Ok(10) -> 30

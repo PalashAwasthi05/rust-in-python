@@ -1,0 +1,14 @@
+0
+0 -> 1 (30) ok
+1 -> 2 (50) ok
+2 -> 2 (1) failed: same account
+2 -> 3 (500) failed: insufficient funds in 2
+3 -> 0 (10) ok
+total 400
+Account { id: 0, balance: 80 }
+Account { id: 1, balance: 80 }
+Account { id: 2, balance: 150 }
+Account { id: 3, balance: 90 }
+Mutex { data: 5, poisoned: false, .. }
+try_lock ok: true
+Mutex { data: "<locked>", poisoned: false, .. } / 5 / 5

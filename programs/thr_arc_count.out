@@ -1,0 +1,19 @@
+0
+count at start: 1
+worker 0 sees main (limit 3)
+worker 1 sees main (limit 3)
+worker 2 sees main (limit 3)
+count after joins: 1
+count with clones: 3
+ptr_eq: true
+count after scope: 1
+weak count: 1
+upgrade some: true
+sum 6 count 1
+unwrapped [1, 2, 3]
+keeper saw main
+count before final drop: 1
+dropping config main
+upgrade after drop: None
+make_mut 6
+end

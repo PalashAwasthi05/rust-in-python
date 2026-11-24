@@ -2786,62 +2786,262 @@ pub mod rc {
 pub mod sync {
     pub use crate::rc::Rc as Arc;
     pub use crate::rc::Weak;
+    use crate::cell::{Cell, RefCell};
+    use crate::fmt;
+    use crate::green::{green_block, green_progress};
 
     pub mod mpsc {
         use crate::rc::Rc;
-        use crate::cell::RefCell;
+        use crate::cell::{Cell, RefCell};
         use crate::collections::VecDeque;
+        use crate::fmt;
+        use crate::green::{green_block, green_progress};
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct RecvError;
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum TryRecvError { Empty, Disconnected }
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum RecvTimeoutError { Timeout, Disconnected }
+        #[derive(Clone, Copy, PartialEq, Eq)]
         pub struct SendError<T>(pub T);
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        pub enum TrySendError<T> { Full(T), Disconnected(T) }
 
-        pub struct Sender<T> { queue: Rc<RefCell<VecDeque<T>>> }
-        pub struct Receiver<T> { queue: Rc<RefCell<VecDeque<T>>> }
-        pub type SyncSender<T> = Sender<T>;
+        impl fmt::Display for RecvError {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("receiving on a closed channel") }
+        }
+        impl fmt::Display for TryRecvError {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match self {
+                    TryRecvError::Empty => f.write_str("receiving on an empty channel"),
+                    TryRecvError::Disconnected => f.write_str("receiving on an empty and disconnected channel"),
+                }
+            }
+        }
+        impl fmt::Display for RecvTimeoutError {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match self {
+                    RecvTimeoutError::Timeout => f.write_str("timed out waiting on channel"),
+                    RecvTimeoutError::Disconnected => f.write_str("channel is empty and sending half is closed"),
+                }
+            }
+        }
+        impl<T> fmt::Debug for SendError<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("SendError { .. }") }
+        }
+        impl<T> fmt::Display for SendError<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("sending on a closed channel") }
+        }
+        impl<T> fmt::Debug for TrySendError<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match self {
+                    TrySendError::Full(_) => f.write_str("Full(..)"),
+                    TrySendError::Disconnected(_) => f.write_str("Disconnected(..)"),
+                }
+            }
+        }
+        impl<T> fmt::Display for TrySendError<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                match self {
+                    TrySendError::Full(_) => f.write_str("sending on a full channel"),
+                    TrySendError::Disconnected(_) => f.write_str("sending on a closed channel"),
+                }
+            }
+        }
+
+        // `bound` is None for an unbounded channel; a bound of 0 makes each send wait for its receive.
+        struct Channel<T> {
+            queue: RefCell<VecDeque<T>>,
+            senders: Cell<usize>,
+            receiving: Cell<bool>,
+            bound: Option<usize>,
+            sent: Cell<u64>,
+            received: Cell<u64>,
+        }
+
+        impl<T> Channel<T> {
+            fn new(bound: Option<usize>) -> Channel<T> {
+                crate::intrinsics::track_drops();
+                Channel {
+                    queue: RefCell::new(VecDeque::new()),
+                    senders: Cell::new(1),
+                    receiving: Cell::new(true),
+                    bound: bound,
+                    sent: Cell::new(0),
+                    received: Cell::new(0),
+                }
+            }
+            fn full(&self) -> bool {
+                match self.bound {
+                    Some(bound) => self.queue.borrow().len() >= if bound == 0 { 1 } else { bound },
+                    None => false,
+                }
+            }
+            fn push(&self, value: T) {
+                self.queue.borrow_mut().push_back(value);
+                self.sent.set(self.sent.get() + 1);
+                green_progress();
+            }
+            fn send(&self, value: T) -> Result<(), T> {
+                while self.receiving.get() && self.full() {
+                    if !green_block() { panic!("deadlock: SyncSender::send can never complete"); }
+                }
+                if !self.receiving.get() { return Err(value); }
+                self.push(value);
+                if self.bound == Some(0) {
+                    let ticket = self.sent.get();
+                    while self.receiving.get() && self.received.get() < ticket {
+                        if !green_block() { panic!("deadlock: SyncSender::send can never complete"); }
+                    }
+                }
+                Ok(())
+            }
+            fn pop(&self) -> Option<T> {
+                let next = self.queue.borrow_mut().pop_front();
+                if next.is_some() {
+                    self.received.set(self.received.get() + 1);
+                    green_progress();
+                }
+                next
+            }
+            fn recv(&self, timeout: bool) -> Result<T, RecvTimeoutError> {
+                loop {
+                    match self.pop() {
+                        Some(value) => return Ok(value),
+                        None => {}
+                    }
+                    if self.senders.get() == 0 { return Err(RecvTimeoutError::Disconnected); }
+                    if !green_block() {
+                        if timeout { return Err(RecvTimeoutError::Timeout); }
+                        panic!("deadlock: Receiver::recv can never receive a message");
+                    }
+                }
+            }
+        }
+
+        pub struct Sender<T> { channel: Rc<Channel<T>> }
+        pub struct SyncSender<T> { channel: Rc<Channel<T>> }
+        pub struct Receiver<T> { channel: Rc<Channel<T>> }
+
+        pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+            let channel = Rc::new(Channel::new(None));
+            (Sender { channel: Rc::clone(&channel) }, Receiver { channel: channel })
+        }
+        pub fn sync_channel<T>(bound: usize) -> (SyncSender<T>, Receiver<T>) {
+            let channel = Rc::new(Channel::new(Some(bound)));
+            (SyncSender { channel: Rc::clone(&channel) }, Receiver { channel: channel })
+        }
 
         impl<T> Clone for Sender<T> {
-            fn clone(&self) -> Sender<T> { Sender { queue: Rc::clone(&self.queue) } }
+            fn clone(&self) -> Sender<T> {
+                self.channel.senders.set(self.channel.senders.get() + 1);
+                Sender { channel: Rc::clone(&self.channel) }
+            }
         }
-        pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-            let queue = Rc::new(RefCell::new(VecDeque::new()));
-            (Sender { queue: Rc::clone(&queue) }, Receiver { queue: queue })
+        impl<T> Clone for SyncSender<T> {
+            fn clone(&self) -> SyncSender<T> {
+                self.channel.senders.set(self.channel.senders.get() + 1);
+                SyncSender { channel: Rc::clone(&self.channel) }
+            }
         }
-        pub fn sync_channel<T>(bound: usize) -> (Sender<T>, Receiver<T>) { channel() }
+        impl<T> Drop for Sender<T> {
+            fn drop(&mut self) {
+                self.channel.senders.set(self.channel.senders.get() - 1);
+                green_progress();
+            }
+        }
+        impl<T> Drop for SyncSender<T> {
+            fn drop(&mut self) {
+                self.channel.senders.set(self.channel.senders.get() - 1);
+                green_progress();
+            }
+        }
+        impl<T> Drop for Receiver<T> {
+            fn drop(&mut self) {
+                self.channel.receiving.set(false);
+                green_progress();
+            }
+        }
+        impl<T> fmt::Debug for Sender<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Sender { .. }") }
+        }
+        impl<T> fmt::Debug for SyncSender<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("SyncSender { .. }") }
+        }
+        impl<T> fmt::Debug for Receiver<T> {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Receiver { .. }") }
+        }
+
         impl<T> Sender<T> {
-            pub fn send(&self, value: T) -> Result<(), SendError<T>> { self.queue.borrow_mut().push_back(value); Ok(()) }
+            pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+                match self.channel.send(value) { Ok(()) => Ok(()), Err(value) => Err(SendError(value)) }
+            }
+        }
+        impl<T> SyncSender<T> {
+            pub fn send(&self, value: T) -> Result<(), SendError<T>> {
+                match self.channel.send(value) { Ok(()) => Ok(()), Err(value) => Err(SendError(value)) }
+            }
+            pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
+                if !self.channel.receiving.get() { return Err(TrySendError::Disconnected(value)); }
+                if self.channel.full() || self.channel.bound == Some(0) { return Err(TrySendError::Full(value)); }
+                self.channel.push(value);
+                Ok(())
+            }
         }
         impl<T> Receiver<T> {
             pub fn recv(&self) -> Result<T, RecvError> {
-                match self.queue.borrow_mut().pop_front() { Some(value) => Ok(value), None => Err(RecvError) }
+                match self.channel.recv(false) { Ok(value) => Ok(value), Err(_) => Err(RecvError) }
             }
             pub fn try_recv(&self) -> Result<T, TryRecvError> {
-                match self.queue.borrow_mut().pop_front() { Some(value) => Ok(value), None => Err(TryRecvError::Disconnected) }
+                match self.channel.pop() {
+                    Some(value) => Ok(value),
+                    None => Err(if self.channel.senders.get() == 0 { TryRecvError::Disconnected } else { TryRecvError::Empty }),
+                }
             }
-            pub fn recv_timeout(&self, timeout: crate::time::Duration) -> Result<T, RecvError> { self.recv() }
-            pub fn iter(&self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.queue.borrow_mut().drain(..).collect::<Vec<T>>()) }
-            pub fn try_iter(&self) -> Lazy<T> { self.iter() }
+            pub fn recv_timeout(&self, timeout: crate::time::Duration) -> Result<T, RecvTimeoutError> {
+                let result = self.channel.recv(true);
+                if let Err(RecvTimeoutError::Timeout) = result { crate::green::green_sleep(timeout.as_nanos()); }
+                result
+            }
+            pub fn iter(&self) -> Iter<'_, T> { Iter { receiver: self } }
+            pub fn try_iter(&self) -> TryIter<'_, T> { TryIter { receiver: self } }
         }
-        use crate::iter::Lazy;
+
+        pub struct Iter<'a, T> { receiver: &'a Receiver<T> }
+        pub struct TryIter<'a, T> { receiver: &'a Receiver<T> }
+        pub struct IntoIter<T> { receiver: Receiver<T> }
+        impl<'a, T> Iterator for Iter<'a, T> {
+            type Item = T;
+            fn next(&mut self) -> Option<T> { self.receiver.recv().ok() }
+        }
+        impl<'a, T> Iterator for TryIter<'a, T> {
+            type Item = T;
+            fn next(&mut self) -> Option<T> { self.receiver.try_recv().ok() }
+        }
+        impl<T> Iterator for IntoIter<T> {
+            type Item = T;
+            fn next(&mut self) -> Option<T> { self.receiver.recv().ok() }
+        }
         impl<T> IntoIterator for Receiver<T> {
             type Item = T;
-            type IntoIter = Lazy<T>;
-            fn into_iter(self) -> Lazy<T> { self.iter() }
+            type IntoIter = IntoIter<T>;
+            fn into_iter(self) -> IntoIter<T> { IntoIter { receiver: self } }
         }
-        impl<T> IntoIterator for &Receiver<T> {
+        impl<'a, T> IntoIterator for &'a Receiver<T> {
             type Item = T;
-            type IntoIter = Lazy<T>;
-            fn into_iter(self) -> Lazy<T> { self.iter() }
+            type IntoIter = Iter<'a, T>;
+            fn into_iter(self) -> Iter<'a, T> { self.iter() }
         }
     }
 
     pub mod atomic {
         use crate::cell::Cell;
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        use crate::green::green_progress;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum Ordering { Relaxed, Release, Acquire, AcqRel, SeqCst }
+        pub fn fence(order: Ordering) {}
+        pub fn compiler_fence(order: Ordering) {}
         macro_rules! atomic {
             ($name:ident, $t:ty) => {
                 #[derive(Default)]
@@ -2849,27 +3049,43 @@ pub mod sync {
                 impl $name {
                     pub fn new(value: $t) -> $name { $name { value: Cell::new(value) } }
                     pub fn load(&self, order: Ordering) -> $t { self.value.get() }
-                    pub fn store(&self, value: $t, order: Ordering) { self.value.set(value) }
-                    pub fn swap(&self, value: $t, order: Ordering) -> $t { self.value.replace(value) }
+                    pub fn store(&self, value: $t, order: Ordering) { self.value.set(value); green_progress(); }
+                    pub fn swap(&self, value: $t, order: Ordering) -> $t { green_progress(); self.value.replace(value) }
                     pub fn into_inner(self) -> $t { self.value.get() }
                     pub fn get_mut(&mut self) -> &mut $t { self.value.get_mut() }
                     pub fn compare_exchange(&self, current: $t, new: $t, success: Ordering, failure: Ordering) -> Result<$t, $t> {
                         let old = self.value.get();
-                        if old == current { self.value.set(new); Ok(old) } else { Err(old) }
+                        if old == current { self.value.set(new); green_progress(); Ok(old) } else { Err(old) }
+                    }
+                    pub fn compare_exchange_weak(&self, current: $t, new: $t, success: Ordering, failure: Ordering) -> Result<$t, $t> {
+                        self.compare_exchange(current, new, success, failure)
+                    }
+                    pub fn fetch_update<F: FnMut($t) -> Option<$t>>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<$t, $t> {
+                        let old = self.value.get();
+                        match f(old) {
+                            Some(new) => { self.value.set(new); green_progress(); Ok(old) }
+                            None => Err(old),
+                        }
                     }
                 }
+                impl From<$t> for $name {
+                    fn from(value: $t) -> $name { $name::new(value) }
+                }
                 impl crate::fmt::Debug for $name {
-                    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "{:?}", self.value.get()) }
+                    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { crate::fmt::Debug::fmt(&self.value.get(), f) }
                 }
             };
         }
         macro_rules! atomic_int {
             ($name:ident, $t:ty) => {
                 impl $name {
-                    pub fn fetch_add(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_add(value)); old }
-                    pub fn fetch_sub(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_sub(value)); old }
-                    pub fn fetch_max(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value > old { self.value.set(value); } old }
-                    pub fn fetch_min(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value < old { self.value.set(value); } old }
+                    pub fn fetch_add(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_add(value)); green_progress(); old }
+                    pub fn fetch_sub(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_sub(value)); green_progress(); old }
+                    pub fn fetch_max(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value > old { self.value.set(value); green_progress(); } old }
+                    pub fn fetch_min(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value < old { self.value.set(value); green_progress(); } old }
+                    pub fn fetch_and(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old & value); green_progress(); old }
+                    pub fn fetch_or(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old | value); green_progress(); old }
+                    pub fn fetch_xor(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old ^ value); green_progress(); old }
                 }
             };
         }
@@ -2895,29 +3111,380 @@ pub mod sync {
         atomic_int!(AtomicI64, i64);
         atomic!(AtomicBool, bool);
         impl AtomicBool {
-            pub fn fetch_or(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old || value); old }
-            pub fn fetch_and(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old && value); old }
+            pub fn fetch_or(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old || value); green_progress(); old }
+            pub fn fetch_and(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old && value); green_progress(); old }
+            pub fn fetch_xor(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old != value); green_progress(); old }
+            pub fn fetch_nand(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(!(old && value)); green_progress(); old }
+            pub fn fetch_not(&self, order: Ordering) -> bool { let old = self.value.get(); self.value.set(!old); green_progress(); old }
         }
     }
 
-    pub struct Mutex<T> { value: crate::cell::RefCell<T> }
-    pub struct RwLock<T> { value: crate::cell::RefCell<T> }
-    #[derive(Debug)]
     pub struct PoisonError<T> { guard: T }
+    impl<T> PoisonError<T> {
+        pub fn new(guard: T) -> PoisonError<T> { PoisonError { guard: guard } }
+        pub fn into_inner(self) -> T { self.guard }
+        pub fn get_ref(&self) -> &T { &self.guard }
+        pub fn get_mut(&mut self) -> &mut T { &mut self.guard }
+    }
+    impl<T> fmt::Debug for PoisonError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("PoisonError { .. }") }
+    }
+    impl<T> fmt::Display for PoisonError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("poisoned lock: another task failed inside") }
+    }
+    pub enum TryLockError<T> { Poisoned(PoisonError<T>), WouldBlock }
+    impl<T> fmt::Debug for TryLockError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                TryLockError::Poisoned(_) => f.write_str("Poisoned(..)"),
+                TryLockError::WouldBlock => f.write_str("WouldBlock"),
+            }
+        }
+    }
+    impl<T> fmt::Display for TryLockError<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                TryLockError::Poisoned(_) => f.write_str("poisoned lock: another task failed inside"),
+                TryLockError::WouldBlock => f.write_str("try_lock failed because the operation would block"),
+            }
+        }
+    }
     pub type LockResult<T> = Result<T, PoisonError<T>>;
+    struct LockedData;
+    impl fmt::Debug for LockedData {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("\"<locked>\"") }
+    }
+    pub type TryLockResult<T> = Result<T, TryLockError<T>>;
+
+    pub struct Mutex<T> { value: RefCell<T>, locked: Cell<bool> }
+    pub struct MutexGuard<'a, T> { lock: &'a Mutex<T> }
 
     impl<T> Mutex<T> {
-        pub fn new(value: T) -> Mutex<T> { Mutex { value: crate::cell::RefCell::new(value) } }
-        pub fn lock(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
-        pub fn try_lock(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
-        pub fn into_inner(self) -> Result<T, PoisonError<T>> { Ok(self.value.into_inner()) }
-        pub fn get_mut(&mut self) -> Result<&mut T, PoisonError<&mut T>> { Ok(self.value.get_mut()) }
+        pub fn new(value: T) -> Mutex<T> { Mutex { value: RefCell::new(value), locked: Cell::new(false) } }
+        pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+            while self.locked.get() {
+                if !green_block() { panic!("deadlock: Mutex::lock can never acquire the lock"); }
+            }
+            self.locked.set(true);
+            Ok(MutexGuard { lock: self })
+        }
+        pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
+            if self.locked.get() { return Err(TryLockError::WouldBlock); }
+            self.locked.set(true);
+            Ok(MutexGuard { lock: self })
+        }
+        pub fn is_poisoned(&self) -> bool { false }
+        pub fn clear_poison(&self) {}
+        pub fn into_inner(self) -> LockResult<T> { Ok(self.value.into_inner()) }
+        pub fn get_mut(&mut self) -> LockResult<&mut T> { Ok(self.value.get_mut()) }
     }
+    impl<T: Default> Default for Mutex<T> {
+        fn default() -> Mutex<T> { Mutex::new(T::default()) }
+    }
+    impl<T> From<T> for Mutex<T> {
+        fn from(value: T) -> Mutex<T> { Mutex::new(value) }
+    }
+    impl<T: fmt::Debug> fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let mut d = f.debug_struct("Mutex");
+            if self.locked.get() {
+                d.field("data", &LockedData);
+            } else {
+                d.field("data", &*crate::intrinsics::refcell_value(&self.value));
+            }
+            d.field("poisoned", &false);
+            d.finish_non_exhaustive()
+        }
+    }
+    impl<'a, T> crate::ops::Deref for MutexGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &T { &*crate::intrinsics::refcell_value(&self.lock.value) }
+    }
+    impl<'a, T> crate::ops::DerefMut for MutexGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut T { crate::intrinsics::refcell_value(&self.lock.value) }
+    }
+    impl<'a, T> Drop for MutexGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock.locked.set(false);
+            green_progress();
+        }
+    }
+    impl<'a, T: fmt::Display> fmt::Display for MutexGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&**self, f) }
+    }
+    impl<'a, T: fmt::Debug> fmt::Debug for MutexGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&**self, f) }
+    }
+
+    // `state` counts readers above zero and marks a writer with -1.
+    pub struct RwLock<T> { value: RefCell<T>, state: Cell<isize> }
+    pub struct RwLockReadGuard<'a, T> { lock: &'a RwLock<T> }
+    pub struct RwLockWriteGuard<'a, T> { lock: &'a RwLock<T> }
+
     impl<T> RwLock<T> {
-        pub fn new(value: T) -> RwLock<T> { RwLock { value: crate::cell::RefCell::new(value) } }
-        pub fn read(&self) -> Result<&T, PoisonError<&T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
-        pub fn write(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
-        pub fn into_inner(self) -> Result<T, PoisonError<T>> { Ok(self.value.into_inner()) }
+        pub fn new(value: T) -> RwLock<T> { RwLock { value: RefCell::new(value), state: Cell::new(0) } }
+        pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
+            while self.state.get() < 0 {
+                if !green_block() { panic!("deadlock: RwLock::read can never acquire the lock"); }
+            }
+            self.state.set(self.state.get() + 1);
+            Ok(RwLockReadGuard { lock: self })
+        }
+        pub fn write(&self) -> LockResult<RwLockWriteGuard<'_, T>> {
+            while self.state.get() != 0 {
+                if !green_block() { panic!("deadlock: RwLock::write can never acquire the lock"); }
+            }
+            self.state.set(-1);
+            Ok(RwLockWriteGuard { lock: self })
+        }
+        pub fn try_read(&self) -> TryLockResult<RwLockReadGuard<'_, T>> {
+            if self.state.get() < 0 { return Err(TryLockError::WouldBlock); }
+            self.state.set(self.state.get() + 1);
+            Ok(RwLockReadGuard { lock: self })
+        }
+        pub fn try_write(&self) -> TryLockResult<RwLockWriteGuard<'_, T>> {
+            if self.state.get() != 0 { return Err(TryLockError::WouldBlock); }
+            self.state.set(-1);
+            Ok(RwLockWriteGuard { lock: self })
+        }
+        pub fn is_poisoned(&self) -> bool { false }
+        pub fn into_inner(self) -> LockResult<T> { Ok(self.value.into_inner()) }
+        pub fn get_mut(&mut self) -> LockResult<&mut T> { Ok(self.value.get_mut()) }
+    }
+    impl<T: Default> Default for RwLock<T> {
+        fn default() -> RwLock<T> { RwLock::new(T::default()) }
+    }
+    impl<T: fmt::Debug> fmt::Debug for RwLock<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let mut d = f.debug_struct("RwLock");
+            if self.state.get() < 0 {
+                d.field("data", &LockedData);
+            } else {
+                d.field("data", &*crate::intrinsics::refcell_value(&self.value));
+            }
+            d.field("poisoned", &false);
+            d.finish_non_exhaustive()
+        }
+    }
+    impl<'a, T> crate::ops::Deref for RwLockReadGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &T { &*crate::intrinsics::refcell_value(&self.lock.value) }
+    }
+    impl<'a, T> Drop for RwLockReadGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock.state.set(self.lock.state.get() - 1);
+            green_progress();
+        }
+    }
+    impl<'a, T> crate::ops::Deref for RwLockWriteGuard<'a, T> {
+        type Target = T;
+        fn deref(&self) -> &T { &*crate::intrinsics::refcell_value(&self.lock.value) }
+    }
+    impl<'a, T> crate::ops::DerefMut for RwLockWriteGuard<'a, T> {
+        fn deref_mut(&mut self) -> &mut T { crate::intrinsics::refcell_value(&self.lock.value) }
+    }
+    impl<'a, T> Drop for RwLockWriteGuard<'a, T> {
+        fn drop(&mut self) {
+            self.lock.state.set(0);
+            green_progress();
+        }
+    }
+    impl<'a, T: fmt::Display> fmt::Display for RwLockReadGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&**self, f) }
+    }
+    impl<'a, T: fmt::Debug> fmt::Debug for RwLockReadGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&**self, f) }
+    }
+    impl<'a, T: fmt::Display> fmt::Display for RwLockWriteGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&**self, f) }
+    }
+    impl<'a, T: fmt::Debug> fmt::Debug for RwLockWriteGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&**self, f) }
+    }
+
+    // Waiters may wake spuriously (as std allows) whenever a notification happened since they slept.
+    pub struct Condvar { notified: Cell<u64> }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WaitTimeoutResult(bool);
+    impl WaitTimeoutResult {
+        pub fn timed_out(&self) -> bool { self.0 }
+    }
+    impl Condvar {
+        pub fn new() -> Condvar { Condvar { notified: Cell::new(0) } }
+        fn sleep(&self, timeout: bool) -> bool {
+            let seen = self.notified.get();
+            while self.notified.get() == seen {
+                if !green_block() {
+                    if timeout { return true; }
+                    panic!("deadlock: Condvar::wait is never notified");
+                }
+            }
+            false
+        }
+        pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+            let lock: &'a Mutex<T> = guard.lock;
+            drop(guard);
+            self.sleep(false);
+            lock.lock()
+        }
+        pub fn wait_while<'a, T, F: FnMut(&mut T) -> bool>(&self, guard: MutexGuard<'a, T>, mut condition: F) -> LockResult<MutexGuard<'a, T>> {
+            let mut guard = guard;
+            while condition(&mut *guard) {
+                guard = match self.wait(guard) { Ok(next) => next, Err(error) => return Err(error) };
+            }
+            Ok(guard)
+        }
+        pub fn wait_timeout<'a, T>(&self, guard: MutexGuard<'a, T>, dur: crate::time::Duration) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+            let lock: &'a Mutex<T> = guard.lock;
+            drop(guard);
+            let timed_out = self.sleep(true);
+            if timed_out { crate::green::green_sleep(dur.as_nanos()); }
+            match lock.lock() {
+                Ok(guard) => Ok((guard, WaitTimeoutResult(timed_out))),
+                Err(_) => panic!("poisoned lock"),
+            }
+        }
+        pub fn wait_timeout_while<'a, T, F: FnMut(&mut T) -> bool>(&self, guard: MutexGuard<'a, T>, dur: crate::time::Duration, mut condition: F) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+            let mut guard = guard;
+            while condition(&mut *guard) {
+                let (next, result) = match self.wait_timeout(guard, dur) { Ok(pair) => pair, Err(_) => panic!("poisoned lock") };
+                guard = next;
+                if result.timed_out() { return Ok((guard, result)); }
+            }
+            Ok((guard, WaitTimeoutResult(false)))
+        }
+        pub fn notify_one(&self) {
+            self.notified.set(self.notified.get() + 1);
+            green_progress();
+        }
+        pub fn notify_all(&self) {
+            self.notified.set(self.notified.get() + 1);
+            green_progress();
+        }
+    }
+    impl Default for Condvar {
+        fn default() -> Condvar { Condvar::new() }
+    }
+    impl fmt::Debug for Condvar {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Condvar { .. }") }
+    }
+
+    pub struct Barrier { count: usize, waiting: Cell<usize>, generation: Cell<usize> }
+    pub struct BarrierWaitResult(bool);
+    impl BarrierWaitResult {
+        pub fn is_leader(&self) -> bool { self.0 }
+    }
+    impl fmt::Debug for BarrierWaitResult {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.debug_struct("BarrierWaitResult").field("is_leader", &self.0).finish() }
+    }
+    impl Barrier {
+        pub fn new(n: usize) -> Barrier { Barrier { count: n, waiting: Cell::new(0), generation: Cell::new(0) } }
+        pub fn wait(&self) -> BarrierWaitResult {
+            let generation = self.generation.get();
+            let arrived = self.waiting.get() + 1;
+            if arrived >= self.count {
+                self.waiting.set(0);
+                self.generation.set(generation + 1);
+                green_progress();
+                return BarrierWaitResult(true);
+            }
+            self.waiting.set(arrived);
+            green_progress();
+            while self.generation.get() == generation {
+                if !green_block() { panic!("deadlock: Barrier::wait can never be released"); }
+            }
+            BarrierWaitResult(false)
+        }
+    }
+    impl fmt::Debug for Barrier {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Barrier { .. }") }
+    }
+
+    pub struct Once { done: Cell<bool> }
+    pub struct OnceState { poisoned: bool }
+    impl OnceState {
+        pub fn is_poisoned(&self) -> bool { self.poisoned }
+    }
+    impl Once {
+        pub fn new() -> Once { Once { done: Cell::new(false) } }
+        pub fn call_once<F: FnOnce()>(&self, f: F) {
+            if !self.done.get() {
+                self.done.set(true);
+                f();
+                green_progress();
+            }
+        }
+        pub fn call_once_force<F: FnOnce(&OnceState)>(&self, f: F) {
+            if !self.done.get() {
+                self.done.set(true);
+                f(&OnceState { poisoned: false });
+                green_progress();
+            }
+        }
+        pub fn is_completed(&self) -> bool { self.done.get() }
+    }
+    impl fmt::Debug for Once {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Once { .. }") }
+    }
+
+    pub struct OnceLock<T> { value: RefCell<Option<T>> }
+    impl<T> OnceLock<T> {
+        pub fn new() -> OnceLock<T> { OnceLock { value: RefCell::new(None) } }
+        pub fn get(&self) -> Option<&T> { crate::intrinsics::refcell_value(&self.value).as_ref() }
+        pub fn get_mut(&mut self) -> Option<&mut T> { self.value.get_mut().as_mut() }
+        pub fn set(&self, value: T) -> Result<(), T> {
+            let slot = crate::intrinsics::refcell_value(&self.value);
+            if slot.is_some() { return Err(value); }
+            *slot = Some(value);
+            green_progress();
+            Ok(())
+        }
+        pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+            if crate::intrinsics::refcell_value(&self.value).is_none() {
+                let value = f();
+                let slot = crate::intrinsics::refcell_value(&self.value);
+                if slot.is_none() { *slot = Some(value); }
+                green_progress();
+            }
+            crate::intrinsics::refcell_value(&self.value).as_ref().unwrap()
+        }
+        pub fn into_inner(self) -> Option<T> { self.value.into_inner() }
+        pub fn take(&mut self) -> Option<T> { self.value.get_mut().take() }
+    }
+    impl<T> Default for OnceLock<T> {
+        fn default() -> OnceLock<T> { OnceLock::new() }
+    }
+    impl<T: fmt::Debug> fmt::Debug for OnceLock<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self.get() {
+                Some(value) => f.debug_tuple("OnceLock").field(value).finish(),
+                None => f.write_str("OnceLock(<uninit>)"),
+            }
+        }
+    }
+    impl<T: Clone> Clone for OnceLock<T> {
+        fn clone(&self) -> OnceLock<T> { OnceLock { value: RefCell::new(self.get().cloned()) } }
+    }
+    impl<T> From<T> for OnceLock<T> {
+        fn from(value: T) -> OnceLock<T> { OnceLock { value: RefCell::new(Some(value)) } }
+    }
+
+    pub struct LazyLock<T> { cell: OnceLock<T>, init: fn() -> T }
+    impl<T> LazyLock<T> {
+        pub fn new(init: fn() -> T) -> LazyLock<T> { LazyLock { cell: OnceLock::new(), init: init } }
+        pub fn force(this: &LazyLock<T>) -> &T { this.cell.get_or_init(this.init) }
+    }
+    impl<T> crate::ops::Deref for LazyLock<T> {
+        type Target = T;
+        fn deref(&self) -> &T { LazyLock::force(self) }
+    }
+    impl<T: fmt::Debug> fmt::Debug for LazyLock<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self.cell.get() {
+                Some(value) => f.debug_tuple("LazyLock").field(value).finish(),
+                None => f.write_str("LazyLock(<uninit>)"),
+            }
+        }
     }
 }
 
@@ -3050,37 +3617,145 @@ pub mod cell {
 }
 
 pub mod thread {
-    // Threads run to completion when spawned, which is one valid interleaving.
-    pub struct JoinHandle<T> { result: Option<T> }
+    // Threads are green threads: a spawned thread runs at once, and threads switch only where one
+    // blocks, yields, or sleeps, which is one valid interleaving of the program.
+    use crate::cell::{Cell, RefCell};
+    use crate::fmt;
+    use crate::marker::PhantomData;
+
+    pub type Result<T> = crate::result::Result<T, Box<dyn crate::any::Any + Send + 'static>>;
+
+    struct Panicked;
+    impl crate::any::Any for Panicked {}
+    impl fmt::Debug for Box<dyn crate::any::Any> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("Any { .. }") }
+    }
+
+    pub struct JoinHandle<T> { id: usize, name: Option<String>, marker: PhantomData<T> }
     impl<T> JoinHandle<T> {
-        pub fn join(self) -> Result<T, Box<dyn crate::any::Any>> {
-            match self.result { Some(value) => Ok(value), None => panic!("thread result already taken") }
+        pub fn join(self) -> Result<T> {
+            match crate::green::green_join::<T>(self.id) {
+                Some(value) => Ok(value),
+                None => Err(Box::new(Panicked)),
+            }
         }
-        pub fn is_finished(&self) -> bool { true }
-        pub fn thread(&self) -> Thread { Thread { name: None } }
+        pub fn is_finished(&self) -> bool { crate::green::green_finished(self.id) }
+        pub fn thread(&self) -> Thread { Thread { id: self.id as u64, name: self.name.clone() } }
     }
-    pub fn spawn<T, F: FnOnce() -> T>(f: F) -> JoinHandle<T> { JoinHandle { result: Some(f()) } }
-    pub fn sleep(duration: crate::time::Duration) {}
-    pub fn yield_now() {}
-    pub struct Thread { name: Option<String> }
+    impl<T> fmt::Debug for JoinHandle<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("JoinHandle { .. }") }
+    }
+
+    pub fn spawn<T, F: FnOnce() -> T>(f: F) -> JoinHandle<T> {
+        JoinHandle { id: crate::green::green_spawn::<F, T>(f, String::new(), false), name: None, marker: PhantomData }
+    }
+    pub fn sleep(duration: crate::time::Duration) { crate::green::green_sleep(duration.as_nanos()) }
+    pub fn sleep_ms(ms: u32) { crate::green::green_sleep(ms as u128 * 1_000_000) }
+    pub fn yield_now() { crate::green::green_yield() }
+    pub fn park() { crate::green::green_yield() }
+    pub fn panicking() -> bool { false }
+
+    #[derive(Clone)]
+    pub struct Thread { id: u64, name: Option<String> }
     impl Thread {
-        pub fn name(&self) -> Option<&str> { None }
-        pub fn id(&self) -> ThreadId { ThreadId(1) }
+        pub fn name(&self) -> Option<&str> { self.name.as_deref() }
+        pub fn id(&self) -> ThreadId { ThreadId(self.id) }
+        pub fn unpark(&self) {}
     }
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct ThreadId(u64);
-    pub fn current() -> Thread { Thread { name: Some(String::from("main")) } }
-    pub struct Scope { marker: () }
-    pub struct ScopedJoinHandle<T> { result: Option<T> }
-    impl<T> ScopedJoinHandle<T> {
-        pub fn join(self) -> Result<T, Box<dyn crate::any::Any>> {
-            match self.result { Some(value) => Ok(value), None => panic!("thread result already taken") }
+    impl fmt::Debug for Thread {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("Thread").field("id", &ThreadId(self.id)).field("name", &self.name).finish_non_exhaustive()
         }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub struct ThreadId(u64);
+    pub fn current() -> Thread {
+        Thread { id: crate::green::green_current_id(), name: crate::green::green_current_name() }
+    }
+
+    #[derive(Debug)]
+    pub struct Builder { name: Option<String>, stack_size: Option<usize> }
+    impl Builder {
+        pub fn new() -> Builder { Builder { name: None, stack_size: None } }
+        pub fn name(self, name: String) -> Builder { Builder { name: Some(name), stack_size: self.stack_size } }
+        pub fn stack_size(self, size: usize) -> Builder { Builder { name: self.name, stack_size: Some(size) } }
+        pub fn spawn<T, F: FnOnce() -> T>(self, f: F) -> crate::io::Result<JoinHandle<T>> {
+            let named = self.name.is_some();
+            let name = self.name.clone().unwrap_or_default();
+            Ok(JoinHandle { id: crate::green::green_spawn::<F, T>(f, name, named), name: self.name, marker: PhantomData })
+        }
+        pub fn spawn_scoped<'scope, T, F: FnOnce() -> T>(self, scope: &'scope Scope, f: F) -> crate::io::Result<ScopedJoinHandle<T>> {
+            let named = self.name.is_some();
+            let name = self.name.clone().unwrap_or_default();
+            let id = crate::green::green_spawn::<F, T>(f, name, named);
+            scope.threads.borrow_mut().push(id);
+            Ok(ScopedJoinHandle { id: id, marker: PhantomData })
+        }
+    }
+
+    pub struct Scope { threads: RefCell<Vec<usize>> }
+    pub struct ScopedJoinHandle<T> { id: usize, marker: PhantomData<T> }
+    impl<T> ScopedJoinHandle<T> {
+        pub fn join(self) -> Result<T> {
+            match crate::green::green_join::<T>(self.id) {
+                Some(value) => Ok(value),
+                None => Err(Box::new(Panicked)),
+            }
+        }
+        pub fn is_finished(&self) -> bool { crate::green::green_finished(self.id) }
+        pub fn thread(&self) -> Thread { Thread { id: self.id as u64, name: None } }
     }
     impl Scope {
-        pub fn spawn<T, F: FnOnce() -> T>(&self, f: F) -> ScopedJoinHandle<T> { ScopedJoinHandle { result: Some(f()) } }
+        pub fn spawn<T, F: FnOnce() -> T>(&self, f: F) -> ScopedJoinHandle<T> {
+            let id = crate::green::green_spawn::<F, T>(f, String::new(), false);
+            self.threads.borrow_mut().push(id);
+            ScopedJoinHandle { id: id, marker: PhantomData }
+        }
     }
-    pub fn scope<T, F: FnOnce(&Scope) -> T>(f: F) -> T { f(&Scope { marker: () }) }
+    pub fn scope<T, F: FnOnce(&Scope) -> T>(f: F) -> T {
+        let scope = Scope { threads: RefCell::new(Vec::new()) };
+        let result = f(&scope);
+        let mut panicked = false;
+        let threads: Vec<usize> = scope.threads.borrow().clone();
+        for id in threads {
+            if crate::green::green_wait(id) { panicked = true; }
+        }
+        if panicked { panic!("a scoped thread panicked"); }
+        result
+    }
+
+    // The storage a `thread_local!` static names; each thread initializes its own copy on first use.
+    pub struct LocalKey<T: 'static> { init: fn() -> T }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AccessError;
+    impl fmt::Display for AccessError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("already destroyed") }
+    }
+    impl<T: 'static> LocalKey<T> {
+        pub fn new(init: fn() -> T) -> LocalKey<T> { LocalKey { init: init } }
+        pub fn with<F: FnOnce(&T) -> R, R>(&'static self, f: F) -> R { f(crate::green::green_local(self)) }
+        pub fn try_with<F: FnOnce(&T) -> R, R>(&'static self, f: F) -> crate::result::Result<R, AccessError> {
+            Ok(f(crate::green::green_local(self)))
+        }
+    }
+    impl<T: 'static> LocalKey<Cell<T>> {
+        pub fn get(&'static self) -> T where T: Copy { crate::green::green_local(self).get() }
+        pub fn set(&'static self, value: T) { crate::green::green_local(self).set(value) }
+        pub fn take(&'static self) -> T where T: Default { crate::green::green_local(self).take() }
+        pub fn replace(&'static self, value: T) -> T { crate::green::green_local(self).replace(value) }
+    }
+    impl<T: 'static> LocalKey<RefCell<T>> {
+        pub fn with_borrow<F: FnOnce(&T) -> R, R>(&'static self, f: F) -> R { f(&*crate::green::green_local(self).borrow()) }
+        pub fn with_borrow_mut<F: FnOnce(&mut T) -> R, R>(&'static self, f: F) -> R {
+            f(&mut *crate::green::green_local(self).borrow_mut())
+        }
+        pub fn set(&'static self, value: T) { *crate::green::green_local(self).borrow_mut() = value; }
+        pub fn take(&'static self) -> T where T: Default { crate::green::green_local(self).take() }
+        pub fn replace(&'static self, value: T) -> T { crate::green::green_local(self).replace(value) }
+    }
+    impl<T: 'static> fmt::Debug for LocalKey<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("LocalKey { .. }") }
+    }
 }
 
 pub mod any {
@@ -3145,6 +3820,22 @@ pub mod time {
     impl crate::ops::Sub for Instant {
         type Output = Duration;
         fn sub(self, other: Instant) -> Duration { Duration { nanos: self.nanos - other.nanos } }
+    }
+    impl crate::ops::Mul<u32> for Duration {
+        type Output = Duration;
+        fn mul(self, factor: u32) -> Duration { Duration { nanos: self.nanos * factor as u128 } }
+    }
+    impl crate::ops::Div<u32> for Duration {
+        type Output = Duration;
+        fn div(self, divisor: u32) -> Duration { Duration { nanos: self.nanos / divisor as u128 } }
+    }
+    impl crate::ops::Add<Duration> for Instant {
+        type Output = Instant;
+        fn add(self, other: Duration) -> Instant { Instant { nanos: self.nanos + other.nanos } }
+    }
+    impl crate::ops::Sub<Duration> for Instant {
+        type Output = Instant;
+        fn sub(self, other: Duration) -> Instant { Instant { nanos: self.nanos - other.nanos } }
     }
     pub struct SystemTime { nanos: u128 }
     pub const UNIX_EPOCH: SystemTime = SystemTime { nanos: 0 };
@@ -3406,4 +4097,19 @@ pub mod ascii_bytes {
 
 pub mod hint {
     pub fn black_box<T>(dummy: T) -> T { dummy }
+}
+
+// Scheduler hooks behind std::thread and std::sync, implemented in rust_in_python.py.
+pub mod green {
+    pub fn green_spawn<F, T>(f: F, name: String, named: bool) -> usize;
+    pub fn green_join<T>(id: usize) -> Option<T>;
+    pub fn green_wait(id: usize) -> bool;
+    pub fn green_finished(id: usize) -> bool;
+    pub fn green_block() -> bool;
+    pub fn green_yield();
+    pub fn green_progress();
+    pub fn green_current_id() -> u64;
+    pub fn green_current_name() -> Option<String>;
+    pub fn green_sleep(nanos: u128);
+    pub fn green_local<T>(key: &crate::thread::LocalKey<T>) -> &T;
 }

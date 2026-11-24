@@ -1,0 +1,11 @@
+0
+Result: 1000
+strong count: 1
+squares: [0, 1, 4, 9, 16]
+inside thread: 82
+final: 82
+locked while held: true
+len 3
+unlocked after scope: true
+Mutex { data: "abcdef!", poisoned: false, .. }
+abcdef!

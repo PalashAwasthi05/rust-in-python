@@ -1,0 +1,5 @@
+0
+worker signalled
+main saw started = true
+collected [0, 3, 6, 9]
+consumer summed 108

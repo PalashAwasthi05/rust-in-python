@@ -1,0 +1,14 @@
+0
+   the: 5
+   dog: 3
+   fox: 3
+     a: 2
+  lazy: 2
+ quick: 2
+segment 0 sum 70
+segment 1 sum 46
+segment 2 sum 38
+segment 3 sum 45
+segment 4 sum 50
+final sum 249
+primes per range [15, 10, 10] total 35

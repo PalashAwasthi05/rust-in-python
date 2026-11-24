@@ -1,0 +1,11 @@
+0
+main counter 2
+thread saw counter 1 log 1
+thread saw counter 2 log 1
+thread saw counter 3 log 1
+main counter still 2
+main log ["main"]
+log len 2
+after set 42
+taken 42 now 0
+depth main 10 other 1
