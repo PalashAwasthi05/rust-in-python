@@ -1,0 +1,16 @@
+0
+Ok([1, 2, 3])
+Err(ParseIntError { kind: InvalidDigit })
+Ok([])
+Ok(30)
+Err("\"2.5\": invalid digit found in string")
+Some([7, 8, 9])
+None
+good=[1, 3] bad=["invalid digit found in string", "invalid digit found in string"]
+[4, 6]
+[4, 6]
+Some(24)
+None
+Err("stopped at 4") after 4 calls
+Some(1500)
+None

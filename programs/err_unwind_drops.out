@@ -1,0 +1,9 @@
+101
+drop inner
+start with 2 values
+drop level 2
+drop level 1
+drop level 0
+drop a
+drop b
+drop outer

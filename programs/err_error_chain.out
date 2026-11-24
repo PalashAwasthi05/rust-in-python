@@ -1,0 +1,8 @@
+0
+loaded 11 bytes
+error: could not load configuration
+  caused by: failed to parse bad.toml
+    caused by: unexpected byte at offset 8
+Some("failed to parse bad.toml")
+error: unexpected byte at offset 9
+LowLevel { byte: 9 }
