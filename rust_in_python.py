@@ -3,7 +3,7 @@
 Run: python3 rust_in_python.py program.rs
 Demo: python3 rust_in_python.py --demo
 
-Supported types include i32, usize, bool, string slices, arrays, structs, and enums.
+Supported types include integers, bool, string slices, arrays, structs, and enums.
 Includes type and const generic parameters, trait and inherent implementations,
 declarative macros, and checked integer arithmetic.
 This subset checks moves, initialization, and local shared and mutable loans.
@@ -58,10 +58,20 @@ class Token:
         return RustError(f"{self.line}:{self.column}: {message}")
 
 
+INTEGER_WIDTHS = {f"{sign}{width}": width for sign in ("i", "u") for width in (8, 16, 32, 64, 128)}
+INTEGER_WIDTHS.update(isize=64, usize=64)
+INTEGER_TYPES = set(INTEGER_WIDTHS)
+INTEGER_SUFFIX = re.compile(f"(?:{'|'.join(INTEGER_WIDTHS)})$")
+INTEGER_BOUNDS = {kind: (-(1 << (width - 1)), 1 << (width - 1)) if kind.startswith("i") else (0, 1 << width)
+                  for kind, width in INTEGER_WIDTHS.items()}
+CONST_TYPES = INTEGER_TYPES | {"bool"}
+
+
 TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|"(?:(?:\\[\s\S])|[^"\\])*"|'
     r"'[A-Za-z_][A-Za-z_0-9]*|"
-    r'[0-9][0-9_]*(?:i32|usize)?|[A-Za-z_][A-Za-z_0-9]*|'
+    rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
+    r'[A-Za-z_][A-Za-z_0-9]*|'
     r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}()[\]#$?.:,;=!+*/%&<>|\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
@@ -78,11 +88,12 @@ PRECEDENCE = {
     "+": 5, "-": 5, "*": 6, "/": 6, "%": 6,
 }
 BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
-PRIMITIVES = {"i32", "usize", "bool", "&str", "()"}
-LIMIT = 2**31
-USIZE_LIMIT = 2**64
+PRIMITIVES = CONST_TYPES | {"&str", "()"}
 NEVER = "!"
-INTEGER_CONSTANTS = {"i32::MIN": -LIMIT, "i32::MAX": LIMIT - 1}
+INTEGER_CONSTANTS = {f"{kind}::{name}": (result, value)
+                     for kind, (lo, hi) in INTEGER_BOUNDS.items()
+                     for name, result, value in (("MIN", kind, lo), ("MAX", kind, hi - 1),
+                                                 ("BITS", "u32", INTEGER_WIDTHS[kind]))}
 
 
 def lex(source):
@@ -1607,7 +1618,7 @@ class Parser:
             self.expect(">")
             self.expect("::")
             return self.associated_projection(owner, trait)
-        if token.text in {"i32", "usize", "bool"}:
+        if token.text in CONST_TYPES:
             return token.text
         if token.text == "[":
             element = self.type_name(static_string=static_string, signature=signature)
@@ -1763,10 +1774,10 @@ class Parser:
             raise name.error(f"duplicate constant {name.text!r}")
         self.expect(":")
         annotation = self.type_name()
-        if annotation not in {"i32", "usize", "bool"}:
+        if annotation not in CONST_TYPES:
             raise name.error("unsupported constant type")
         self.expect("=")
-        value = self.const_expression(self.expression())
+        value = self.const_expression(self.expression(), annotation)
         if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
             raise name.error(f"expected a {annotation} constant")
         if (annotation == "bool") != value.boolean:
@@ -1932,7 +1943,7 @@ class Parser:
                     raise name.error(f"duplicate generic parameter {name.text}")
                 self.expect(":")
                 kind = self.advance()
-                if kind.text not in {"i32", "usize", "bool"}:
+                if kind.text not in CONST_TYPES:
                     raise kind.error("unsupported const parameter type")
                 types[name.text] = TypeParameter(name.text, const_type=kind.text)
             elif IDENT.fullmatch(token.text) and token.text not in RESERVED:
@@ -2413,7 +2424,7 @@ class Parser:
             local = token if self.current.text != "::" else None
             path, type_arguments = self.expression_path(token, allow_record=allow_record)
             if path.text in INTEGER_CONSTANTS:
-                return Expr("literal", path, ("i32", INTEGER_CONSTANTS[path.text]))
+                return Expr("literal", path, INTEGER_CONSTANTS[path.text])
             if path.text in self.constants:
                 constant = self.constants[path.text]
                 return Expr("literal", path, (constant.kind, constant.value))
@@ -2448,13 +2459,19 @@ class Parser:
     def literal(token, negative=False):
         word = token.text
         if word[0].isdigit():
-            kind = "usize" if word.endswith("usize") else "i32"
-            digits = word.removesuffix("usize").removesuffix("i32").replace("_", "").lstrip("0") or "0"
-            if len(digits) > 20 or int(digits) >= USIZE_LIMIT:
+            suffix = INTEGER_SUFFIX.search(word)
+            kind = suffix.group() if suffix else "i32"
+            digits = (word[:suffix.start()] if suffix else word).replace("_", "")
+            base = {"0b": 2, "0o": 8, "0x": 16}.get(digits[:2], 10)
+            if base != 10:
+                digits = digits[2:]
+            if not digits:
+                raise token.error("expected digits after the integer base prefix")
+            digits = digits.lstrip("0") or "0"
+            if len(digits) > 128 or int(digits, base) >= 1 << 128:
                 raise token.error("integer literal out of range")
-            value = int(digits)
-            return Expr("literal", token, (kind, -value if negative else value),
-                        unsuffixed=not word.endswith(("i32", "usize")))
+            value = int(digits, base)
+            return Expr("literal", token, (kind, -value if negative else value), unsuffixed=suffix is None)
         if negative:
             raise token.error("expected an integer after '-'")
         if word in {"true", "false"}:
@@ -2522,7 +2539,7 @@ class Parser:
         if parameter and parameter.const_type and not negative:
             return parameter
         literal = self.literal(token, negative=bool(negative))
-        if literal is None or literal.args[0] not in {"i32", "usize", "bool"}:
+        if literal is None or literal.args[0] not in CONST_TYPES:
             raise token.error("expected a constant value or parameter")
         kind, value = literal.args
         return ConstValue(value, None if literal.unsuffixed else kind)
@@ -2531,15 +2548,21 @@ class Parser:
         expr = ungroup(expr)
         if expr.kind == "const_value":
             return expr.args[0]
-        if expr.kind == "literal" and expr.args[0] in {"i32", "usize", "bool"}:
+        if expr.kind == "literal" and expr.args[0] in CONST_TYPES:
             kind, value = expr.args
             return ConstValue(value, None if expr.unsuffixed else kind)
         if expr.kind == "unary" and expr.token.text == "-":
             value = self.const_expression(expr.args[0], hint)
+            kind = const_kind(value) or hint
+            if kind in INTEGER_TYPES and INTEGER_BOUNDS[kind][0] == 0:
+                raise expr.token.error(f"cannot negate {kind} with '-'")
             if isinstance(value, ConstValue) and type(value.value) is int:
-                return ConstValue(-value.value, value.kind)
-            if const_kind(value) == "i32":
-                return ConstExpression("-", (value,), "i32", expr.token)
+                result = -value.value
+                if kind in INTEGER_TYPES:
+                    checked(result, expr.token, kind)
+                return ConstValue(result, value.kind)
+            if kind in INTEGER_TYPES and kind.startswith("i"):
+                return ConstExpression("-", (value,), kind, expr.token)
         if expr.kind == "binary":
             left, right = (self.const_expression(arg, hint) for arg in expr.args)
             word = expr.token.text
@@ -2559,6 +2582,10 @@ class Parser:
                 if word in COMPARE and left.boolean == right.boolean and (
                     not left.kind or not right.kind or left.kind == right.kind
                 ):
+                    if not left.boolean:
+                        kind = left.kind or right.kind or (hint if hint in INTEGER_TYPES else "i32")
+                        checked(left.value, expr.token, kind)
+                        checked(right.value, expr.token, kind)
                     return ConstValue(COMPARE[word](left.value, right.value), "bool")
                 kind = left.kind or right.kind
                 if (not left.boolean and not right.boolean and word in {*ARITHMETIC, "/", "%"}
@@ -2658,7 +2685,7 @@ class Parser:
             raise token.error("expected a pattern")
         path, type_arguments = self.expression_path(token)
         if path.text in INTEGER_CONSTANTS:
-            return Expr("literal", path, ("i32", INTEGER_CONSTANTS[path.text]))
+            return Expr("literal", path, INTEGER_CONSTANTS[path.text])
         if path.text in self.constants:
             constant = self.constants[path.text]
             return Expr("literal", path, (constant.kind, constant.value))
@@ -3032,8 +3059,8 @@ def uncovered(matrix, types, program):
                 default.append(tuple(tail))
             else:
                 explicit.append((option, tuple(tail)))
-    if annotation == "i32" and explicit:
-        return uncovered_integer(explicit, default, remaining_types, program)
+    if annotation in INTEGER_TYPES and explicit:
+        return uncovered_integer(explicit, default, annotation, remaining_types, program)
     if isinstance(annotation, SliceType) and explicit:
         return uncovered_slice(explicit, default, annotation, remaining_types, program)
     if isinstance(annotation, ArrayType) and explicit:
@@ -3092,8 +3119,8 @@ def uncovered_slice(explicit, default, annotation, types, program):
     return None
 
 
-def uncovered_integer(explicit, default, types, program):
-    boundaries = {-LIMIT, LIMIT}
+def uncovered_integer(explicit, default, annotation, types, program):
+    boundaries = set(INTEGER_BOUNDS[annotation])
     ranges = []
     for first, tail in explicit:
         tag = first.tag
@@ -3105,7 +3132,7 @@ def uncovered_integer(explicit, default, types, program):
         rows = default + [tail for interval, tail in ranges if interval.contains(value)]
         missing = uncovered(rows, types, program)
         if missing is not None:
-            return ((("i32", value), ()), *missing)
+            return (((annotation, value), ()), *missing)
     return None
 
 
@@ -3566,13 +3593,13 @@ class Checker:
             if isinstance(resolved, TypeVariable):
                 self.require(resolved, "i32", token)
                 resolved = "i32"
-            if resolved not in {"i32", "usize"}:
+            if resolved not in INTEGER_TYPES:
                 raise token.error(f"expected an integer, found {resolved}")
             checked(value, token, resolved)
         for operand, result, token in self.unary_results:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
-                if operand not in {"i32", "usize", "bool"}:
+                if operand not in CONST_TYPES:
                     raise token.error(f"cannot negate {operand} with '!'")
                 self.require(result, operand, token)
         for variable in self.variables:
@@ -3889,19 +3916,28 @@ class Checker:
             raise token.error("'..' is only allowed within a tuple, array, or record pattern")
         if kind == "literal":
             actual, value = args
-            if actual == "i32":
-                checked(value, token)
+            hint = self.resolve(annotation)
+            if expr.unsuffixed and hint in INTEGER_TYPES:
+                actual = hint
+            if actual in INTEGER_TYPES:
+                checked(value, token, actual)
             self.require(actual, annotation, token)
             return Pattern(tag=(actual, value)), {}
         if kind == "pattern_range":
-            self.require("i32", annotation, token)
             first, last, inclusive = args
+            integer = self.resolve(annotation)
+            if integer not in INTEGER_TYPES:
+                integer = next((endpoint.args[0] for endpoint in (first, last)
+                                if endpoint and not endpoint.unsuffixed and endpoint.args[0] in INTEGER_TYPES), "i32")
+            self.require(integer, annotation, token)
             for endpoint in (first, last):
                 if endpoint:
-                    self.require(endpoint.args[0], "i32", endpoint.token)
-                    checked(endpoint.args[1], endpoint.token)
-            start = first.args[1] if first else -LIMIT
-            stop = last.args[1] + int(inclusive) if last else LIMIT
+                    actual = integer if endpoint.unsuffixed else endpoint.args[0]
+                    self.require(actual, integer, endpoint.token)
+                    checked(endpoint.args[1], endpoint.token, integer)
+            lower, upper = INTEGER_BOUNDS[integer]
+            start = first.args[1] if first else lower
+            stop = last.args[1] + int(inclusive) if last else upper
             if start >= stop:
                 raise token.error("empty integer range pattern")
             return Pattern(tag=IntegerRange(start, stop)), {}
@@ -4021,11 +4057,8 @@ class Checker:
         test = "()"
         if kind == "for":
             name, mutable, start, end, _, _ = args
-            first = self.type_of(start, scope)
-            last = self.type_of(end, scope, first if first == "usize" else None)
-            integer = "usize" if "usize" in {first, last} else "i32"
-            if integer == "usize" and start.unsuffixed:
-                first = self.type_of(start, scope, integer)
+            first, last = self.operand_types(start, end, scope, same_type=True)
+            integer = self.integer_pair(first, last)
             bounds = (first, last)
             for bound in bounds:
                 self.require(bound, integer, token)
@@ -4160,23 +4193,33 @@ class Checker:
             return "()"
         if kind == "cast":
             value, target = args
-            if not isinstance(target, ReferenceType) or not isinstance(target.inner, DynType):
-                raise token.error("supported casts convert references to trait objects")
-            result = self.type_of(value, scope, target)
-            self.require_argument(result, target, token)
-            expr.kind, expr.args = "group", (value,)
-            return result
+            if isinstance(target, ReferenceType) and isinstance(target.inner, (DynType, SliceType)):
+                result = self.type_of(value, scope, target)
+                self.require_argument(result, target, token)
+                expr.kind, expr.args = "group", (value,)
+                return result
+            if target in INTEGER_TYPES:
+                hint = target if self.unsuffixed_integer(value) else None
+                actual = self.type_of(value, scope, hint)
+                if actual == NEVER:
+                    expr.kind, expr.args = "group", (value,)
+                    return NEVER
+                if actual not in CONST_TYPES:
+                    raise token.error(f"cannot cast {actual} to {target}")
+                expr.kind = "integer_cast"
+                return target
+            raise token.error("supported casts convert integers and borrowed slices or trait objects")
         if kind in {"dyn_reference", "slice_reference"}:
             return self.program.expr_types[id(expr)]
         if kind == "literal":
             annotation, value = args
             hint = self.resolve(expected)
-            if expr.unsuffixed and hint == "usize":
+            if expr.unsuffixed and hint in INTEGER_TYPES:
                 annotation = hint
             elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.integer_literal:
                 self.array_integers.append((hint, value, token))
                 return hint
-            if annotation in {"i32", "usize"}:
+            if annotation in INTEGER_TYPES:
                 checked(value, token, annotation)
             return annotation
         if kind == "const_value":
@@ -4361,20 +4404,34 @@ class Checker:
             return NEVER
         if kind == "unary":
             operand = args[0]
-            if min_literal(expr):
-                return "i32"
-            actual = self.type_of(operand, scope)
+            hint = self.resolve(expected)
+            hint = hint if hint in CONST_TYPES else None
+            literal = ungroup(operand)
+            if token.text == "-" and literal.kind == "literal" and literal.args[0] in INTEGER_TYPES:
+                kind, magnitude = literal.args
+                if literal.unsuffixed and hint in INTEGER_TYPES:
+                    kind = hint
+                lower, _ = INTEGER_BOUNDS[kind]
+                if lower < 0 and magnitude == -lower:
+                    expr.kind, expr.args = "literal", (kind, lower)
+                    expr.unsuffixed = literal.unsuffixed
+                    return kind
+            actual = self.type_of(operand, scope, hint)
+            if actual == NEVER:
+                return NEVER
             if token.text == "!" and actual == "bool":
                 return "bool"
-            if token.text == "!" and actual == "usize":
-                return "usize"
+            if actual in INTEGER_TYPES:
+                if token.text == "-" and INTEGER_BOUNDS[actual][0] == 0:
+                    raise token.error(f"cannot negate {actual} with '-'")
+                return actual
             if token.text == "!" and isinstance(actual, TypeVariable):
                 result = TypeVariable("operator result", token)
                 self.variables.append(result)
                 self.unary_results.append((actual, result, token))
                 return result
             self.numeric_operands.append((actual, "i32", token))
-            return NEVER if actual == NEVER else "i32"
+            return "i32"
         if kind == "assign":
             left, right = args
             annotation = self.type_of(left, scope)
@@ -4384,23 +4441,21 @@ class Checker:
                 raise token.error("reassigning reference bindings is unsupported")
             if isinstance(annotation, SliceType):
                 raise token.error("cannot assign an unsized slice value")
-            hint = annotation if token.text == "=" or right.unsuffixed else None
+            hint = annotation if token.text == "=" or self.unsuffixed_integer(right) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
                 self.require(actual, annotation, token)
             else:
-                integer = "usize" if annotation == "usize" or actual == "usize" else "i32"
+                integer = self.integer_pair(annotation, actual)
                 self.numeric_operands.extend(((annotation, integer, token), (actual, integer, token)))
             return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
-            hint = "bool" if token.text in {"&&", "||"} else None
-            left = self.type_of(args[0], scope, hint)
-            second_hint = left if token.text in COMPARE and left != NEVER else hint
-            if args[1].unsuffixed and left == "usize":
-                second_hint = "usize"
-            right = self.type_of(args[1], scope, second_hint)
-            if args[0].unsuffixed and right == "usize":
-                left = self.type_of(args[0], scope, "usize")
+            hint = self.resolve(expected)
+            if token.text in {"&&", "||"}:
+                hint = "bool"
+            elif hint not in INTEGER_TYPES or token.text in COMPARE:
+                hint = None
+            left, right = self.operand_types(*args, scope, hint, same_type=token.text in COMPARE)
             return self.binary_type(token, left, right)
         if kind == "call":
             return self.call_type(expr, scope, expected)
@@ -4432,6 +4487,32 @@ class Checker:
                 self.obligation(actual, "Debug" if mode == "debug" else "Display", token)
             return NEVER if kind == "panic" or NEVER in types else "()"
         raise AssertionError(kind)
+
+    @staticmethod
+    def unsuffixed_integer(expr):
+        expr = ungroup(expr)
+        if expr.kind == "unary" and expr.token.text == "-":
+            return Checker.unsuffixed_integer(expr.args[0])
+        if expr.kind == "binary" and expr.token.text in {*ARITHMETIC, "/", "%"}:
+            return all(map(Checker.unsuffixed_integer, expr.args))
+        return expr.unsuffixed
+
+    def operand_types(self, left, right, scope, hint=None, *, same_type=False):
+        left_literal, right_literal = self.unsuffixed_integer(left), self.unsuffixed_integer(right)
+        if hint is None and left_literal and not right_literal:
+            right_type = self.type_of(right, scope)
+            left_type = self.type_of(left, scope, right_type if right_type in INTEGER_TYPES else None)
+        else:
+            left_type = self.type_of(left, scope, hint if hint == "bool" or left_literal else None)
+            right_hint = left_type if left_type != NEVER else hint
+            right_type = self.type_of(right, scope, right_hint if hint == "bool" or same_type or right_literal else None)
+        return left_type, right_type
+
+    @staticmethod
+    def integer_pair(left, right):
+        if left in INTEGER_TYPES:
+            return left
+        return right if right in INTEGER_TYPES else "i32"
 
     def array_type(self, expr, scope, expected):
         kind, token, args = expr.kind, expr.token, expr.args
@@ -4805,7 +4886,7 @@ class Checker:
                 self.require(right, left, token)
                 self.obligation(left, "PartialEq" if word in {"==", "!="} else "PartialOrd", token)
             return NEVER if NEVER in {left, right} else "bool"
-        integer = "usize" if "usize" in {left, right} else "i32"
+        integer = self.integer_pair(left, right)
         self.numeric_operands.extend(((left, integer, token), (right, integer, token)))
         return NEVER if NEVER in {left, right} else integer
 
@@ -5415,7 +5496,7 @@ class Ownership:
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
             return cursor
-        if kind in {"group", "field", "unary", "deref"}:
+        if kind in {"group", "field", "unary", "deref", "integer_cast"}:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
@@ -5526,7 +5607,7 @@ class Ownership:
                 cursor = self.emit(cursor, "read", target_place, token)
             return self.emit(cursor, action, target_place, token)
         if kind == "binary":
-            if token.text in COMPARE and self.annotation(args[0]) not in {"i32", "usize", "bool"}:
+            if token.text in COMPARE and self.annotation(args[0]) not in CONST_TYPES:
                 return self.lower_comparison(args, scope, cursor)
             left, right = args
             cursor = self.lower(left, scope, cursor)
@@ -5732,29 +5813,26 @@ class Ownership:
         return cursor
 
 
-def min_literal(expr):
-    operand = expr.args[0]
-    while operand.kind == "group":
-        operand = operand.args[0]
-    return expr.token.text == "-" and operand.kind == "literal" and operand.args == ("i32", LIMIT)
-
-
-def checked(value, token, integer="i32"):
-    lower, upper = (0, USIZE_LIMIT) if integer == "usize" else (-LIMIT, LIMIT)
+def checked(value, token, integer="i32", *, runtime=False):
+    lower, upper = INTEGER_BOUNDS[integer]
     if not lower <= value < upper:
-        raise token.error(f"{integer} arithmetic overflow")
+        message = f"{integer} arithmetic overflow"
+        raise RustPanic(message) if runtime else token.error(message)
     return value
 
 
-def binary(word, left, right, token, integer="i32"):
+def binary(word, left, right, token, integer="i32", *, runtime=False):
+    if not runtime:
+        checked(left, token, integer)
+        checked(right, token, integer)
     if word in ARITHMETIC:
-        return checked(ARITHMETIC[word](left, right), token, integer)
+        return checked(ARITHMETIC[word](left, right), token, integer, runtime=runtime)
     if right == 0:
-        raise token.error("division by zero")
+        raise RustPanic("division by zero") if runtime else token.error("division by zero")
     quotient = abs(left) // abs(right)
     if (left < 0) != (right < 0):
         quotient = -quotient
-    checked(quotient, token, integer)
+    checked(quotient, token, integer, runtime=runtime)
     return quotient if word == "/" else left - quotient * right
 
 
@@ -5847,8 +5925,10 @@ class Interpreter:
             self.type_arguments = previous
 
     def default_value(self, annotation):
+        if annotation in INTEGER_TYPES:
+            return 0
         if annotation in PRIMITIVES:
-            return {"i32": 0, "usize": 0, "bool": False, "&str": "", "()": None}[annotation]
+            return {"bool": False, "&str": "", "()": None}[annotation]
         if isinstance(annotation, ArrayType):
             return ArrayValue(tuple(self.default_value(annotation.element)
                                     for _ in range(annotation.length.value)))
@@ -6105,20 +6185,25 @@ class Interpreter:
         if kind == "continue":
             raise Continue(expr.label)
         if kind == "unary":
-            if min_literal(expr):
-                return -LIMIT
             value = self.eval(args[0], scope)
+            annotation = self.program.expr_types[id(expr)]
             if token.text == "-":
-                return checked(-value, token)
-            if self.program.expr_types[id(expr)] == "usize":
-                return (USIZE_LIMIT - 1) ^ value
-            return not value if isinstance(value, bool) else ~value
+                return checked(-value, token, annotation, runtime=True)
+            if isinstance(value, bool):
+                return not value
+            lower, upper = INTEGER_BOUNDS[annotation]
+            return ~value if lower < 0 else (upper - 1) ^ value
+        if kind == "integer_cast":
+            value, target = args
+            lower, upper = INTEGER_BOUNDS[target]
+            return (int(self.eval(value, scope)) - lower) % (upper - lower) + lower
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
             address = self.address(left, scope)
             if token.text != "=":
-                value = binary(token.text[0], address.read(), value, token, self.program.expr_types[id(left)])
+                value = binary(token.text[0], address.read(), value, token,
+                               self.program.expr_types[id(left)], runtime=True)
             address.write(value)
             return None
         if kind == "binary":
@@ -6131,7 +6216,8 @@ class Interpreter:
             if token.text in COMPARE:
                 other = self.eval(right, scope)
                 return COMPARE[token.text](self.compare(value, other), 0)
-            return binary(token.text, value, self.eval(right, scope), token, self.program.expr_types[id(expr)])
+            return binary(token.text, value, self.eval(right, scope), token,
+                          self.program.expr_types[id(expr)], runtime=True)
         if kind == "call":
             values = tuple(self.eval(arg, scope) for arg in args)
             ctor = self.program.constructors.get(token.text)

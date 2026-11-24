@@ -53,7 +53,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
-- Checked `i32` arithmetic, `bool`, string literals, and `()`
+- Signed and unsigned integer widths, integer casts and ranges, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
 ## Match something

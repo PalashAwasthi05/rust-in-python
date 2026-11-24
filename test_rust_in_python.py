@@ -1197,6 +1197,29 @@ VALID = [
             assert!(matches!(a[..], [1, ..]));
         }
     """, "0 2 5 3\n2 5\n"),
+    ("integer widths, casts, bases, and const parameters", """
+        const SMALL: u8 = 100 + 100;
+        fn value<const N: u16>() -> u16 { N }
+        fn classify(n: u8) -> i32 {
+            match n { 0..=129 => 0, 130..=u8::MAX => 1 }
+        }
+        fn main() {
+            let max = u128::MAX;
+            let min: i8 = -128;
+            let min128 = -170141183460469231731687303715884105728i128;
+            let result: i64 = -4 + 0x10;
+            let sum = 3000000000 + 1u64;
+            let cast = 300i32 as u8;
+            let widened = 3000000000 as u64;
+            let bits = !0b_0000_0011u8;
+            let mut n = -1isize;
+            for x in 0..3u16 { n -= x as isize; }
+            println!("{max} {min} {min128}");
+            println!("{result} {sum} {cast} {widened} {bits} {n}");
+            println!("{} {} {} {}", SMALL, value::<0o77u16>(), classify(bits), i64::BITS);
+        }
+    """, "340282366920938463463374607431768211455 -128 -170141183460469231731687303715884105728\n"
+         "12 3000000001 44 3000000000 252 -4\n200 63 1 64\n"),
 ]
 
 INVALID = [
@@ -1754,6 +1777,21 @@ INVALID = [
         }
         fn main() {}
     """, "Item does not implement Copy"),
+    ("signed integer patterns must remain in bounds", """
+        fn classify(value: i8) -> bool { matches!(value, -129..=127) }
+        fn main() {}
+    """, "i8 arithmetic overflow"),
+    ("constant operands are checked before computing the result", """
+        const VALUE: u8 = 256u8 - 1;
+        fn main() { println!("{VALUE}"); }
+    """, "u8 arithmetic overflow"),
+    ("unsigned integer negation is invalid even for zero", """
+        const VALUE: u8 = -0;
+        fn main() { println!("{VALUE}"); }
+    """, "cannot negate u8"),
+    ("arithmetic requires matching integer widths", """
+        fn main() { let _ = 1i16 + 1i64; }
+    """, "expected i16, found i64"),
 ]
 
 
@@ -1800,15 +1838,20 @@ class InterpreterTests(unittest.TestCase):
                 fn read(data: &[i32], at: usize) -> i32 { data[at] }
                 fn main() { let a = [1, 2, 3]; println!("{}", read(&a[..1], 2)); }
             ''', encoding="utf-8")
+            overflow = folder / "overflow.rs"
+            overflow.write_text('''
+                fn increase(n: u8) -> u8 { n + 1 }
+                fn main() { println!("before"); increase(u8::MAX); }
+            ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, unsupported, panics, bounds],
+                                     capture, slices, slice_pattern, unsupported, panics, bounds, overflow],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match",
-                              "acceptance_mismatch", "runtime_match", "runtime_match"])
+                              "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
 
