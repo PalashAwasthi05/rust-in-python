@@ -254,6 +254,6 @@ Generic bodies are checked against their declared trait bounds. Const parameters
 
 Trait objects support shared and mutable references and `Box` ownership. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual macro inheritance, `#[macro_export]`, crate-root paths, and macro re-exports work within a crate. Crate dependencies and cross-crate macro hygiene remain open.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. Crate dependencies and cross-crate macro hygiene remain open.
 
 General reference types as type arguments, complete closure capture analysis and callable trait bounds, standard library coverage, Cargo integration, and native code generation remain incomplete. `Result` propagation currently requires the same error type at the call and return sites.

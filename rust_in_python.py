@@ -417,17 +417,25 @@ class MacroExpander:
         self.definitions = 0
         self.qualified = {}
         self.module_macros = {}
+        self.local_inner_macros = set()
+        self.import_module = None
 
-    def expand(self, items, inherited=None, depth=0, *, item_scope=False):
+    def expand(self, items, inherited=None, depth=0, *, item_scope=False, definitions=None):
         if depth > 64:
             raise next(flatten_trees(items), Token("macro", 1, 1)).error("macro expansion recursion limit reached")
         macros = dict(inherited or {})
+        if definitions is None:
+            definitions = {}
         result = []
         index = 0
         while index < len(items):
             item = items[index]
             if isinstance(item, Token) and item.child_module is not None:
                 self.module_macros[item.child_module] = dict(macros)
+                if self.import_module:
+                    inherited_macros = self.import_module(item.child_module)
+                    macros.update(inherited_macros)
+                    definitions.update(inherited_macros)
                 index += 1
                 continue
             if tree_text(item) == "macro_rules" and index + 3 < len(items):
@@ -435,7 +443,9 @@ class MacroExpander:
                 if tree_text(marker) != "!" or not isinstance(name, Token) or not isinstance(body, TokenGroup):
                     raise item.error("invalid macro_rules definition")
                 self.definitions += 1
-                macros[identifier_text(name.text)] = (self.definitions, self.rules(body))
+                key = identifier_text(name.text)
+                definition = self.definitions, self.rules(body), id(body) in self.local_inner_macros
+                macros[key] = definitions[key] = definition
                 result.append(replace(name, text="@macro_definition", definition=self.definitions))
                 index += 4
                 if index < len(items) and tree_text(items[index]) == ";":
@@ -456,10 +466,16 @@ class MacroExpander:
                 self.steps += 1
                 if self.steps > 10_000:
                     raise item.error("macro expansion limit reached")
-                definition, rules = macro
-                expanded = self.invoke(item, rules, items[argument].items, (definition, self.steps))
+                definition, rules, local_inner = macro
+                mark = definition, self.steps
+                expanded = self.invoke(item, rules, items[argument].items, mark)
+                if local_inner:
+                    expanded = self.qualify_inner(expanded, mark)
                 index = argument + 1
-                result.extend(self.expand(expanded, macros, depth + 1, item_scope=item_scope))
+                added = {}
+                result.extend(self.expand(expanded, macros, depth + 1, item_scope=item_scope, definitions=added))
+                macros.update(added)
+                definitions.update(added)
                 expanded_items = expose_fragments(expanded, {"item", "vis"})
                 first = next(expanded_items, None)
                 item_start = first and tree_text(first) in {
@@ -482,6 +498,20 @@ class MacroExpander:
                 item = replace(item, items=self.expand(item.items, macros, depth))
             result.append(item)
             index += 1
+        return tuple(result)
+
+    @staticmethod
+    def qualify_inner(items, mark):
+        result = []
+        for index, item in enumerate(items):
+            if (isinstance(item, Token) and is_identifier(item.text) and item.context[-1:] == (mark,)
+                    and (index == 0 or tree_text(items[index - 1]) != "::")
+                    and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
+                    and isinstance(items[index + 2], TokenGroup)):
+                result.extend((replace(item, text="crate"), replace(item, text="::")))
+            elif isinstance(item, (TokenGroup, OpaqueFragment)):
+                item = replace(item, items=MacroExpander.qualify_inner(item.items, mark))
+            result.append(item)
         return tuple(result)
 
     def rules(self, group):
@@ -805,6 +835,7 @@ class ModuleUnit:
     trait_imports: dict = field(default_factory=dict)
     glob_aliases: dict = field(default_factory=dict)
     hidden_traits: set = field(default_factory=set)
+    macro_use: bool = False
 
 
 class Modules:
@@ -864,6 +895,8 @@ class Modules:
             start = index
             kept_attributes = []
             export = False
+            local_inner = False
+            macro_use = False
             custom_path = None
             while index + 1 < len(items) and tree_text(items[index]) == "#":
                 inner = tree_text(items[index + 1]) == "!"
@@ -872,8 +905,18 @@ class Modules:
                     break
                 attribute = items[position]
                 attribute = replace(attribute, items=tuple(expose_fragments(attribute.items, {"meta"})))
-                if not inner and len(attribute.items) == 1 and tree_text(attribute.items[0]) == "macro_export":
+                if not inner and attribute.items and tree_text(attribute.items[0]) == "macro_export":
                     export = True
+                    if len(attribute.items) > 1:
+                        option = attribute.items[1]
+                        if (len(attribute.items) != 2 or not isinstance(option, TokenGroup)
+                                or option.opening.text != "("
+                                or tuple(map(tree_text, option.items)) not in {("local_inner_macros",),
+                                                                                ("local_inner_macros", ",")}):
+                            raise attribute.opening.error("unsupported macro_export option")
+                        local_inner = True
+                elif not inner and len(attribute.items) == 1 and tree_text(attribute.items[0]) == "macro_use":
+                    macro_use = True
                 elif (not inner and len(attribute.items) == 3
                       and tuple(map(tree_text, attribute.items[:2])) == ("path", "=")
                       and isinstance(attribute.items[2], Token)):
@@ -897,6 +940,8 @@ class Modules:
                 output.extend(items[start:])
                 break
             word = tree_text(items[index])
+            if macro_use and word != "mod":
+                raise items[index].error("macro_use requires a module")
             if word == "const" and index + 1 < len(items) and tree_text(items[index + 1]) == "fn":
                 end = self.item_end(items, index + 1, "fn")
                 if index + 2 >= len(items):
@@ -923,7 +968,7 @@ class Modules:
                 directory = unit.directory / symbol.path[-1] if unit.directory is not None else None
                 if custom_path is not None and unit.directory is not None:
                     directory = (unit.directory / custom_path).resolve().parent
-                child = ModuleUnit(symbol.path, directory)
+                child = ModuleUnit(symbol.path, directory, macro_use=macro_use)
                 self.units[symbol.path] = child
                 if isinstance(body, TokenGroup) and tree_text(body) == "{":
                     contents = body.items
@@ -965,7 +1010,7 @@ class Modules:
                         key = identifier_text(name.text)
                         if key in self.exported and not expanded:
                             raise name.error(f"duplicate exported macro {name.text!r}")
-                        self.exported[key] = body
+                        self.exported[key] = body, local_inner
                     output.extend(kept_attributes)
                     output.extend(items[index:end])
                 index = end
@@ -1256,29 +1301,43 @@ class Modules:
         for index in range(0, len(builtin_items), 4):
             _, _, name, body = builtin_items[index:index + 4]
             expander.definitions += 1
-            builtins[name.text] = (expander.definitions, expander.rules(body))
+            builtins[name.text] = (expander.definitions, expander.rules(body), False)
         exports = {}
-        for name, body in self.exported.items():
+        for name, (body, local_inner) in self.exported.items():
             expander.definitions += 1
-            exports[name] = (expander.definitions, expander.rules(body))
+            exports[name] = (expander.definitions, expander.rules(body), local_inner)
+            if local_inner:
+                expander.local_inner_macros.add(id(body))
         self.link_macros(exports)
         self.link_imports(strict=False)
         self.link_macros(exports)
         pending = deque(self.units)
-        visited = set()
-        while pending:
-            path = pending.popleft()
-            if path in visited:
-                continue
-            visited.add(path)
+        declared = {}
+
+        def expand_unit(path):
+            if path in declared:
+                return declared[path]
+            definitions = declared[path] = {}
             unit = self.units[path]
             macros = builtins | expander.module_macros.get(unit.path, {})
             macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
                            for item in unit.imports if self.is_macro_import(unit, item)})
+            previous = expander.qualified
             expander.qualified = self.macro_qualifiers(unit)
-            expanded = expander.expand(unit.items, macros, item_scope=True)
+            try:
+                expanded = expander.expand(unit.items, macros, item_scope=True, definitions=definitions)
+            finally:
+                expander.qualified = previous
             unit.items = self.scan(unit, expanded, expanded=True)
-            pending.extend(path for path in self.units if path not in visited)
+            return definitions
+
+        expander.import_module = lambda path: expand_unit(path) if self.units[path].macro_use else {}
+        while pending:
+            path = pending.popleft()
+            if path in declared:
+                continue
+            expand_unit(path)
+            pending.extend(path for path in self.units if path not in declared)
         self.link_imports()
         self.alias_names = {symbol.name for unit in self.units.values()
                             for symbol in unit.symbols.values() if symbol.kind == "type"}

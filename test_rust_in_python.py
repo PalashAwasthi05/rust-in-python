@@ -15,6 +15,41 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("local inner macros use the defining crate's exported helpers", """
+        mod provider {
+            #[macro_export]
+            macro_rules! helper {
+                () => { 7 };
+            }
+            #[macro_export(local_inner_macros)]
+            macro_rules! calculate {
+                ($input:expr) => { helper!() + ($input) };
+            }
+        }
+        mod caller {
+            macro_rules! helper {
+                () => { 5 };
+            }
+            pub fn value() -> i32 { crate::calculate!(helper!()) }
+        }
+        fn main() { println!("{}", caller::value()); }
+    """, "12\n"),
+    ("macro_use imports module and generated macros at their textual positions", """
+        macro_rules! inherited { () => { 3 }; }
+        #[macro_use]
+        mod helpers {
+            #[macro_use]
+            mod more { macro_rules! extra { () => { 5 }; } }
+            macro_rules! combined { () => { inherited!() + extra!() }; }
+        }
+        macro_rules! introduce {
+            () => { macro_rules! generated { () => { 9 }; } };
+        }
+        fn main() {
+            introduce!();
+            println!("{} {} {}", combined!(), extra!(), generated!());
+        }
+    """, "8 5 9\n"),
     ("main can propagate a result and terminate successfully", """
         #[derive(Debug)]
         struct Failure(u8);
@@ -2079,6 +2114,12 @@ VALID = [
 ]
 
 INVALID = [
+    ("macro_use does not import macros before the module declaration", """
+        fn too_soon() { helper!(); }
+        #[macro_use]
+        mod helpers { macro_rules! helper { () => {}; } }
+        fn main() {}
+    """, "unknown macro 'helper'"),
     ("main requires the termination trait", """
         fn main() -> i32 { 1 }
     """, "does not implement .*Termination"),
