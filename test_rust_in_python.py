@@ -1431,6 +1431,35 @@ VALID = [
             println!("{} {} {} {} {} {} {}", aggregate.1.0, header, pair.1, left, right, score, v);
         }
     """, "4 2 7 3 7 9 8\n"),
+    ("vectors use two-phase borrowing, runtime lengths, and borrowed slices", """
+        #[derive(Clone, Debug, PartialEq)]
+        struct Row(i32);
+        struct Tree { children: Vec<Tree> }
+        fn view(values: &Vec<u8>) -> &[u8] { values.as_slice() }
+        fn sum(values: &[u8]) -> u8 { values[0] + values[1] }
+        fn main() {
+            let mut a = Vec::new();
+            a.push(1usize);
+            a.push(a.len() + 1);
+            println!("{a:?} {:?}", a.pop());
+            let mut rows = vec![Row(4); a.len() + 1];
+            rows[0].0 = 3;
+            println!("{rows:?}");
+            let mut values: std::vec::Vec<u8> = vec![7, 8, 9,];
+            let old = values.clone();
+            values.as_mut_slice()[1] = 4;
+            println!("{} {} {old:?}", sum(view(&values)), sum(&values));
+            values.truncate(2);
+            values.clear();
+            println!("{} {:?}", values.is_empty(), values.pop());
+            let node = Tree { children: vec![] };
+            println!("{}", node.children.len());
+        }
+    """, "[1] Some(2)\n[Row(3), Row(4)]\n11 11 [7, 8, 9]\ntrue None\n0\n"),
+    ("local macro definitions can shadow the prelude vector macro", """
+        macro_rules! vec { () => { 7i32 }; }
+        fn main() { println!("{}", vec!()); }
+    """, "7\n"),
 ]
 
 INVALID = [
@@ -2099,6 +2128,24 @@ INVALID = [
     ("at binding names cannot repeat inside the subpattern", """
         fn main() { let _x @ (_x, _) = (1, 2); }
     """, "duplicate pattern binding"),
+    ("a borrowed vector slice keeps its heap storage immutable", """
+        fn main() {
+            let mut values = vec![1, 2];
+            let slice = values.as_slice();
+            values.push(3);
+            println!("{slice:?}");
+        }
+    """, "immutably borrowed"),
+    ("mutating a vector requires a mutable place", """
+        fn main() { let v = vec![1]; v.push(2); }
+    """, "cannot borrow immutable place"),
+    ("repeating a vector element requires Clone", """
+        struct Item(i32);
+        fn main() { let _ = vec![Item(1); 2]; }
+    """, "Item does not implement Clone"),
+    ("using a moved vector is rejected", """
+        fn main() { let a = vec![1]; let b = a; println!("{a:?} {b:?}"); }
+    """, "use of moved value 'a'"),
 ]
 
 
@@ -2161,12 +2208,18 @@ class InterpreterTests(unittest.TestCase):
                     println!("{value}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "heap_vector.rs"
-            unsupported.write_text('''
+            vector = folder / "heap_vector.rs"
+            vector.write_text('''
                 fn main() {
                     let mut values = vec![1, 2];
                     values.push(3);
                     println!("{values:?}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "for_iterator.rs"
+            unsupported.write_text('''
+                fn main() {
+                    for n in vec![1, 2, 3] { println!("{n}"); }
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2188,14 +2241,14 @@ class InterpreterTests(unittest.TestCase):
             ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, unsupported, panics,
-                                     bounds, overflow, shift],
+                                     capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
+                                     unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match", "acceptance_mismatch",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")

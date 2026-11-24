@@ -311,6 +311,13 @@ class MacroExpander:
                         and index < len(items) and tree_text(items[index]) == ";"):
                     index += 1
                 continue
+            if (tree_text(item) == "vec" and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
+                    and isinstance(items[index + 2], TokenGroup)):
+                group = items[index + 2]
+                result.append(replace(item, text="@vec"))
+                result.append(replace(group, items=self.expand(group.items, macros, depth)))
+                index += 3
+                continue
             if isinstance(item, (TokenGroup, OpaqueFragment)):
                 item = replace(item, items=self.expand(item.items, macros, depth))
             result.append(item)
@@ -480,7 +487,8 @@ class MacroExpander:
 MODULE_SEPARATOR = "§"
 OPTION = MODULE_SEPARATOR.join(("core", "option", "Option"))
 RESULT = MODULE_SEPARATOR.join(("core", "result", "Result"))
-PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT}
+VEC = MODULE_SEPARATOR.join(("alloc", "vec", "Vec"))
+PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
 macro_rules! assert {
@@ -802,14 +810,16 @@ class Modules:
     def prelude(path, token):
         head, *tail = path
         if head in {"std", "core"} and len(tail) >= 2:
+            crate = head
             module, head, *tail = tail
             if (module, head) not in {("option", "Option"), ("result", "Result")}:
-                return None
+                if (crate, module, head) != ("std", "vec", "Vec"):
+                    return None
         if head in PRELUDE_TYPES and len(tail) <= 1:
             parts = tuple(PRELUDE_TYPES[head].split(MODULE_SEPARATOR))
             if tail:
                 return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{tail[0]}"), "associated", (), token)
-            return ModuleSymbol(parts, "enum", (), token)
+            return ModuleSymbol(parts, "struct" if head == "Vec" else "enum", (), token)
         if head in PRELUDE_VARIANTS and not tail:
             parts = tuple(PRELUDE_VARIANTS[head].split(MODULE_SEPARATOR))
             return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{head}"), "associated", (), token)
@@ -1119,6 +1129,10 @@ class AppliedType:
         return f"{self.name}<{', '.join(map(str, self.arguments))}>"
 
 
+def is_vector(annotation):
+    return isinstance(annotation, AppliedType) and annotation.name == VEC
+
+
 @dataclass(frozen=True)
 class ConstValue:
     value: int | bool | Character
@@ -1426,6 +1440,7 @@ class Program:
             self.constructors.update({ctor.path: ctor for ctor in constructors})
         self.derives[OPTION]["Default"] = self.types[OPTION][0]
         self.default_variants[OPTION] = f"{OPTION}::None"
+        self.type_parameters[VEC] = (TypeParameter("T"),)
 
     def projection_trait(self, annotation):
         if annotation.trait:
@@ -1557,6 +1572,11 @@ class Program:
                 return not annotation.mutable
             return trait != "Default" and self.implements(annotation.inner, trait, assumed)
         if isinstance(annotation, AppliedType):
+            if annotation.name == VEC:
+                return trait == "Default" or (
+                    trait in {"Clone", "Debug", "PartialEq", "Eq", "PartialOrd", "Ord"}
+                    and self.implements(annotation.arguments[0], trait, assumed)
+                )
             if trait == "Default" and annotation.name in self.default_variants:
                 return True
             return (trait in self.derives.get(annotation.name, {})
@@ -2411,6 +2431,20 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word == "@vec":
+            close = DELIMITERS[self.advance().text]
+            if self.accept(close):
+                return Expr("vector", token)
+            first = self.expression()
+            if self.accept(";"):
+                count = self.expression()
+                self.expect(close)
+                return Expr("vector_repeat", token, (first, count))
+            elements = [first]
+            while self.accept(",") and self.current.text != close:
+                elements.append(self.expression())
+            self.expect(close)
+            return Expr("vector", token, tuple(elements))
         if word in {"|", "||"} or word == "move" and self.current.text in {"|", "||"}:
             return self.closure(token, self.advance().text if word == "move" else word)
         if word == "<":
@@ -3042,7 +3076,7 @@ def place_root(expr):
 def reference_source(expr):
     expr = ungroup(expr)
     return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference",
-                         "slice_reference", "byte_string"} or (
+                         "slice_reference", "byte_string", "vector_method"} or (
         expr.kind == "block" and not expr.label
     )
 
@@ -4026,11 +4060,10 @@ class Checker:
         for ctor in self.program.types[name][1]:
             for _, kind in ctor.fields:
                 self.check_type(kind, token)
-                for part in self.type_parts(kind):
+                for part in self.type_parts(kind, inline_only=True):
                     if part in self.program.types:
                         self.check_layout(part, token, visiting, finished)
-                    if isinstance(part, TypeParameter):
-                        used.add(part)
+                used.update(part for part in self.type_parts(kind) if isinstance(part, TypeParameter))
         for param in self.program.type_parameters[name]:
             if param not in used and not param.const_type:
                 raise token.error(f"unused type parameter {param}")
@@ -4038,17 +4071,18 @@ class Checker:
         finished.add(name)
 
     @staticmethod
-    def type_parts(annotation):
+    def type_parts(annotation, *, inline_only=False):
         if isinstance(annotation, AppliedType):
             yield annotation.name
-            for argument in annotation.arguments:
-                yield from Checker.type_parts(argument)
+            if not (inline_only and annotation.name == VEC):
+                for argument in annotation.arguments:
+                    yield from Checker.type_parts(argument, inline_only=inline_only)
         elif isinstance(annotation, ArrayType):
-            yield from Checker.type_parts(annotation.element)
+            yield from Checker.type_parts(annotation.element, inline_only=inline_only)
             yield annotation.length
         elif isinstance(annotation, TupleType):
             for kind in annotation.elements:
-                yield from Checker.type_parts(kind)
+                yield from Checker.type_parts(kind, inline_only=inline_only)
         else:
             yield annotation
 
@@ -4357,8 +4391,9 @@ class Checker:
                 or (expected.mutable and not actual.mutable)):
             return actual
         target = expected.inner
-        if isinstance(target, SliceType) and isinstance(actual.inner, ArrayType):
-            self.require(actual.inner.element, target.element, expr.token)
+        if isinstance(target, SliceType) and (isinstance(actual.inner, ArrayType) or is_vector(actual.inner)):
+            element = actual.inner.arguments[0] if is_vector(actual.inner) else actual.inner.element
+            self.require(element, target.element, expr.token)
             conversion = "slice_reference"
         elif isinstance(target, DynType):
             self.check_dyn(target, expr.token)
@@ -4464,8 +4499,8 @@ class Checker:
             return ReferenceType(ArrayType("u8", ConstValue(len(args), "usize")), False, "'static")
         if kind == "const_value":
             return args[0].const_type
-        if kind in {"array", "array_repeat"}:
-            return self.array_type(expr, scope, expected)
+        if kind in {"array", "array_repeat", "vector", "vector_repeat"}:
+            return self.sequence_type(expr, scope, expected)
         if kind == "tuple":
             hint = self.resolve(expected)
             types = hint.elements if isinstance(hint, TupleType) and len(hint.elements) == len(args) else (None,) * len(args)
@@ -4484,7 +4519,7 @@ class Checker:
                 base = Expr("deref", base.token, (base, False))
                 expr.args = (base, *bounds)
                 annotation = self.type_of(base, scope)
-            if annotation != NEVER and not isinstance(annotation, (ArrayType, SliceType)):
+            if annotation != NEVER and not (isinstance(annotation, (ArrayType, SliceType)) or is_vector(annotation)):
                 raise token.error(f"cannot index {annotation}")
             diverges = annotation == NEVER
             for index in (bounds if kind == "index" else bounds[:2]):
@@ -4494,7 +4529,8 @@ class Checker:
                     diverges |= actual == NEVER
             if diverges:
                 return NEVER
-            return annotation.element if kind == "index" else SliceType(annotation.element)
+            element = annotation.arguments[0] if is_vector(annotation) else annotation.element
+            return element if kind == "index" else SliceType(element)
         if kind == "default":
             return self.program.expr_types[id(expr)]
         if kind == "method":
@@ -4762,10 +4798,16 @@ class Checker:
             return left
         return right if right in INTEGER_TYPES else "i32"
 
-    def array_type(self, expr, scope, expected):
+    def sequence_type(self, expr, scope, expected):
         kind, token, args = expr.kind, expr.token, expr.args
         expected = self.resolve(expected)
-        element = expected.element if isinstance(expected, (ArrayType, SliceType)) else None
+        vector = kind in {"vector", "vector_repeat"}
+        if isinstance(expected, SliceType) or (not vector and isinstance(expected, ArrayType)):
+            element = expected.element
+        elif vector and is_vector(expected):
+            element = expected.arguments[0]
+        else:
+            element = None
         if args and args[0].unsuffixed and (element is None or isinstance(element, TypeVariable)):
             literal = TypeVariable("integer literal", token, integer_literal=True)
             self.variables.append(literal)
@@ -4773,7 +4815,15 @@ class Checker:
                 self.require(literal, element, token)
             element = literal
         diverges = False
-        if kind == "array_repeat":
+        if kind == "vector_repeat":
+            value, count = args
+            element = self.type_of(value, scope, element)
+            count_type = self.type_of(count, scope, "usize")
+            self.require(count_type, "usize", count.token)
+            self.obligation(element, "Clone", token)
+            diverges = NEVER in {element, count_type}
+            length = None
+        elif kind == "array_repeat":
             value, length = args
             element = self.type_of(value, scope, element)
             if not isinstance(length, ConstValue) or length.value > 1:
@@ -4790,11 +4840,11 @@ class Checker:
                     else:
                         self.require(found, element, value.token)
             if element is None and not diverges:
-                element = TypeVariable("array element", token)
+                element = TypeVariable("vector element" if vector else "array element", token)
                 self.variables.append(element)
         if diverges:
             return NEVER
-        result = ArrayType(element, length)
+        result = AppliedType(VEC, (element,)) if vector else ArrayType(element, length)
         self.check_type(result, token)
         if expected is not None and not isinstance(expected, SliceType):
             self.require(result, expected, token)
@@ -4815,6 +4865,12 @@ class Checker:
             if trait:
                 return self.trait_call(expr, scope, expected, owner, trait, token.text)
             return self.call_on_type(expr, scope, expected, owner, token.text)
+        if token.text == f"{VEC}::new":
+            owner = None
+            if expr.type_arguments is not None:
+                arguments = self.specialize(self.program.type_parameters[VEC], expr.type_arguments, token)
+                owner = AppliedType(VEC, tuple(arguments.values()))
+            return self.vector_constructor(expr, scope, owner or expected)
         ctor = self.program.constructors.get(token.text)
         if ctor and ctor.style == "tuple":
             ctor = self.constructor(expr, "tuple", expected)
@@ -4967,12 +5023,14 @@ class Checker:
             result = self.prelude_method(expr, scope, original, actual, base, rest)
             if result is not None:
                 return result
-        if isinstance(base, (ArrayType, SliceType)) and name in {"len", "is_empty"} and not rest:
+        if (isinstance(base, (ArrayType, SliceType)) or is_vector(base)) and name in {"len", "is_empty"} and not rest:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", expr.token, (original, False))
                 self.type_of(original, scope)
             expr.kind, expr.args = ("length" if name == "len" else name), (original,)
             return "usize" if name == "len" else "bool"
+        if is_vector(base) and name in {"push", "pop", "clear", "truncate", "as_slice", "as_mut_slice"}:
+            return self.vector_method(expr, scope, expected, actual, base)
         # There can be multiple inherent impl blocks on one target.
         for impl in self.program.impls:
             if impl.trait or name not in impl.methods:
@@ -5030,6 +5088,37 @@ class Checker:
             if actual == NEVER:
                 return NEVER
         return self.resolve(result)
+
+    def vector_constructor(self, expr, scope, expected):
+        if expr.args:
+            raise expr.token.error("Vec::new takes no arguments")
+        expr.kind = "vector"
+        return self.sequence_type(expr, scope, expected)
+
+    def vector_method(self, expr, scope, expected, actual, base):
+        name = expr.token.text
+        original, *rest = expr.args
+        element = base.arguments[0]
+        mutable = name != "as_slice"
+        receiver = ReferenceType(base, mutable)
+        if not isinstance(actual, ReferenceType):
+            original = Expr("borrow", expr.token, (original, mutable), auto_borrow=True)
+            actual = self.type_of(original, scope)
+        if expr.type_arguments is not None:
+            raise expr.token.error(f"{name} takes no type arguments")
+        params = (receiver, element) if name == "push" else (receiver, "usize") if name == "truncate" else (receiver,)
+        if name == "pop":
+            result = AppliedType(OPTION, (element,))
+        elif name in {"as_slice", "as_mut_slice"}:
+            result = ReferenceType(SliceType(element), mutable)
+        else:
+            result = "()"
+        expr.kind, expr.args = "vector_method", (original, *rest)
+        checked_result = self.check_call(expr, scope, expected, params, result, {}, actual)
+        if isinstance(result, ReferenceType):
+            self.program.call_functions[id(expr)] = Function(
+                expr.token, [(expr.token, False, receiver)], result, None, (0,))
+        return checked_result
 
     def trait_available(self, base, name, token):
         if isinstance(base, DynType):
@@ -5106,6 +5195,8 @@ class Checker:
         return self.function_call(expr, scope, expected, trait.methods[name], {trait.self_type: owner}, first)
 
     def call_on_type(self, expr, scope, expected, owner, name):
+        if is_vector(owner) and name == "new":
+            return self.vector_constructor(expr, scope, owner)
         for impl in self.program.impls:
             if impl.trait is not None or name not in impl.methods:
                 continue
@@ -5539,7 +5630,7 @@ class Ownership:
         if expr.kind in {"dyn_reference", "slice_reference"}:
             return self.lower_reference(expr.args[0], scope, cursor, reborrow=reborrow,
                                         two_phase=two_phase, extend_to=extend_to)
-        if expr.kind in {"call", "indirect_call"}:
+        if expr.kind in {"call", "indirect_call", "vector_method"}:
             return self.lower_call(expr, scope, cursor)
         if expr.kind == "byte_string":
             place = Place(Local(expr.token, False, static=True))
@@ -5777,7 +5868,7 @@ class Ownership:
                 if item is not None:
                     cursor = self.lower(item, scope, cursor)
             return cursor
-        if kind in {"array", "tuple", "index", "array_repeat"}:
+        if kind in {"array", "tuple", "index", "array_repeat", "vector", "vector_repeat"}:
             for item in (args[:1] if kind == "array_repeat" else args):
                 cursor = self.lower(item, scope, cursor)
             return cursor
@@ -5893,7 +5984,7 @@ class Ownership:
             for _, value in args[0]:
                 cursor = self.lower(value, scope, cursor)
             return cursor
-        if kind in {"call", "indirect_call"}:
+        if kind in {"call", "indirect_call", "vector_method"}:
             cursor, _ = self.lower_call(expr, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
         if kind in {"print", "panic"}:
@@ -6277,6 +6368,8 @@ class Interpreter:
         if isinstance(annotation, ArrayType):
             return ArrayValue(tuple(self.default_value(annotation.element)
                                     for _ in range(annotation.length.value)))
+        if is_vector(annotation):
+            return ArrayValue(())
         constructors = self.program.layout(annotation)[1]
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         path = self.program.default_variants.get(name)
@@ -6383,6 +6476,26 @@ class Interpreter:
             if actual == "Err":
                 message += f": {display(value.fields[0], True)}"
             raise RustPanic(message)
+        if kind == "vector_method":
+            address = self.eval(args[0], scope)
+            if token.text in {"as_slice", "as_mut_slice"}:
+                return address
+            arguments = tuple(self.eval(arg, scope) for arg in args[1:])
+            items = address.read().items
+            if token.text == "push":
+                address.write(ArrayValue((*items, arguments[0])))
+            elif token.text == "clear":
+                address.write(ArrayValue(()))
+            elif token.text == "truncate":
+                address.write(ArrayValue(items[:arguments[0]]))
+            elif token.text == "pop":
+                annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+                variant = "Some" if items else "None"
+                ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path.endswith(f"::{variant}"))
+                if items:
+                    address.write(ArrayValue(items[:-1]))
+                return Value(ctor, items[-1:])
+            return None
         if kind == "macro_definition":
             scope.remember(token)
             return None
@@ -6400,16 +6513,16 @@ class Interpreter:
             return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
             return substitute(args[0], self.type_arguments).value
-        if kind == "array":
+        if kind in {"array", "vector"}:
             return ArrayValue(tuple(self.eval(item, scope) for item in args))
         if kind == "tuple":
             fields = tuple(self.eval(item, scope) for item in args)
             kind = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
             return Value(self.program.layout(kind)[1][0], fields)
-        if kind == "array_repeat":
+        if kind in {"array_repeat", "vector_repeat"}:
             value, length = args
             item = self.eval(value, scope)
-            count = substitute(length, self.type_arguments).value
+            count = self.eval(length, scope) if kind == "vector_repeat" else substitute(length, self.type_arguments).value
             if count > 1_000_000:
                 raise token.error("array exceeds interpreter allocation limit")
             return ArrayValue((item,) * count)
