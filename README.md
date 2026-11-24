@@ -65,7 +65,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Borrowed strings with lifetime checking, UTF-8 substring views, and `chars` and `bytes` iterators
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `f32` and `f64` arithmetic, comparisons, casts, and selected float methods
-- `println!` with display, debug, and named placeholders
+- `format!`, printing macros, named and positional arguments, and numeric width and precision
 
 ## Match something
 

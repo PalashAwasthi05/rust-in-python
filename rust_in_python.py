@@ -1493,7 +1493,7 @@ class Program:
     traits_in_scope: dict = field(default_factory=dict)
     values_in_scope: dict = field(default_factory=dict)
     constants_in_scope: dict = field(default_factory=dict)
-    format_constants: dict = field(default_factory=dict)
+    formats: dict = field(default_factory=dict)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2659,12 +2659,12 @@ class Parser:
                     raise self.current.error("expected a macro delimiter")
                 if word in {"panic", "unreachable", "unimplemented", "todo"}:
                     return Expr("panic", token, self.arguments(opening))
-                if word != "println":
-                    if not self.fragment:
-                        raise token.error(f"unknown macro {word!r}")
-                    self.skip_group()
-                    return Expr("literal", token, ("i32", 0))
-                return Expr("print", token, self.arguments(opening))
+                if word in {"println", "print", "eprintln", "eprint", "format"}:
+                    return Expr("format" if word == "format" else "print", token, self.arguments(opening))
+                if not self.fragment:
+                    raise token.error(f"unknown macro {word!r}")
+                self.skip_group()
+                return Expr("literal", token, ("i32", 0))
             local = token if self.current.text != "::" else None
             path, type_arguments = self.expression_path(token, allow_record=allow_record)
             if path.text in SCALAR_CONSTANTS:
@@ -3547,7 +3547,67 @@ def show_missing(witness):
     return f"{tag.path} {{ {entries} }}" if entries else f"{tag.path} {{}}"
 
 
-PLACEHOLDER = re.compile(r'\{([A-Za-z_][A-Za-z_0-9]*)?(?::(\?))?\}')
+FORMAT_SPECIFICATION = re.compile(
+    r"(?:(?P<fill>[^{}])(?P<filled_alignment>[<^>])|(?P<alignment>[<^>]))?"
+    r"(?P<sign>[+-])?(?P<alternate>#)?(?P<zero>0(?!\$))?"
+    r"(?P<width>(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]+)\$|[0-9]+)?"
+    r"(?:\.(?P<precision>(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]+)\$|[0-9]+|\*))?(?P<kind>[?boxXeE])?"
+)
+
+
+@dataclass(frozen=True)
+class FormatCount:
+    argument: object
+
+
+@dataclass(frozen=True)
+class FormatSpec:
+    kind: str
+    fill: str
+    align: str | None
+    sign: str | None
+    alternate: bool
+    zero: bool
+    width: int | FormatCount
+    precision: int | FormatCount | None
+
+
+@dataclass(frozen=True)
+class FormatField:
+    argument: object
+    spec: FormatSpec
+    annotation: object = None
+
+
+def parse_format_field(text, token):
+    argument, _, specification = text.partition(":")
+    argument = argument.rstrip()
+    if argument and not (IDENT.fullmatch(argument) or re.fullmatch(r"[0-9]+", argument)):
+        raise token.error("unsupported format argument")
+    match = FORMAT_SPECIFICATION.fullmatch(specification.rstrip())
+    if not match:
+        raise token.error("unsupported format specification")
+    fields = match.groupdict()
+    try:
+        width = parse_format_count(fields["width"], 0)
+        precision = parse_format_count(fields["precision"], None)
+        argument = int(argument) if argument.isdecimal() else argument or None
+    except ValueError:
+        raise token.error("format argument is out of range") from None
+    spec = FormatSpec(fields["kind"] or "", fields["fill"] or " ", fields["filled_alignment"] or fields["alignment"],
+                      fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision)
+    return FormatField(argument, spec)
+
+
+def parse_format_count(value, default):
+    if value is None:
+        return default
+    if value == "*":
+        return FormatCount(None)
+    if value.endswith("$"):
+        argument = value[:-1]
+        return FormatCount(int(argument) if argument.isdecimal() else argument)
+    return int(value)
 
 
 def format_parts(text, token):
@@ -3563,15 +3623,16 @@ def format_parts(text, token):
             literal.append(char)
             index += 2
         else:
-            parts.append(("text", "".join(literal)))
-            literal.clear()
-            match = PLACEHOLDER.match(text, index)
-            if not match:
+            end = text.find("}", index + 1)
+            if char != "{" or end < 0:
                 raise token.error("unsupported format placeholder")
-            name, debug = match.groups()
-            parts.append(("debug" if debug else "display", name))
-            index = match.end()
-    parts.append(("text", "".join(literal)))
+            if literal:
+                parts.append("".join(literal))
+                literal.clear()
+            parts.append(parse_format_field(text[index + 1:end], token))
+            index = end + 1
+    if literal:
+        parts.append("".join(literal))
     return parts
 
 
@@ -4012,6 +4073,18 @@ class Checker:
         for variable in self.variables:
             if isinstance(self.resolve(variable), TypeVariable):
                 raise variable.token.error(f"type annotations needed for {variable.name}")
+        for key, (token, parts) in self.program.formats.items():
+            resolved = []
+            for field in parts:
+                if isinstance(field, FormatField):
+                    annotation = self.resolve(field.annotation)
+                    if annotation != NEVER and field.spec.kind in {"b", "o", "x", "X"} and annotation not in INTEGER_TYPES:
+                        raise token.error(f"base formatting requires an integer, found {annotation}")
+                    if annotation != NEVER and field.spec.kind in {"e", "E"} and annotation not in NUMBER_TYPES:
+                        raise token.error(f"exponent formatting requires a number, found {annotation}")
+                    field = replace(field, annotation=annotation)
+                resolved.append(field)
+            self.program.formats[key] = token, tuple(resolved)
         for function in self.closures:
             function.captures = tuple(replace(capture, annotation=self.resolve(capture.annotation))
                                       for capture in function.captures)
@@ -5000,45 +5073,106 @@ class Checker:
             return self.binary_type(token, left, right)
         if kind == "call":
             return self.call_type(expr, scope, expected)
-        if kind in {"print", "panic"}:
-            if not args:
-                return NEVER if kind == "panic" else "()"
-            template, *values = args
-            template = ungroup(template)
-            expr.args = (template, *values)
-            if template.kind != "literal" or not is_str_reference(template.args[0]):
-                raise template.token.error("println! requires a format string literal")
-            parts = format_parts(template.args[1], template.token)
-            placeholders = [(mode, name) for mode, name in parts if mode != "text"]
-            if sum(name is None for _, name in placeholders) != len(values):
-                raise token.error("println! argument count does not match format string")
-            types = [self.type_of(value, scope) for value in values]
-            positional = iter(types)
-            for mode, name in placeholders:
-                if name:
-                    name_token = replace(template.token, text=name)
-                    binding = self.local_binding(scope, name_token)
-                    if binding is not None:
-                        actual = binding.value
-                    else:
-                        parameter = self.parameters.get(name)
-                        constant = parameter if parameter and parameter.const_type else (
-                            self.program.constants_in_scope.get(template.token.module, {}).get(name))
-                        if constant is None:
-                            raise name_token.error(f"unknown binding {name!r}")
-                        actual = const_kind(constant)
-                        self.program.format_constants.setdefault(id(expr), {})[name] = constant
-                else:
-                    actual = next(positional)
-                if isinstance(actual, ReferenceType):
-                    actual = actual.inner
-                elif isinstance(actual, SliceType) or actual == "str":
-                    raise token.error("formatting an unsized slice requires a reference")
-                if mode == "display" and actual == "()":
-                    raise token.error("() requires debug formatting")
-                self.obligation(actual, "Debug" if mode == "debug" else "Display", token)
-            return NEVER if kind == "panic" or NEVER in types else "()"
+        if kind in {"print", "panic", "format"}:
+            return self.format_type(expr, scope)
         raise AssertionError(kind)
+
+    def format_type(self, expr, scope):
+        kind, token, args = expr.kind, expr.token, expr.args
+        if not args:
+            if kind == "panic":
+                return NEVER
+            if token.text in {"println", "eprintln"}:
+                return "()"
+            raise token.error("expected a format string literal")
+        template = ungroup(args[0])
+        if template.kind != "literal" or not is_str_reference(template.args[0]):
+            raise template.token.error(f"{token.text}! requires a format string literal")
+        values, named = [], {}
+        for value in args[1:]:
+            if value.kind == "assign" and value.token.text == "=" and value.args[0].kind == "name":
+                name, value = value.args
+                if name.token.text in named:
+                    raise name.token.error(f"duplicate format argument {name.token.text!r}")
+                named[name.token.text] = len(values)
+            else:
+                if named:
+                    raise value.token.error("positional format arguments must precede named arguments")
+            values.append(value)
+        expr.args = (template, *values)
+        used = set()
+        next_position = 0
+
+        def argument_index(argument):
+            nonlocal next_position
+            if argument is None:
+                argument = next_position
+                next_position += 1
+            if isinstance(argument, str) and argument in named:
+                argument = named[argument]
+            if isinstance(argument, int):
+                if argument >= len(values):
+                    raise token.error("format argument count does not match format string")
+                used.add(argument)
+            return argument
+
+        counts = {}
+        parts = []
+        for field in format_parts(template.args[1], template.token):
+            if isinstance(field, str):
+                parts.append(field)
+                continue
+            changes = {}
+            for dimension in ("width", "precision"):
+                count = getattr(field.spec, dimension)
+                if isinstance(count, FormatCount):
+                    argument = argument_index(count.argument)
+                    counts[argument] = None
+                    changes[dimension] = FormatCount(argument)
+            parts.append(replace(field, argument=argument_index(field.argument), spec=replace(field.spec, **changes)))
+        if len(used) != len(values):
+            raise token.error("unused format argument")
+        types = [self.type_of(value, scope, "usize" if index in counts else None) for index, value in enumerate(values)]
+        resolved_counts = {}
+        for argument in counts:
+            resolved, actual = self.format_argument_type(argument, types, template.token, scope)
+            self.require(actual, "usize", token)
+            resolved_counts[argument] = FormatCount(resolved)
+        typed_parts = []
+        for field in parts:
+            if isinstance(field, str):
+                typed_parts.append(field)
+                continue
+            argument, actual = self.format_argument_type(field.argument, types, template.token, scope)
+            if isinstance(actual, SliceType) or actual == "str":
+                raise token.error("formatting an unsized slice requires a reference")
+            while isinstance(actual, ReferenceType):
+                actual = actual.inner
+            if field.spec.kind == "" and actual == "()":
+                raise token.error("() requires debug formatting")
+            self.obligation(actual, "Debug" if field.spec.kind == "?" else "Display", token)
+            width, precision = field.spec.width, field.spec.precision
+            spec = replace(field.spec, width=resolved_counts[width.argument] if isinstance(width, FormatCount) else width,
+                           precision=resolved_counts[precision.argument] if isinstance(precision, FormatCount) else precision)
+            typed_parts.append(replace(field, argument=argument, spec=spec, annotation=actual))
+        self.program.formats[id(expr)] = (token, typed_parts)
+        if kind == "panic" or NEVER in types:
+            return NEVER
+        return STRING if kind == "format" else "()"
+
+    def format_argument_type(self, argument, types, token, scope):
+        if isinstance(argument, int):
+            return argument, types[argument]
+        name_token = replace(token, text=argument)
+        binding = self.local_binding(scope, name_token)
+        if binding is not None:
+            return argument, binding.value
+        parameter = self.parameters.get(argument)
+        constant = parameter if parameter and parameter.const_type else (
+            self.program.constants_in_scope.get(token.module, {}).get(argument))
+        if constant is None:
+            raise name_token.error(f"unknown binding {argument!r}")
+        return constant, const_kind(constant)
 
     @staticmethod
     def unsuffixed_number(expr):
@@ -6248,14 +6382,19 @@ class Ownership:
                 cursor, loan = self.start_loan(cursor, place, False, value.token)
             cursor, holder = self.keep_loan(cursor, loan, value.token)
             temporaries.append(holder)
-        for mode, name in format_parts(template.args[1], template.token):
-            if mode == "text" or not name or name in self.program.format_constants.get(id(expr), {}):
+        for field in self.program.formats[id(expr)][1]:
+            if not isinstance(field, FormatField):
                 continue
-            local = scope.find(replace(template.token, text=name))
-            place = self.referent(local) if local.loan else Place(local)
-            cursor, loan = self.start_loan(cursor, place, False, token)
-            cursor, holder = self.keep_loan(cursor, loan, token)
-            temporaries.append(holder)
+            arguments = [field.argument]
+            arguments.extend(count.argument for count in (field.spec.width, field.spec.precision)
+                             if isinstance(count, FormatCount))
+            for name in arguments:
+                if isinstance(name, str):
+                    local = scope.find(replace(template.token, text=name))
+                    place = self.referent(local) if local.loan else Place(local)
+                    cursor, loan = self.start_loan(cursor, place, False, token)
+                    cursor, holder = self.keep_loan(cursor, loan, token)
+                    temporaries.append(holder)
         for holder in temporaries:
             cursor = self.emit(cursor, "read", holder, token)
         return cursor
@@ -6471,7 +6610,7 @@ class Ownership:
         if kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, _ = self.lower_call(expr, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
-        if kind in {"print", "panic"}:
+        if kind in {"print", "panic", "format"}:
             if kind == "panic":
                 self.lower_print(expr, scope, cursor)
                 return None
@@ -6874,11 +7013,7 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
     return quotient if word == "/" else left - quotient * right
 
 
-def format_float(value, debug):
-    if math.isnan(value):
-        return "NaN"
-    if math.isinf(value):
-        return "-inf" if value < 0 else "inf"
+def decimal_float(value):
     text = repr(float(value))
     if isinstance(value, Float32):
         for digits in range(1, 10):
@@ -6886,13 +7021,92 @@ def format_float(value, debug):
             if rounded_float(float(candidate), "f32") == value:
                 text = candidate
                 break
-    decimal = Decimal(text)
+    return Decimal(text)
+
+
+def format_exponent(value, kind, precision):
+    if isinstance(value, float) and not math.isfinite(value):
+        return format_float(value, False)
+    decimal = decimal_float(value) if isinstance(value, float) else Decimal(value)
+    if precision is None:
+        text = format(decimal, "e")
+    elif isinstance(value, float):
+        text = format(value, f".{precision}e")
+    else:
+        text = format(decimal, f".{precision}e")
+    coefficient, exponent = text.split("e")
+    if precision is None and "." in coefficient:
+        coefficient = coefficient.rstrip("0").rstrip(".")
+    return f"{coefficient}{kind}{int(exponent)}"
+
+
+def format_float(value, debug):
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "-inf" if value < 0 else "inf"
+    decimal = decimal_float(value)
     if debug and value != 0.0 and not -4 <= decimal.adjusted() < 16:
-        coefficient, exponent = format(decimal.normalize(), "e").split("e")
-        return f"{coefficient}e{int(exponent)}"
+        return format_exponent(value, "e", None)
     text = format(decimal, "f")
     text = text.rstrip("0").rstrip(".") if "." in text else text
     return text + ".0" if debug and "." not in text else text
+
+
+def pretty_debug(value, indent=0):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
+        value = value.read()
+    if isinstance(value, ArrayValue) and value.items:
+        opening, closing = "[", "]"
+        entries = [pretty_debug(item, indent + 4) for item in value.items]
+    elif isinstance(value, Value) and value.fields:
+        ctor = value.constructor
+        name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
+        entries = [pretty_debug(item, indent + 4) for item in value.fields]
+        if ctor.style == "record":
+            opening, closing = f"{name} {{", "}"
+            entries = [f"{field}: {entry}" for (field, _), entry in zip(ctor.fields, entries)]
+        else:
+            opening, closing = f"{name}(", ")"
+    else:
+        return display(value, True)
+    lines = "".join(" " * (indent + 4) + entry + ",\n" for entry in entries)
+    return opening + "\n" + lines + " " * indent + closing
+
+
+def format_value(value, annotation, spec):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
+        value = value.read()
+    kind = spec.kind
+    numeric = annotation in NUMBER_TYPES
+    prefix = ""
+    if kind in {"b", "o", "x", "X"}:
+        if value < 0:
+            value %= 1 << INTEGER_WIDTHS[annotation]
+        text = format(value, kind)
+        if spec.alternate:
+            prefix = {"b": "0b", "o": "0o", "x": "0x", "X": "0x"}[kind]
+    elif kind in {"e", "E"}:
+        text = format_exponent(value, kind, spec.precision)
+    elif isinstance(value, float) and spec.precision is not None and math.isfinite(value):
+        text = format(value, f".{spec.precision}f")
+    elif kind == "?" and spec.alternate:
+        text = pretty_debug(value)
+    else:
+        text = display(value, kind == "?")
+        if spec.precision is not None and not numeric and kind == "":
+            text = text[:spec.precision]
+    sign = ""
+    if numeric and text.startswith("-"):
+        sign, text = "-", text[1:]
+    elif numeric and spec.sign == "+" and text != "NaN":
+        sign = "+"
+    width = max(0, spec.width - len(sign + prefix + text))
+    if numeric and spec.zero:
+        return sign + prefix + "0" * width + text
+    align = spec.align or (">" if numeric else "<")
+    left = width if align == ">" else width // 2 if align == "^" else 0
+    return spec.fill * left + sign + prefix + text + spec.fill * (width - left)
 
 
 def display(value, debug):
@@ -7105,6 +7319,13 @@ class Interpreter:
         variant = "Some" if fields else "None"
         ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path.endswith(f"::{variant}"))
         return Value(ctor, fields)
+
+    def format_argument(self, argument, evaluated, token, scope):
+        if isinstance(argument, int):
+            return evaluated[argument]
+        if isinstance(argument, str):
+            return scope.find(replace(token, text=argument)).value
+        return substitute(argument, self.type_arguments).value
 
     def address(self, expr, scope):
         expr = ungroup(expr)
@@ -7474,31 +7695,33 @@ class Interpreter:
                 else:
                     arguments = arguments | {self.program.traits[trait].self_type: receiver}
             return self.call(function.name.text, values, arguments)
-        if kind in {"print", "panic"}:
+        if kind in {"print", "panic", "format"}:
             if not args:
                 if kind == "panic":
                     raise RustPanic(token.text)
-                print(file=self.stdout)
+                print(file=sys.stderr if token.text == "eprintln" else self.stdout)
                 return None
             template, *values = args
-            evaluated = iter([self.eval(value, scope) for value in values])
-            parts = format_parts(template.args[1], template.token)
+            evaluated = tuple(self.eval(value, scope) for value in values)
             rendered = []
-            for mode, value in parts:
-                if mode == "text":
-                    rendered.append(value)
+            for field in self.program.formats[id(expr)][1]:
+                if isinstance(field, str):
+                    rendered.append(field)
                     continue
-                if value:
-                    constant = self.program.format_constants.get(id(expr), {}).get(value)
-                    item = (substitute(constant, self.type_arguments).value if constant is not None
-                            else scope.find(replace(template.token, text=value)).value)
-                else:
-                    item = next(evaluated)
-                rendered.append(display(item, mode == "debug"))
+                item = self.format_argument(field.argument, evaluated, template.token, scope)
+                spec = field.spec
+                adjustments = {dimension: self.format_argument(count.argument, evaluated, template.token, scope)
+                               for dimension, count in (("width", spec.width), ("precision", spec.precision))
+                               if isinstance(count, FormatCount)}
+                annotation = self.program.normalize(substitute(field.annotation, self.type_arguments))
+                rendered.append(format_value(item, annotation, replace(spec, **adjustments)))
             rendered = "".join(rendered)
             if kind == "panic":
                 raise RustPanic(rendered)
-            print(rendered, file=self.stdout)
+            if kind == "format":
+                return rendered
+            destination = sys.stderr if token.text in {"eprint", "eprintln"} else self.stdout
+            print(rendered, end="\n" if token.text in {"println", "eprintln"} else "", file=destination)
             return None
         raise AssertionError(kind)
 

@@ -1665,6 +1665,36 @@ VALID = [
             show::<5>();
         }
     """, "1.4142135 true true true true 1 2 0.0\n5\n"),
+    ("format macros handle alignment, numeric bases, and pretty debug", """
+        #[derive(Debug)]
+        struct Data(i32, Vec<(i32, bool)>);
+        fn next() -> i32 { println!("next"); 7 }
+        fn main() {
+            let n = 1.234f64;
+            println!("{n:.2} [{:+07.2}] [{:#06X}] [{:_^9.2}]", -3.125f32, -1i8, "Ωab");
+            println!("[{0:e}] [{1:.2E}] [{0:#x}] [{name:>6}] {2:b}", 1200u64, 0.002f32, 3, name = "some");
+            let built = format!("{{{w}}}-{1}-{0}-{0}", next(), 8, w = "value");
+            print!("{built} ");
+            println!("{:#?}", Data(1, vec![(2, false)]));
+            println!("[{:.0}] [{:.2}] [{:>4}] [{:+}]", 'Ω', true, 'x', f64::NAN);
+        }
+    """, "1.23 [-003.12] [0x00FF] [___Ωa____]\n[1.2e3] [2.00E-3] [0x4b0] [  some] 11\n"
+         "next\n{value}-8-7-7 Data(\n    1,\n    [\n        (\n            2,\n            false,\n"
+         "        ),\n    ],\n)\n[] [tr] [   x] [NaN]\n"),
+    ("format width and precision can use arguments and constants", """
+        const WID: usize = 7;
+        fn emit<const PLACES: usize>() {
+            let width: usize = 8;
+            println!("[{0:width$.PLACES$}] [{0:WID$.2}]", 1.23456);
+        }
+        fn main() {
+            emit::<3>();
+            println!("[{:.*}] [{:>width$}] [{2}:{width}]", 2, 1.234, "a", width = 6);
+            println!("[{:1$}]", 42, 6);
+            println!("{0}-{named}-{named}", 3, named = 7);
+            println!("[{1:.*}] [{0:0$}]", 3, 0.00125);
+        }
+    """, "[   1.235] [   1.23]\n[1.23] [     a] [a:6]\n[    42]\n3-7-7\n[0.001] [  3]\n"),
 ]
 
 INVALID = [
@@ -2463,6 +2493,15 @@ INVALID = [
         fn invalid<const VALUE: f64>() {}
         fn main() {}
     """, "unsupported const parameter type"),
+    ("format macro arguments must be used", """
+        fn main() { println!("literal", 2); }
+    """, "unused format argument"),
+    ("dynamic format width must be usize", """
+        fn main() { let width = 4i32; println!("{:width$}", 2); }
+    """, "expected usize, found i32"),
+    ("base formatting does not accept floats", """
+        fn main() { println!("{:x}", 1.5f32); }
+    """, "base formatting requires an integer"),
 ]
 
 
@@ -2581,9 +2620,14 @@ class InterpreterTests(unittest.TestCase):
                     println!("{}", n * 2.0);
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "format_precision.rs"
-            unsupported.write_text('''
+            formatting = folder / "format_precision.rs"
+            formatting.write_text('''
                 fn main() { println!("{:.2}", 1.234f64); }
+            ''', encoding="utf-8")
+            unsupported = folder / "parameter_pattern.rs"
+            unsupported.write_text('''
+                fn sum((a, b): (i32, i32)) -> i32 { a + b }
+                fn main() { println!("{}", sum((1, 2))); }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
@@ -2621,14 +2665,16 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, map_iterator, string, borrowed_string, collect, floating, unsupported,
+                                     for_iteration, iterator, map_iterator, string, borrowed_string, collect, floating,
+                                     formatting, unsupported,
                                      panics, bounds, overflow, shift, utf8, substring],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
