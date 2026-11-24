@@ -2,7 +2,7 @@
 
 I heard Rust had a steep learning curve, so I put Python underneath it.
 
-This is a Rust interpreter written entirely in Python. It tokenizes, parses, type-checks, and runs a subset of Rust using only the Python standard library. Python is now checking my borrowing habits. This seemed funnier before it started saying no.
+This is a Rust interpreter written entirely in Python. It tokenizes, parses, type-checks, borrow-checks, and runs Rust using only the Python standard library. It also ships a standard library, mostly written in Rust and running on the interpreter, with Python underneath for the parts that touch the machine. Python is now checking my borrowing habits. This seemed funnier before it started saying no.
 
 ## Run it
 
@@ -78,6 +78,29 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `f32` and `f64` arithmetic, comparisons, casts, and selected float methods
 - `format!`, printing macros, named and positional arguments, and numeric width and precision
+- `Fn`, `FnMut`, and `FnOnce` bounds, `impl Fn` arguments and returns, `Box<dyn Fn>`, and paths like `String::from` or `Some` passed as functions
+- Generic traits with defaulted parameters, such as `Add<Rhs = Self>` and `From<T>`, matched on their arguments
+- Operator overloading through `std::ops` for arithmetic, bitwise, unary, compound assignment, `Index`, and `IndexMut`
+- User `Display`, `Debug`, `Clone`, `Default`, `PartialEq`, `PartialOrd`, `Ord`, `Hash`, and `Drop` impls, used by formatting, cloning, comparison, sorting, and scope exit
+- `Deref` auto-deref for method calls, fields, `*`, and indexing
+- `From`, `Into`, `TryFrom`, `TryInto`, `FromStr` with `parse`, and `?` that converts errors, including into `Box<dyn Error>`
+- Lifetime parameters on structs and impls, and references stored in structs, tuples, vectors, and maps
+- Items nested inside function bodies, non-scalar `const` items, `static mut`, and `unsafe` blocks
+- Drops in Rust order at scope exit, on reassignment, for discarded temporaries, and through `mem::drop`
+
+## What the standard library has
+
+`std.rs` is the standard library. It is ordinary Rust that the interpreter parses and checks with every program. Functions without bodies are intrinsics implemented in Python.
+
+- `Iterator` and `IntoIterator` as real traits, so user iterators get every adapter: `map`, `filter`, `filter_map`, `flat_map`, `flatten`, `enumerate`, `zip`, `chain`, `skip`, `take`, `step_by`, `peekable`, `scan`, `take_while`, `skip_while`, `inspect`, `rev`, `cycle`, `by_ref`, and the rest
+- Terminal iterator methods such as `fold`, `sum`, `product`, `count`, `min`, `max`, `min_by_key`, `position`, `find`, `any`, `all`, `partition`, `unzip`, `try_fold`, and `collect` into vectors, strings, maps, sets, deques, heaps, `Option`, and `Result`
+- `Option` and `Result` combinators like `map`, `and_then`, `ok_or`, `unwrap_or_else`, `take`, `as_ref`, and `transpose`
+- Slice and `Vec` methods including sorting, binary search, `windows`, `chunks`, `dedup`, `retain`, `drain`, `split_at_mut`, and `join`
+- `str`, `String`, and `char` methods with Rust's UTF-8 byte offsets and patterns that can be a char, a string, a char set, or a closure
+- Integer and float methods with Rust's overflow, wrapping, saturating, and rounding rules
+- `HashMap`, `HashSet`, `BTreeMap`, `BTreeSet`, `VecDeque`, and `BinaryHeap`, with the entry API
+- `Rc`, `Weak`, `RefCell`, `Cell`, `Mutex`, `RwLock`, and atomics
+- `thread::spawn` and `mpsc` channels, `std::io` for stdin and stdout, `std::env`, and `std::time`
 
 ## Match something
 
@@ -101,6 +124,12 @@ python3 -m unittest -v
 ```
 
 The interpreter runs with Python alone. With `rustc` installed, the tests also check the same programs against Rust.
+
+The `programs` folder holds Rust programs whose expected output and exit status came from rustc. The tests run each one through the interpreter and compare. To record rustc's output for a new program, add it to the folder and run:
+
+```sh
+python3 programs/bless.py programs/new_program.rs
+```
 
 ## Move something
 
@@ -252,14 +281,16 @@ Both commands accept `--edition`, which defaults to 2021. Edition 2024 enables l
 
 ## Scope
 
-This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
+This is a tree-walking interpreter, so it is slow. A program that does a few million operations takes a while. Startup parses and checks the whole standard library each run, which costs about a third of a second.
 
-Function signatures can tie reference returns, including string slices, to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, nested references, and general reference capture in patterns remain incomplete.
+The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location. Function signatures can tie reference returns, including string slices, to input lifetimes, and at calls the borrow checker uses those declared input regions, including bounds between lifetimes.
 
-Generic bodies are checked against their declared trait bounds. Const parameters support integer widths, `bool`, and `char`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax. Scalar constant evaluation supports immutable bindings, conditionals, and short-circuit boolean expressions. Recursion and mutation in constant evaluation remain open.
+The borrow checker is strict where it can trace a reference and permissive where it cannot. References stored inside tuples, vectors, structs, and maps, references returned without a traceable input, references produced by closures, and the results of interior mutability like `RefCell::borrow_mut` are not tracked. Programs that rustc accepts run. Some programs that rustc rejects for those reasons also run.
 
-Trait objects support shared and mutable references and `Box` ownership. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
+Generic bodies are checked against their declared trait bounds. Const parameters support integer widths, `bool`, and `char`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax. Recursion and mutation in constant evaluation remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. The optional host supports cross-crate macro expansion and generated local bindings. General external value and type resolution and full hygiene in exported expansions remain open.
+Trait objects support shared and mutable references, `Box`, and `Rc`. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
-General reference types as type arguments, complete closure capture analysis and callable trait bounds, standard library coverage, Cargo integration, and native code generation remain incomplete. `Result` propagation currently requires the same error type at the call and return sites.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. The optional host supports cross-crate macro expansion and generated local bindings.
+
+Threads run one at a time: `thread::spawn` runs its closure to completion before returning, which is one valid schedule but deadlocks on programs that need two threads to make progress together. `HashMap` and `HashSet` iterate in insertion order, which rustc never promises, so output that prints them unsorted can differ from a compiled run. `RefCell` does not panic on conflicting borrows. File and network IO, processes, `async`, procedural derive macros other than the built-in derives, Cargo integration, and native code generation are not implemented.
