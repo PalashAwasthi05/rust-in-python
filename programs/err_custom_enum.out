@@ -1,0 +1,24 @@
+0
+good port: ok 8080
+good ratio: ok 0.500
+bad port: error: bad integer: invalid digit found in string
+  debug: BadInt(ParseIntError { kind: InvalidDigit })
+  caused by: invalid digit found in string
+bad ratio: error: bad float: invalid float literal
+  debug: BadFloat(ParseFloatError { kind: Invalid })
+  caused by: invalid float literal
+huge: error: port = 70000 exceeds 65535
+  debug: OutOfRange { key: "port", value: 70000, max: 65535 }
+  no source
+empty: error: missing key `port`
+  debug: Missing("port")
+  no source
+empty int: error: bad integer: cannot parse integer from empty string
+  debug: BadInt(ParseIntError { kind: Empty })
+  caused by: cannot parse integer from empty string
+overflow: error: bad integer: number too large to fit in target type
+  debug: BadInt(ParseIntError { kind: PosOverflow })
+  caused by: number too large to fit in target type
+negative: error: bad integer: invalid digit found in string
+  debug: BadInt(ParseIntError { kind: InvalidDigit })
+  caused by: invalid digit found in string

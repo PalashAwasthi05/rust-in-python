@@ -1,0 +1,29 @@
+0
+ ada: Ok("example.com")
+      EXAMPLE.COM
+      is_ok=true is_err=false
+ bob: Err(NoEmail(2))
+      <NoEmail(2)>
+      is_ok=false is_err=true
+  cy: Err(BadDomain("cy-at-nowhere"))
+      <BadDomain("cy-at-nowhere")>
+      is_ok=false is_err=true
+ dee: Err(NoUser("dee"))
+      <NoUser("dee")>
+      is_ok=false is_err=true
+Some(18)
+Err(4)
+-1
+Ok(0)
+Some("boom")
+Err("3 too big")
+Err("nothing")
+Ok(16)
+Ok(Some(5))
+None
+false
+true
+80
+3
+Some(2)
+Some(1)

@@ -1,0 +1,28 @@
+0
+"12" => ok 12
+"" => empty
+"-" => invalid digit in "-"
+"+" => invalid digit in "+"
+"1_0" => invalid digit in "1_0"
+"128" => too big
+"-129" => too small
+"-128" => ok -128
+"  5" => invalid digit in "  5"
+Err(ParseIntError { kind: Empty })
+Err(ParseIntError { kind: InvalidDigit })
+Err(ParseIntError { kind: PosOverflow })
+Err(ParseFloatError { kind: Invalid })
+Err(ParseFloatError { kind: Empty })
+Err(ParseBoolError)
+Err(ParseCharError { kind: TooManyChars })
+provided string was not `true` or `false`
+cannot parse char from empty string
+too many characters in string
+Timeout(50) -> retry
+Timeout(5000) -> give up
+Denied { user: "eve", severity: High } -> alert
+Denied { user: "bob", severity: Low } -> log
+Io(NotFound) -> create it
+Io(InvalidData) -> fail
+out of range integral type conversion attempted / TryFromIntError(PosOverflow)
+Err(TryFromIntError(NegOverflow))

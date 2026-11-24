@@ -16,6 +16,8 @@ pub mod prelude {
 }
 
 pub mod intrinsics {
+    pub fn downcast_ref<T>(value: &dyn crate::error::Error) -> Option<&T>;
+    pub fn downcast_mut<T>(value: &mut dyn crate::error::Error) -> Option<&mut T>;
     pub trait Concat {}
     impl<T> Concat for Vec<T> {}
     impl<T> Concat for [T] {}
@@ -1657,9 +1659,9 @@ pub mod convert {
     impl From<bool> for u64 { fn from(value: bool) -> u64 { value as u64 } }
     impl From<f32> for f64 { fn from(value: f32) -> f64 { value as f64 } }
     impl TryFrom<u32> for char {
-        type Error = crate::num::TryFromIntError;
-        fn try_from(value: u32) -> Result<char, crate::num::TryFromIntError> {
-            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::num::TryFromIntError) }
+        type Error = crate::num::CharTryFromError;
+        fn try_from(value: u32) -> Result<char, crate::num::CharTryFromError> {
+            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::num::CharTryFromError(())) }
         }
     }
 
@@ -1677,6 +1679,13 @@ pub mod error {
     pub trait Error: Debug + Display {
         fn source(&self) -> Option<&dyn Error> { None }
         fn description(&self) -> &str { "description() is deprecated; use Display" }
+    }
+    impl dyn Error {
+        pub fn is<T: Error + 'static>(&self) -> bool { crate::intrinsics::downcast_ref::<T>(self).is_some() }
+        pub fn downcast_ref<T: Error + 'static>(&self) -> Option<&T> { crate::intrinsics::downcast_ref::<T>(self) }
+        pub fn downcast_mut<T: Error + 'static>(&mut self) -> Option<&mut T> {
+            crate::intrinsics::downcast_mut::<T>(self)
+        }
     }
 
     impl<E: Error> From<E> for Box<dyn Error> {
@@ -1703,6 +1712,7 @@ pub mod error {
     impl Error for crate::num::ParseBoolError {}
     impl Error for crate::num::ParseCharError {}
     impl Error for crate::num::TryFromIntError {}
+    impl Error for crate::num::CharTryFromError {}
     impl Error for crate::fmt::Error {}
     impl Error for crate::string::FromUtf8Error {}
 }
@@ -1828,7 +1838,7 @@ pub mod collections {
             impl<K, Q: ?Sized, V> Index<&Q> for $map<K, V> {
                 type Output = V;
                 fn index(&self, key: &Q) -> &V {
-                    match crate::intrinsics::map_get(self, key) { Some(value) => value, None => panic!("key not found") }
+                    match crate::intrinsics::map_get(self, key) { Some(value) => value, None => panic!("no entry found for key") }
                 }
             }
             impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for $map<K, V> {
@@ -2257,13 +2267,13 @@ pub mod cell {
         pub fn borrow(&self) -> Ref<'_, T> {
             match self.try_borrow() {
                 Ok(guard) => guard,
-                Err(_) => panic!("already mutably borrowed: BorrowError"),
+                Err(_) => panic!("RefCell already mutably borrowed"),
             }
         }
         pub fn borrow_mut(&self) -> RefMut<'_, T> {
             match self.try_borrow_mut() {
                 Ok(guard) => guard,
-                Err(_) => panic!("already borrowed: BorrowMutError"),
+                Err(_) => panic!("RefCell already borrowed"),
             }
         }
         pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
@@ -2500,4 +2510,12 @@ pub mod env {
     pub fn var(key: &str) -> Result<String, VarError> {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
     }
+}
+
+pub mod process {
+    // exit, ExitCode, and Termination are built in; the module exists so `use std::process;` resolves.
+}
+
+pub mod hint {
+    pub fn black_box<T>(dummy: T) -> T { dummy }
 }

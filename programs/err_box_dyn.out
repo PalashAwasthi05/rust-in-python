@@ -1,0 +1,12 @@
+0
+"12" -> 12
+"-4" -> negative error holding -4
+"0" -> other error: zero is not allowed
+"abc" -> parse int error: invalid digit found in string
+"5000" -> other error: 5000 is too large
+"" -> parse int error: cannot parse integer from empty string
+Some(8)
+sum failed: invalid digit found in string
+[-7 is negative] NegativeError(-7) true
+[plain] "plain" true
+[invalid float literal] ParseFloatError { kind: Invalid } true

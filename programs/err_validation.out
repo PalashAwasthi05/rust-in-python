@@ -1,0 +1,11 @@
+0
+ok: Form { name: "Zoë", age: 33 }
+ok: Form { name: "Ivy", age: 7 }
+row 1: name must not be empty
+row 2: name is 11 chars, max 8
+row 3: age must not be empty
+row 4: age must be numeric, got "old"
+row 5: age must be numeric, got "300"
+Some(Empty("name"))
+true
+boxed: name must not be empty

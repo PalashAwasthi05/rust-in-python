@@ -42,7 +42,7 @@ class RustError(Exception):
 
 
 class RustPanic(Exception):
-    pass
+    location = None  # the Token rustc would name in "panicked at file:line:column"
 
 
 class ProcessExit(Exception):
@@ -1047,10 +1047,15 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         }
     }
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ParseFloatError { empty: bool }
+    pub struct ParseFloatError { kind: FloatErrorKind }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FloatErrorKind { Empty, Invalid }
     impl crate::fmt::Display for ParseFloatError {
         fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
-            if self.empty { write!(f, "cannot parse float from empty string") } else { write!(f, "invalid float literal") }
+            match self.kind {
+                FloatErrorKind::Empty => write!(f, "cannot parse float from empty string"),
+                FloatErrorKind::Invalid => write!(f, "invalid float literal"),
+            }
         }
     }
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1061,12 +1066,26 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         }
     }
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ParseCharError;
+    pub struct ParseCharError { kind: CharErrorKind }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CharErrorKind { EmptyString, TooManyChars }
     impl crate::fmt::Display for ParseCharError {
-        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid character") }
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            match self.kind {
+                CharErrorKind::EmptyString => write!(f, "cannot parse char from empty string"),
+                CharErrorKind::TooManyChars => write!(f, "too many characters in string"),
+            }
+        }
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TryFromIntError;
+    pub struct TryFromIntError(IntErrorKind);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CharTryFromError(pub(crate) ());
+    impl crate::fmt::Display for CharTryFromError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "converted integer out of range for `char`")
+        }
+    }
     impl crate::fmt::Display for TryFromIntError {
         fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
             write!(f, "out of range integral type conversion attempted")
@@ -1084,7 +1103,8 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) => Ok(c),
-                _ => Err(ParseCharError),
+                (None, _) => Err(ParseCharError { kind: CharErrorKind::EmptyString }),
+                _ => Err(ParseCharError { kind: CharErrorKind::TooManyChars }),
             }
         }
     }
@@ -1167,7 +1187,7 @@ PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "St
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
 macro_rules! assert {
-    ($condition:expr $(,)?) => {{ if !$condition { panic!("assertion failed"); } }};
+    ($condition:expr $(,)?) => {{ if !$condition { panic!("assertion failed: {}", stringify!($condition)); } }};
     ($condition:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
         if !$condition { panic!($format $(,$argument)*); }
     }};
@@ -1176,19 +1196,30 @@ macro_rules! assert_eq {
     ($left:expr, $right:expr $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left != *right { panic!("assertion failed: left != right"); }
+        if *left != *right { panic!("assertion `left == right` failed\\n  left: {:?}\\n right: {:?}", left, right); }
     }};
     ($left:expr, $right:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left != *right { panic!($format $(,$argument)*); }
+        if *left != *right {
+            panic!("assertion `left == right` failed: {}\\n  left: {:?}\\n right: {:?}",
+                   format!($format $(,$argument)*), left, right);
+        }
     }};
 }
 macro_rules! assert_ne {
     ($left:expr, $right:expr $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left == *right { panic!("assertion failed: left == right"); }
+        if *left == *right { panic!("assertion `left != right` failed\\n  left: {:?}\\n right: {:?}", left, right); }
+    }};
+    ($left:expr, $right:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let left = &$left;
+        let right = &$right;
+        if *left == *right {
+            panic!("assertion `left != right` failed: {}\\n  left: {:?}\\n right: {:?}",
+                   format!($format $(,$argument)*), left, right);
+        }
     }};
 }
 macro_rules! debug_assert {
@@ -6086,7 +6117,7 @@ class Checker:
                 self.check_type(method.result, method.name, allow_never=True)
         for index, impl in enumerate(self.program.impls):
             self.check_bounds(impl.parameters, impl.token)
-            if isinstance(impl.target, SliceType) or impl.target == "str":
+            if isinstance(impl.target, (SliceType, DynType)) or impl.target == "str":
                 self.check_type(ReferenceType(impl.target, False), impl.token)
             else:
                 self.check_type(impl.target, impl.token)
@@ -6107,7 +6138,8 @@ class Checker:
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
             if impl.trait is None and impl.token.module[:1] != STD_ROOT and (
-                    isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
+                    isinstance(impl.target, TupleType) or not isinstance(impl.target, DynType)
+                    and self.program.layout(impl.target) is None):
                 raise impl.token.error("inherent impl requires a declared struct or enum")
             for previous in self.program.impls[:index]:
                 if impl.token.module[:1] == STD_ROOT:
@@ -9106,6 +9138,15 @@ class Checker:
             if impl.trait is None and name in impl.methods and target == owner:
                 method = impl.methods[name]
                 return None if method.associated_const else len(method.params)
+        # `MyError::from` names a trait method through the type that implements the trait.
+        arities = set()
+        for impl in self.program.impls:
+            target = impl.target.name if isinstance(impl.target, AppliedType) else impl.target
+            trait = self.program.traits.get(impl.trait) if impl.trait and target == owner else None
+            if trait and name in trait.methods and not trait.methods[name].associated_const:
+                arities.add(len(trait.methods[name].params))
+        if len(arities) == 1:
+            return arities.pop()
         if owner in self.parameters:
             for bound in self.program.trait_closure(self.parameters[owner].bounds):
                 trait = self.program.traits.get(bound)
@@ -10529,10 +10570,31 @@ class Ownership:
         return cursor
 
 
-def checked(value, token, integer="i32", *, runtime=False):
+OVERFLOW_OPERATIONS = {"+": "add", "-": "subtract", "*": "multiply", "/": "divide", "%": "calculate the remainder",
+                       "neg": "negate", "<<": "shift left", ">>": "shift right"}
+PANIC_MACRO_MESSAGES = {"unreachable": "internal error: entered unreachable code", "unimplemented": "not implemented",
+                        "todo": "not yet implemented"}
+
+
+def in_std(token):
+    """Whether a token comes from the bundled standard library rather than the program."""
+    return token.source_file == "<std>" or token.module[:1] == STD_ROOT
+
+
+def expression_start(expr):
+    """The token where an expression's source text begins: `a / b` and `v[i]` panic at `a` and `v`."""
+    while expr.args and isinstance(expr.args[0], Expr) and (
+            (expr.args[0].token.line, expr.args[0].token.column) < (expr.token.line, expr.token.column)):
+        expr = expr.args[0]
+    return expr.token
+
+
+def checked(value, token, integer="i32", *, runtime=False, operation=None):
     lower, upper = INTEGER_BOUNDS[integer]
     if not lower <= value < upper:
         message = f"{integer} arithmetic overflow"
+        if runtime and operation in OVERFLOW_OPERATIONS:
+            message = f"attempt to {OVERFLOW_OPERATIONS[operation]} with overflow"
         raise RustPanic(message) if runtime else token.error(message)
     return value
 
@@ -10612,8 +10674,9 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
         return BITWISE[word](left, right)
     if word in SHIFTS:
         if not 0 <= right < INTEGER_WIDTHS[integer]:
-            message = "shift amount is outside the integer width"
-            raise RustPanic(message) if runtime else token.error(message)
+            if runtime:
+                raise RustPanic(f"attempt to {OVERFLOW_OPERATIONS[word]} with overflow")
+            raise token.error("shift amount is outside the integer width")
         if not runtime:
             checked(left, token, integer)
         return truncate_integer(left << right, integer) if word == "<<" else left >> right
@@ -10621,13 +10684,16 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
         checked(left, token, integer)
         checked(right, token, integer)
     if word in ARITHMETIC:
-        return checked(ARITHMETIC[word](left, right), token, integer, runtime=runtime)
+        return checked(ARITHMETIC[word](left, right), token, integer, runtime=runtime, operation=word)
     if right == 0:
-        raise RustPanic("division by zero") if runtime else token.error("division by zero")
+        if runtime:
+            raise RustPanic("attempt to divide by zero" if word == "/" else
+                            "attempt to calculate the remainder with a divisor of zero")
+        raise token.error("division by zero")
     quotient = abs(left) // abs(right)
     if (left < 0) != (right < 0):
         quotient = -quotient
-    checked(quotient, token, integer, runtime=runtime)
+    checked(quotient, token, integer, runtime=runtime, operation=word)
     return quotient if word == "/" else left - quotient * right
 
 
@@ -10711,6 +10777,9 @@ def format_value(value, annotation, spec):
         text = USER_FORMAT(value, spec.kind == "?", alternate=spec.alternate, spec=spec)
         if text is not None:
             return text
+    if spec.kind == "?" and not spec.alternate and isinstance(value, (Value, ArrayValue, MapValue, str)) and (
+            spec.width or spec.precision is not None or spec.sign or spec.zero):
+        return debug_with_spec(value, spec)
     kind = spec.kind
     numeric = annotation in NUMBER_TYPES
     prefix = ""
@@ -10741,6 +10810,42 @@ def format_value(value, annotation, spec):
     align = spec.align or (">" if numeric else "<")
     left = width if align == ">" else width // 2 if align == "^" else 0
     return spec.fill * left + sign + prefix + text + spec.fill * (width - left)
+
+
+def debug_with_spec(value, spec):
+    """`{:5?}` as Rust renders it: str, char, and unit variants ignore the spec, while derived Debug
+    passes the same formatter to every field, so each scalar leaf is padded on its own."""
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
+        value = value.read()
+    if isinstance(value, str):
+        return display(value, True)
+    if USER_FORMAT is not None and isinstance(value, Value):
+        text = USER_FORMAT(value, True, spec=spec)
+        if text is not None:
+            return text
+    if isinstance(value, MapValue):
+        entries = MAP_ORDER(value) if MAP_ORDER else value.entries.values()
+        if all(item[1] is MAP_MEMBER for item in entries):
+            return "{" + ", ".join(debug_with_spec(key, spec) for key, _ in entries) + "}"
+        return "{" + ", ".join(f"{debug_with_spec(key, spec)}: {debug_with_spec(item, spec)}"
+                               for key, item in entries) + "}"
+    if isinstance(value, ArrayValue):
+        return "[" + ", ".join(debug_with_spec(item, spec) for item in value.items) + "]"
+    if isinstance(value, Value):
+        ctor = value.constructor
+        name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
+        if ctor.style == "unit" or not ctor.fields:
+            return name
+        fields = [debug_with_spec(item, spec) for item in value.fields]
+        if ctor.style == "tuple":
+            return f"{name}({', '.join(fields)})" if name else tuple_text(fields)
+        entries = ", ".join(f"{field}: {item}" for (field, _), item in zip(ctor.fields, fields))
+        return f"{name} {{ {entries} }}"
+    if isinstance(value, WeakValue):
+        return "(Weak)"
+    annotation = ("f64" if isinstance(value, float) else "i64" if isinstance(value, int)
+                  and not isinstance(value, bool) else None)
+    return format_value(value, annotation, spec)
 
 
 USER_FORMAT = None
@@ -10973,7 +11078,7 @@ class Interpreter:
         if len(values) == 1:
             value = plain(values[0])
             if symbol == "-":
-                return rounded_float(-value, kind) if kind in FLOAT_TYPES else checked(-value, token, kind, runtime=True)
+                return rounded_float(-value, kind) if kind in FLOAT_TYPES else checked(-value, token, kind, runtime=True, operation="neg")
             return (not value) if kind == "bool" else complement(value, kind)
         left, right = map(plain, values)
         if kind == STRING:
@@ -11121,7 +11226,33 @@ class Interpreter:
                 binding.moved = True
                 self.drop_value(binding.value)
 
+    @staticmethod
+    def locate_panic(panic, token, macro=False):
+        """Raise a panic at token; a panic!/assert! inside macros is reported at the outermost invocation."""
+        while macro and token.expansion_site is not None:
+            token = token.expansion_site
+        panic.location = token
+        raise panic
+
+    @staticmethod
+    def relocate_panic(panic, token):
+        """Point a panic raised inside std (or nowhere in particular) at user code, as #[track_caller] does."""
+        if not in_std(token) and (panic.location is None or in_std(panic.location)):
+            while token.expansion_site is not None:
+                token = token.expansion_site
+            panic.location = token
+
+    def index_location(self, expr):
+        """rustc places a built-in array or slice index panic at the indexed expression's start, and one from an
+        Index impl (Vec, String, maps) at the `[`."""
+        base = self.program.expr_types.get(id(expr.args[0]))
+        while isinstance(base, ReferenceType):
+            base = base.inner
+        return expression_start(expr) if isinstance(base, (ArrayType, SliceType)) else expr.token
+
     def drop_scope(self, bindings):
+        if not self.track_drops:
+            return
         for binding in reversed(list(bindings.values())):
             if not binding.moved:
                 binding.moved = True
@@ -11515,10 +11646,29 @@ class Interpreter:
             start = self.eval(first, scope) if first else 0
             stop = self.eval(last, scope) + int(inclusive) if last else length
             if not 0 <= start <= stop <= length:
-                raise RustPanic(f"slice range {start}..{stop} is out of bounds for length {length}")
+                if utf8 is not None and max(start, stop) > length:
+                    message = (f"{'start' if start > length else 'end'} byte index {start if start > length else stop}"
+                               f" is out of bounds for string of length {length}")
+                elif utf8 is not None:
+                    message = f"byte range starts at {start} but ends at {stop}"
+                elif start > stop and last:
+                    message = f"slice index starts at {start} but ends at {stop}"
+                elif last:
+                    message = f"range end index {stop - int(inclusive)} out of range for slice of length {length}"
+                else:
+                    message = f"range start index {start} out of range for slice of length {length}"
+                self.locate_panic(RustPanic(message), expr.token)
             if utf8 is not None:
-                if any(offset < length and utf8[offset] & 0xC0 == 0x80 for offset in (start, stop)):
-                    raise RustPanic("string index is not at a UTF-8 character boundary")
+                for side, offset in (("start", start), ("end", stop)):
+                    if offset < length and utf8[offset] & 0xC0 == 0x80:
+                        begin = offset
+                        while utf8[begin] & 0xC0 == 0x80:
+                            begin -= 1
+                        character = utf8[begin:].decode("utf-8", "ignore")[0]
+                        width = len(character.encode("utf-8"))
+                        self.locate_panic(RustPanic(
+                            f"{side} byte index {offset} is not a char boundary; it is inside {display(Character(character), True)} "
+                            f"(bytes {begin}..{begin + width} of string)"), expr.token)
                 if isinstance(root, StringAddress):
                     return StringAddress(root.address, root.start + start, root.start + stop)
                 return StringAddress(root, start, stop)
@@ -11535,7 +11685,10 @@ class Interpreter:
         if kind == "exit_code":
             return ExitCodeValue(self.eval(args[0], scope))
         if kind == "process_exit":
-            raise ProcessExit(self.eval(args[0], scope))
+            status = self.eval(args[0], scope)
+            # process::exit ends the process at once: no destructors run while the exception unwinds.
+            self.track_drops = False
+            raise ProcessExit(status)
         if kind == "box":
             value = self.eval(args[0], scope)
             concrete = self.program.normalize(substitute(self.program.expr_types[id(args[0])], self.type_arguments))
@@ -11662,10 +11815,17 @@ class Interpreter:
                 return value.fields[0]
             if token.text == "unwrap_or":
                 return supplied[0]
-            message = display(supplied[0], False) if token.text == "expect" else f"called {token.text} on {actual}"
+            if token.text == "expect":
+                message = display(supplied[0], False)
+            elif actual == "Err":
+                message = f"called `Result::{token.text}()` on an `Err` value"
+            else:
+                message = f"called `Option::{token.text}()` on a `None` value"
             if actual == "Err":
                 message += f": {display(value.fields[0], True)}"
-            raise RustPanic(message)
+            panic = RustPanic(message)
+            panic.location = token
+            raise panic
         if kind == "vector_method":
             address = self.eval(args[0], scope)
             if token.text in {"as_slice", "as_mut_slice"}:
@@ -11775,7 +11935,11 @@ class Interpreter:
                 raise token.error("array exceeds interpreter allocation limit")
             return ArrayValue((item,) * count)
         if kind in {"index", "range_index"}:
-            return self.address(expr, scope).read()
+            try:
+                return self.address(expr, scope).read()
+            except RustPanic as panic:
+                self.relocate_panic(panic, self.index_location(expr))
+                raise
         if kind in {"length", "is_empty"}:
             root = self.address(args[0], scope)
             if isinstance(root, SliceAddress):
@@ -11953,7 +12117,11 @@ class Interpreter:
             if token.text == "-":
                 if annotation in FLOAT_TYPES:
                     return rounded_float(-value, annotation)
-                return checked(-value, token, annotation, runtime=True)
+                try:
+                    return checked(-value, token, annotation, runtime=True, operation="neg")
+                except RustPanic as panic:
+                    self.relocate_panic(panic, token)
+                    raise
             return complement(value, annotation)
         if kind == "scalar_cast":
             value, target = args
@@ -11961,20 +12129,30 @@ class Interpreter:
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
-            address = self.address(left, scope)
-            if self.track_drops and token.text == "=" and isinstance(address, Address):
-                binding = address.binding
-                if isinstance(binding, Binding):
-                    if not binding.moved:
+            try:
+                address = self.address(left, scope)
+                if self.track_drops and token.text == "=" and isinstance(address, Address):
+                    binding = address.binding
+                    if isinstance(binding, Binding):
+                        if not binding.moved:
+                            self.drop_value(address.read())
+                        if not address.fields:
+                            binding.moved = False
+                    else:
                         self.drop_value(address.read())
-                    if not address.fields:
-                        binding.moved = False
-                else:
-                    self.drop_value(address.read())
-            if token.text != "=":
-                value = binary(token.text[:-1], address.read(), value, token,
-                               self.program.expr_types[id(left)], runtime=True)
-            address.write(value)
+                if token.text != "=":
+                    current = address.read()
+                    try:
+                        value = binary(token.text[:-1], current, value, token,
+                                       self.program.expr_types[id(left)], runtime=True)
+                    except RustPanic as panic:
+                        self.relocate_panic(panic, expression_start(expr))
+                        raise
+                address.write(value)
+            except RustPanic as panic:
+                if ungroup(left).kind == "index":
+                    self.relocate_panic(panic, self.index_location(ungroup(left)))
+                raise
             return None
         if kind == "binary":
             left, right = args
@@ -12001,8 +12179,12 @@ class Interpreter:
                 other = self.eval(right, scope)
                 compared = self.compare(value, other, equality=token.text in {"==", "!="})
                 return token.text == "!=" if compared is None else COMPARE[token.text](compared, 0)
-            return binary(token.text, value, self.eval(right, scope), token,
-                          self.program.expr_types[id(expr)], runtime=True)
+            other = self.eval(right, scope)
+            try:
+                return binary(token.text, value, other, token, self.program.expr_types[id(expr)], runtime=True)
+            except RustPanic as panic:
+                self.relocate_panic(panic, expression_start(expr))
+                raise
         if kind == "call":
             values = tuple(self.eval(arg, scope) for arg in args)
             ctor = self.program.constructors.get(token.text)
@@ -12060,11 +12242,16 @@ class Interpreter:
                                                zip(prototype.method_parameters, function.method_parameters)}
                 else:
                     arguments = arguments | {self.program.traits[trait].self_type: receiver}
-            return self.call(function.name.text, values, arguments)
+            try:
+                return self.call(function.name.text, values, arguments)
+            except RustPanic as panic:
+                self.relocate_panic(panic, token)
+                raise
         if kind in {"print", "panic", "format"}:
             if not args:
                 if kind == "panic":
-                    raise RustPanic(token.text)
+                    self.locate_panic(RustPanic(PANIC_MACRO_MESSAGES.get(token.text, "explicit panic")), token,
+                                      macro=True)
                 print(file=sys.stderr if token.text == "eprintln" else self.stdout)
                 return None
             template, *values = args
@@ -12088,7 +12275,9 @@ class Interpreter:
                     if ungroup(value_expr).kind not in {"name", "field", "index", "deref", "literal", "borrow"}:
                         self.drop_value(value)
             if kind == "panic":
-                raise RustPanic(rendered)
+                if token.text in PANIC_MACRO_MESSAGES:
+                    rendered = f"{PANIC_MACRO_MESSAGES[token.text]}: {rendered}"
+                self.locate_panic(RustPanic(rendered), token, macro=True)
             if kind == "format":
                 return rendered
             destination = sys.stderr if token.text in {"eprint", "eprintln"} else self.stdout
@@ -13634,8 +13823,7 @@ def rust_try_integer(interpreter, result, value):
     low, high = INTEGER_BOUNDS[result.arguments[0]]
     if low <= value < high:
         return interpreter.variant(result, "Ok", value)
-    error = result.arguments[1]
-    return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], ()))
+    return parse_error(interpreter, result, "PosOverflow" if value >= high else "NegOverflow")
 
 
 @intrinsic
@@ -13658,7 +13846,10 @@ def rust_parse_float(interpreter, result, text):
     value = text_of(text)
     if not FLOAT_SYNTAX.fullmatch(value):
         error = result.arguments[1]
-        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (not value,)))
+        kinds = MODULE_SEPARATOR.join(("std", "num", "FloatErrorKind"))
+        variant = next(ctor for ctor in interpreter.program.layout(kinds)[1]
+                       if ctor.path.endswith("::Invalid" if value else "::Empty"))
+        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (Value(variant, ()),)))
     return interpreter.variant(result, "Ok", rounded_float(float(value), kind))
 
 
@@ -14482,6 +14673,20 @@ def rust_type_text(interpreter, annotation):
 
 
 @intrinsic
+def rust_downcast_ref(interpreter, result, value):
+    """`<dyn Error>::downcast_ref::<T>()`: the object's concrete type, recorded when it was made, must be T."""
+    wanted = interpreter.program.concrete_type(interpreter.intrinsic_types[0])
+    if isinstance(value, DynAddress) and interpreter.program.concrete_type(value.concrete) == wanted:
+        return interpreter.variant(result, "Some", value)
+    return interpreter.variant(result, "None")
+
+
+@intrinsic
+def rust_downcast_mut(interpreter, result, value):
+    return rust_downcast_ref(interpreter, result, value)
+
+
+@intrinsic
 def rust_type_name(interpreter, result):
     return shared(rust_type_text(interpreter, interpreter.intrinsic_types[0]))
 
@@ -14597,7 +14802,12 @@ def main():
         print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
         return 1
     except RustPanic as error:
-        print(f"{label}: {error}", file=sys.stderr)
+        # rustc's panic report; it also names the thread id, which an interpreter has no equivalent for.
+        location, where = error.location, ""
+        if location is not None and not in_std(location):
+            where = f" at {location.source_file or label}:{location.line}:{location.column}"
+        print(f"\nthread 'main' panicked{where}:\n{error}\n"
+              "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace", file=sys.stderr)
         return 101
     except RecursionError:
         print(f"{label}: Python recursion limit reached", file=sys.stderr)
