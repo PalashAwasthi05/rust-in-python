@@ -1,0 +1,20 @@
+0
++---------+-------+-----------+---------+
+| planet  | moons | radius km | gravity |
++=========+=======+===========+=========+
+| Mercury |     0 |    2439.7 |  3.70   |
+| Earth   |     1 |    6371.0 |  9.81   |
+| Jupiter |    95 |   69911.0 |  24.79  |
+| Saturn  |   146 |   58232.0 |  10.44  |
+| Neptune |    16 |   24622.0 |  11.15  |
+| Pluto?  |     - |         - |    -    |
++---------+-------+-----------+---------+
+widths [7, 5, 9, 7]
+258 moons, biggest Jupiter, max g 24.79
+["Earth", "Saturn", "Neptune", "Mercury", "Jupiter"]
+[    Earth] [--Earth--] [Ear]
+[   Saturn] [-Saturn--] [Sat]
+[  Neptune] [-Neptune-] [Nep]
+[  Mercury] [-Mercury-] [Mer]
+[  Jupiter] [-Jupiter-] [Jup]
+   10.9733|1.10e7    |+11|-010.973

@@ -30,6 +30,8 @@ pub mod intrinsics {
     impl Join for &str { type Output = String; }
     impl Join for &String { type Output = String; }
     impl<T> Join for Vec<T> { type Output = Vec<T>; }
+    impl<T, const N: usize> Join for [T; N] { type Output = Vec<T>; }
+    impl<T> Join for &[T] { type Output = Vec<T>; }
 
     pub fn iter_max<I: crate::iter::Iterator>(iter: I, last: bool) -> Option<I::Item>;
     pub fn iter_collect<I: crate::iter::Iterator>(iter: I) -> Vec<I::Item>;
@@ -103,6 +105,9 @@ pub mod intrinsics {
     pub fn lazy_range<C, B, R>(items: C, range: B) -> R;
     pub fn parse_float<T>(text: &str) -> Result<T, crate::num::ParseFloatError>;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
+    pub fn lazy_next_back<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
+    pub fn vec_to_array<T, const N: usize>(items: Vec<T>) -> [T; N];
+    pub fn range_resolve<B>(range: B, len: usize) -> (usize, usize);
 }
 
 pub mod iter {
@@ -134,7 +139,7 @@ pub mod iter {
             if step == 0 { panic!("assertion failed: step != 0"); }
             StepBy { iter: self, step: step - 1, first: true }
         }
-        fn chain<U>(self, other: U) -> Chain<Self, U::IntoIter> where Self: Sized, U: IntoIterator {
+        fn chain<U>(self, other: U) -> Chain<Self, U::IntoIter> where Self: Sized, U: IntoIterator<Item = Self::Item> {
             Chain { first: Some(self), second: other.into_iter() }
         }
         fn zip<U>(self, other: U) -> Zip<Self, U::IntoIter> where Self: Sized, U: IntoIterator {
@@ -563,6 +568,15 @@ pub mod iter {
         type Item = T;
         fn next(&mut self) -> Option<T> { crate::intrinsics::lazy_next(self) }
     }
+    impl<T> Lazy<T> {
+        pub fn next_back(&mut self) -> Option<T> { crate::intrinsics::lazy_next_back(self) }
+        pub fn nth_back(&mut self, n: usize) -> Option<T> {
+            for _ in 0..n {
+                self.next_back()?;
+            }
+            self.next_back()
+        }
+    }
 
     pub struct Fuse<I> { iter: Option<I> }
     impl<I: Iterator> Iterator for Fuse<I> {
@@ -613,6 +627,14 @@ pub mod iter {
         fn next(&mut self) -> Option<T> { Some(self.item.clone()) }
     }
     pub fn repeat<T: Clone>(value: T) -> Repeat<T> { Repeat { item: value } }
+
+    pub struct RepeatWith<F> { f: F }
+    impl<T, F: FnMut() -> T> Iterator for RepeatWith<F> {
+        type Item = T;
+        fn next(&mut self) -> Option<T> { Some((self.f)()) }
+    }
+    pub fn repeat_with<T, F: FnMut() -> T>(f: F) -> RepeatWith<F> { RepeatWith { f: f } }
+    pub fn repeat_n<T: Clone>(value: T, count: usize) -> Take<Repeat<T>> { repeat(value).take(count) }
 
     pub struct FromFn<F> { f: F }
     impl<T, F: FnMut() -> Option<T>> Iterator for FromFn<F> {
@@ -719,6 +741,15 @@ pub mod slice {
     pub type Windows<'a, T> = Lazy<&'a [T]>;
     pub type Chunks<'a, T> = Lazy<&'a [T]>;
 
+    pub struct ChunksExact<'a, T> { chunks: Lazy<&'a [T]>, rem: &'a [T] }
+    impl<'a, T> Iterator for ChunksExact<'a, T> {
+        type Item = &'a [T];
+        fn next(&mut self) -> Option<&'a [T]> { self.chunks.next() }
+    }
+    impl<'a, T> ChunksExact<'a, T> {
+        pub fn remainder(&self) -> &'a [T] { self.rem }
+    }
+
     impl<T> [T] {
         pub fn first(&self) -> Option<&T>;
         pub fn last(&self) -> Option<&T>;
@@ -756,7 +787,10 @@ pub mod slice {
         pub fn clone_from_slice(&mut self, src: &[T]) where T: Clone;
         pub fn windows(&self, size: usize) -> Lazy<&[T]>;
         pub fn chunks(&self, size: usize) -> Lazy<&[T]>;
-        pub fn chunks_exact(&self, size: usize) -> Lazy<&[T]>;
+        pub fn chunks_exact(&self, size: usize) -> ChunksExact<'_, T> {
+            let whole = self.len() - self.len() % size;
+            ChunksExact { chunks: self[..whole].chunks(size), rem: &self[whole..] }
+        }
         pub fn rchunks(&self, size: usize) -> Lazy<&[T]>;
         pub fn split<F: FnMut(&T) -> bool>(&self, pred: F) -> Lazy<&[T]>;
         pub fn iter_positions(&self) -> usize { self.len() }
@@ -792,6 +826,14 @@ pub mod vec {
         pub fn resize_with<F: FnMut() -> T>(&mut self, new_len: usize, f: F);
         pub fn drain<R: crate::ops::RangeBounds>(&mut self, range: R) -> Lazy<T>;
         pub fn into_boxed_slice(self) -> Vec<T> { self }
+        pub fn splice<R: crate::ops::RangeBounds, I: IntoIterator<Item = T>>(&mut self, range: R, replace_with: I) -> Lazy<T> {
+            let (start, end) = crate::intrinsics::range_resolve(range, self.len());
+            let tail = self.split_off(end);
+            let removed = self.split_off(start);
+            self.extend(replace_with);
+            self.extend(tail);
+            crate::intrinsics::lazy_elements(removed)
+        }
         pub fn from_elem(elem: T, n: usize) -> Vec<T> where T: Clone { vec![elem; n] }
         pub fn from_iter<I: IntoIterator>(iter: I) -> Vec<T> {
             let mut items = Vec::new();
@@ -950,6 +992,12 @@ pub mod option {
         }
     }
 
+    impl<T, U> Option<(T, U)> {
+        pub fn unzip(self) -> (Option<T>, Option<U>) {
+            match self { Some((a, b)) => (Some(a), Some(b)), None => (None, None) }
+        }
+    }
+
     impl<T, E> Option<Result<T, E>> {
         pub fn transpose(self) -> Result<Option<T>, E> {
             match self {
@@ -1040,6 +1088,15 @@ pub mod result {
                 Ok(None) => None,
                 Err(err) => Some(Err(err)),
             }
+        }
+    }
+
+    impl<T: Clone, E> Result<&T, E> {
+        pub fn cloned(self) -> Result<T, E> {
+            match self { Ok(value) => Ok(value.clone()), Err(err) => Err(err) }
+        }
+        pub fn copied(self) -> Result<T, E> {
+            match self { Ok(value) => Ok(value.clone()), Err(err) => Err(err) }
         }
     }
 }
@@ -1541,6 +1598,11 @@ pub mod string {
         pub fn from_utf8_lossy(v: &[u8]) -> String;
         pub fn replace_range<R: crate::ops::RangeBounds>(&mut self, range: R, replace_with: &str);
         pub fn into_boxed_str(self) -> String { self }
+        pub fn from_iter<I: IntoIterator>(iter: I) -> String {
+            let mut text = String::new();
+            text.extend(iter);
+            text
+        }
     }
 }
 
@@ -1576,6 +1638,48 @@ pub mod char {
         pub fn len_utf8(self) -> usize;
         pub fn from_u32(i: u32) -> Option<char>;
         pub fn from_digit(num: u32, radix: u32) -> Option<char>;
+    }
+    pub fn from_digit(num: u32, radix: u32) -> Option<char> { char::from_digit(num, radix) }
+    impl char {
+        pub fn escape_unicode(self) -> String { format!("\\u{{{:x}}}", self as u32) }
+        pub fn escape_default(self) -> String {
+            match self {
+                '\t' => String::from("\\t"),
+                '\r' => String::from("\\r"),
+                '\n' => String::from("\\n"),
+                '\'' | '"' | '\\' => format!("\\{}", self),
+                ' '..='~' => self.to_string(),
+                _ => self.escape_unicode(),
+            }
+        }
+        pub fn escape_debug(self) -> String {
+            if self == '"' { return String::from("\\\""); }
+            let text = format!("{:?}", self);
+            text[1..text.len() - 1].to_string()
+        }
+    }
+    pub fn from_u32(i: u32) -> Option<char> { char::from_u32(i) }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CharTryFromError(pub(crate) ());
+    impl crate::fmt::Display for CharTryFromError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "converted integer out of range for `char`")
+        }
+    }
+    impl crate::error::Error for CharTryFromError {}
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TryFromCharError(pub(crate) ());
+    impl crate::fmt::Display for TryFromCharError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "unicode code point out of range")
+        }
+    }
+    impl crate::error::Error for TryFromCharError {}
+    impl crate::convert::TryFrom<char> for u8 {
+        type Error = TryFromCharError;
+        fn try_from(c: char) -> Result<u8, TryFromCharError> {
+            if (c as u32) < 256 { Ok(c as u8) } else { Err(TryFromCharError(())) }
+        }
     }
 }
 
@@ -1657,9 +1761,9 @@ pub mod convert {
     impl From<bool> for u64 { fn from(value: bool) -> u64 { value as u64 } }
     impl From<f32> for f64 { fn from(value: f32) -> f64 { value as f64 } }
     impl TryFrom<u32> for char {
-        type Error = crate::num::TryFromIntError;
-        fn try_from(value: u32) -> Result<char, crate::num::TryFromIntError> {
-            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::num::TryFromIntError) }
+        type Error = crate::char::CharTryFromError;
+        fn try_from(value: u32) -> Result<char, crate::char::CharTryFromError> {
+            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::char::CharTryFromError(())) }
         }
     }
 
@@ -1714,11 +1818,11 @@ pub mod collections {
 
     pub mod hash_map {
         pub use super::HashMap;
-        pub use super::Entry;
+        pub use super::{Entry, OccupiedEntry, VacantEntry};
     }
     pub mod btree_map {
         pub use super::BTreeMap;
-        pub use super::Entry;
+        pub use super::{Entry, OccupiedEntry, VacantEntry};
     }
     pub mod hash_set {
         pub use super::HashSet;
@@ -1743,39 +1847,73 @@ pub mod collections {
     #[derive(Clone, PartialEq, Eq, Default, PartialOrd, Ord)]
     pub struct BTreeSet<T> { entries: Vec<T> }
 
-    pub struct Entry<'a, M, K, V> { map: &'a mut M, key: K, value: Option<V> }
+    pub enum Entry<'a, M, K, V> {
+        Occupied(OccupiedEntry<'a, M, K, V>),
+        Vacant(VacantEntry<'a, M, K, V>),
+    }
+    pub struct OccupiedEntry<'a, M, K, V> { map: &'a mut M, key: K, value: crate::marker::PhantomData<V> }
+    pub struct VacantEntry<'a, M, K, V> { map: &'a mut M, key: K, value: crate::marker::PhantomData<V> }
 
     impl<'a, M, K, V> Entry<'a, M, K, V> {
-        pub fn or_insert(self, default: V) -> &'a mut V { crate::intrinsics::map_or_insert(self.map, self.key, default) }
-        pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
-            if crate::intrinsics::map_has(&*self.map, &self.key) {
-                crate::intrinsics::map_slot(self.map, &self.key)
+        fn new(map: &'a mut M, key: K) -> Entry<'a, M, K, V> {
+            if crate::intrinsics::map_has(&*map, &key) {
+                Entry::Occupied(OccupiedEntry { map: map, key: key, value: crate::marker::PhantomData })
             } else {
-                crate::intrinsics::map_or_insert(self.map, self.key, default())
+                Entry::Vacant(VacantEntry { map: map, key: key, value: crate::marker::PhantomData })
             }
         }
+        pub fn or_insert(self, default: V) -> &'a mut V {
+            match self { Entry::Occupied(entry) => entry.into_mut(), Entry::Vacant(entry) => entry.insert(default) }
+        }
+        pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> &'a mut V {
+            match self { Entry::Occupied(entry) => entry.into_mut(), Entry::Vacant(entry) => entry.insert(default()) }
+        }
         pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> &'a mut V {
-            if crate::intrinsics::map_has(&*self.map, &self.key) {
-                crate::intrinsics::map_slot(self.map, &self.key)
-            } else {
-                let value = default(&self.key);
-                crate::intrinsics::map_or_insert(self.map, self.key, value)
+            match self {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let value = default(&entry.key);
+                    entry.insert(value)
+                }
             }
         }
         pub fn or_default(self) -> &'a mut V where V: Default {
-            if crate::intrinsics::map_has(&*self.map, &self.key) {
-                crate::intrinsics::map_slot(self.map, &self.key)
-            } else {
-                crate::intrinsics::map_or_insert(self.map, self.key, V::default())
-            }
+            match self { Entry::Occupied(entry) => entry.into_mut(), Entry::Vacant(entry) => entry.insert(V::default()) }
         }
         pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Entry<'a, M, K, V> {
-            if crate::intrinsics::map_has(&*self.map, &self.key) {
-                f(crate::intrinsics::map_slot(self.map, &self.key));
+            match self {
+                Entry::Occupied(mut entry) => {
+                    f(entry.get_mut());
+                    Entry::Occupied(entry)
+                }
+                Entry::Vacant(entry) => Entry::Vacant(entry),
             }
-            self
         }
+        pub fn key(&self) -> &K {
+            match self { Entry::Occupied(entry) => &entry.key, Entry::Vacant(entry) => &entry.key }
+        }
+    }
+
+    impl<'a, M, K, V> OccupiedEntry<'a, M, K, V> {
         pub fn key(&self) -> &K { &self.key }
+        pub fn get(&self) -> &V { crate::intrinsics::map_slot(self.map, &self.key) }
+        pub fn get_mut(&mut self) -> &mut V { crate::intrinsics::map_slot(self.map, &self.key) }
+        pub fn into_mut(self) -> &'a mut V { crate::intrinsics::map_slot(self.map, &self.key) }
+        pub fn insert(&mut self, value: V) -> V { crate::mem::replace(self.get_mut(), value) }
+        pub fn remove(self) -> V {
+            let removed: Option<V> = crate::intrinsics::map_remove(self.map, &self.key);
+            removed.unwrap()
+        }
+        pub fn remove_entry(self) -> (K, V) {
+            let removed: Option<(K, V)> = crate::intrinsics::map_remove_entry(self.map, &self.key);
+            removed.unwrap()
+        }
+    }
+
+    impl<'a, M, K, V> VacantEntry<'a, M, K, V> {
+        pub fn key(&self) -> &K { &self.key }
+        pub fn into_key(self) -> K { self.key }
+        pub fn insert(self, value: V) -> &'a mut V { crate::intrinsics::map_or_insert(self.map, self.key, value) }
     }
 
     macro_rules! map_methods {
@@ -1793,7 +1931,7 @@ pub mod collections {
                 pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool { crate::intrinsics::map_has(self, key) }
                 pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> Option<V> { crate::intrinsics::map_remove(self, key) }
                 pub fn remove_entry<Q: ?Sized>(&mut self, key: &Q) -> Option<(K, V)> { crate::intrinsics::map_remove_entry(self, key) }
-                pub fn entry(&mut self, key: K) -> Entry<'_, $map<K, V>, K, V> { Entry { map: self, key: key, value: None } }
+                pub fn entry(&mut self, key: K) -> Entry<'_, $map<K, V>, K, V> { Entry::new(self, key) }
                 pub fn keys(&self) -> Lazy<&K> { crate::intrinsics::map_keys(self) }
                 pub fn values(&self) -> Lazy<&V> { crate::intrinsics::map_values(self) }
                 pub fn values_mut(&mut self) -> Lazy<&mut V> { crate::intrinsics::map_values(self) }
@@ -1833,6 +1971,16 @@ pub mod collections {
             }
             impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for $map<K, V> {
                 fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { crate::intrinsics::map_debug(self, f) }
+            }
+            impl<K, V, const N: usize> From<[(K, V); N]> for $map<K, V> {
+                fn from(entries: [(K, V); N]) -> $map<K, V> {
+                    let mut map = $map::new();
+                    map.extend(entries);
+                    map
+                }
+            }
+            impl<K, V> $map<K, V> {
+                pub fn append(&mut self, other: &mut $map<K, V>) { self.extend(other.drain()) }
             }
         };
     }
@@ -1882,6 +2030,32 @@ pub mod collections {
             impl<T: fmt::Debug> fmt::Debug for $set<T> {
                 fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { crate::intrinsics::map_debug(self, f) }
             }
+            impl<T, const N: usize> From<[T; N]> for $set<T> {
+                fn from(items: [T; N]) -> $set<T> {
+                    let mut set = $set::new();
+                    set.extend(items);
+                    set
+                }
+            }
+            impl<T> $set<T> {
+                pub fn append(&mut self, other: &mut $set<T>) { self.extend(other.drain()) }
+            }
+            impl<T: Clone> crate::ops::BitOr<&$set<T>> for &$set<T> {
+                type Output = $set<T>;
+                fn bitor(self, rhs: &$set<T>) -> $set<T> { self.union(rhs).cloned().collect() }
+            }
+            impl<T: Clone> crate::ops::BitAnd<&$set<T>> for &$set<T> {
+                type Output = $set<T>;
+                fn bitand(self, rhs: &$set<T>) -> $set<T> { self.intersection(rhs).cloned().collect() }
+            }
+            impl<T: Clone> crate::ops::Sub<&$set<T>> for &$set<T> {
+                type Output = $set<T>;
+                fn sub(self, rhs: &$set<T>) -> $set<T> { self.difference(rhs).cloned().collect() }
+            }
+            impl<T: Clone> crate::ops::BitXor<&$set<T>> for &$set<T> {
+                type Output = $set<T>;
+                fn bitxor(self, rhs: &$set<T>) -> $set<T> { self.symmetric_difference(rhs).cloned().collect() }
+            }
         };
     }
     set_methods!(HashSet);
@@ -1924,6 +2098,14 @@ pub mod collections {
         pub fn resize(&mut self, len: usize, value: T) where T: Clone { self.items.resize(len, value) }
         pub fn as_slices(&self) -> (&[T], &[T]) { (&self.items[..], &self.items[0..0]) }
         pub fn range<R: RangeBounds>(&self, range: R) -> Lazy<&T> { crate::intrinsics::lazy_range(&self.items, range) }
+        pub fn retain_mut<F: FnMut(&mut T) -> bool>(&mut self, f: F) { self.items.retain_mut(f) }
+        pub fn binary_search(&self, x: &T) -> Result<usize, usize> where T: Ord { self.items.binary_search(x) }
+        pub fn binary_search_by<F: FnMut(&T) -> crate::cmp::Ordering>(&self, f: F) -> Result<usize, usize> { self.items.binary_search_by(f) }
+        pub fn binary_search_by_key<B: Ord, F: FnMut(&T) -> B>(&self, b: &B, f: F) -> Result<usize, usize> { self.items.binary_search_by_key(b, f) }
+        pub fn partition_point<P: FnMut(&T) -> bool>(&self, pred: P) -> usize { self.items.partition_point(pred) }
+        pub fn swap_remove_back(&mut self, index: usize) -> Option<T> { if index < self.items.len() { Some(self.items.swap_remove(index)) } else { None } }
+        pub fn shrink_to_fit(&mut self) {}
+        pub fn reserve(&mut self, additional: usize) {}
     }
     impl<T> Index<usize> for VecDeque<T> {
         type Output = T;
@@ -1943,7 +2125,7 @@ pub mod collections {
         fn into_iter(self) -> Lazy<&T> { crate::intrinsics::lazy_elements(&self.items) }
     }
     impl<T: fmt::Debug> fmt::Debug for VecDeque<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.items) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.items, f) }
     }
     impl<T> From<Vec<T>> for VecDeque<T> {
         fn from(items: Vec<T>) -> VecDeque<T> { VecDeque { items: items } }
@@ -2016,7 +2198,7 @@ pub mod collections {
         fn into_iter(self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.items) }
     }
     impl<T: fmt::Debug> fmt::Debug for BinaryHeap<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.items) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.items, f) }
     }
 }
 
@@ -2499,5 +2681,71 @@ pub mod env {
     }
     pub fn var(key: &str) -> Result<String, VarError> {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
+    }
+}
+
+pub mod bool {
+    impl bool {
+        pub fn then<T, F: FnOnce() -> T>(self, f: F) -> Option<T> { if self { Some(f()) } else { None } }
+        pub fn then_some<T>(self, t: T) -> Option<T> { if self { Some(t) } else { None } }
+    }
+}
+
+pub mod ascii_bytes {
+    impl u8 {
+        pub fn is_ascii(&self) -> bool { *self < 128 }
+        pub fn is_ascii_digit(&self) -> bool { (*self as char).is_ascii_digit() }
+        pub fn is_ascii_hexdigit(&self) -> bool { (*self as char).is_ascii_hexdigit() }
+        pub fn is_ascii_alphabetic(&self) -> bool { (*self as char).is_ascii_alphabetic() }
+        pub fn is_ascii_alphanumeric(&self) -> bool { (*self as char).is_ascii_alphanumeric() }
+        pub fn is_ascii_uppercase(&self) -> bool { (*self as char).is_ascii_uppercase() }
+        pub fn is_ascii_lowercase(&self) -> bool { (*self as char).is_ascii_lowercase() }
+        pub fn is_ascii_punctuation(&self) -> bool { (*self as char).is_ascii_punctuation() }
+        pub fn is_ascii_whitespace(&self) -> bool { (*self as char).is_ascii_whitespace() }
+        pub fn is_ascii_graphic(&self) -> bool { (*self as char).is_ascii_graphic() }
+        pub fn is_ascii_control(&self) -> bool { (*self as char).is_ascii_control() }
+        pub fn to_ascii_uppercase(&self) -> u8 { if self.is_ascii_lowercase() { *self - 32 } else { *self } }
+        pub fn to_ascii_lowercase(&self) -> u8 { if self.is_ascii_uppercase() { *self + 32 } else { *self } }
+        pub fn make_ascii_uppercase(&mut self) { *self = self.to_ascii_uppercase(); }
+        pub fn make_ascii_lowercase(&mut self) { *self = self.to_ascii_lowercase(); }
+        pub fn eq_ignore_ascii_case(&self, other: &u8) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
+    }
+}
+
+pub mod array {
+    use crate::convert::TryFrom;
+
+    pub fn from_fn<T, const N: usize, F: FnMut(usize) -> T>(f: F) -> [T; N] {
+        let mut f = f;
+        let mut items = Vec::new();
+        for index in 0..N { items.push(f(index)); }
+        crate::intrinsics::vec_to_array(items)
+    }
+    impl<T, const N: usize> [T; N] {
+        pub fn map<U, F: FnMut(T) -> U>(self, f: F) -> [U; N] {
+            let mut f = f;
+            let mut items = Vec::new();
+            for item in self { items.push(f(item)); }
+            crate::intrinsics::vec_to_array(items)
+        }
+    }
+    impl<T, const N: usize> TryFrom<Vec<T>> for [T; N] {
+        type Error = Vec<T>;
+        fn try_from(items: Vec<T>) -> Result<[T; N], Vec<T>> {
+            if items.len() == N { Ok(crate::intrinsics::vec_to_array(items)) } else { Err(items) }
+        }
+    }
+    #[derive(Debug, Clone, Copy)]
+    pub struct TryFromSliceError(());
+    impl crate::fmt::Display for TryFromSliceError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "could not convert slice to array")
+        }
+    }
+    impl<T: Copy, const N: usize> TryFrom<&[T]> for [T; N] {
+        type Error = TryFromSliceError;
+        fn try_from(items: &[T]) -> Result<[T; N], TryFromSliceError> {
+            if items.len() == N { Ok(crate::intrinsics::vec_to_array(items.to_vec())) } else { Err(TryFromSliceError(())) }
+        }
     }
 }

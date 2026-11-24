@@ -1,0 +1,21 @@
+0
+ok: new item BOLT x100
+ok: new item NUT x250
+ok: restocked bolt to 120
+ok: took 30 nut
+err: unknown sku gear (UnknownSku("gear"))
+err: bolt: have 120, want 500 (Insufficient { sku: "bolt", have: 120, want: 500 })
+err: parse error: bad op sell (Parse("bad op sell"))
+err: parse error: invalid digit found in string (Parse("invalid digit found in string"))
+err: parse error: missing sku in "add" (Parse("missing sku in \"add\""))
+ok: new item GEAR x3
+sku     |   qty|   price|     value
+bolt    |   120|   $0.15|    $18.00
+gear    |     3|  $12.50|    $37.50
+nut     |   220|   $0.05|    $11.00
+total $66.50
+cheapest Some("NUT")
+low stock ["gear"]
+removed Item { name: "GEAR", qty: 3, price_cents: 1250 }
+vacant key zzz
+keys ["bolt", "nut"]

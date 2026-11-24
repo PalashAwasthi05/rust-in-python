@@ -965,11 +965,34 @@ impl {T} {
     pub fn midpoint(self, rhs: {T}) -> {T};
     pub fn to_be_bytes(self) -> Vec<u8>;
     pub fn to_le_bytes(self) -> Vec<u8>;
+    pub fn from_be_bytes(bytes: [u8; {N}]) -> {T};
+    pub fn from_le_bytes(bytes: [u8; {N}]) -> {T};
+    pub fn from_ne_bytes(bytes: [u8; {N}]) -> {T};
     pub fn from_str_radix(src: &str, radix: u32) -> Result<{T}, crate::num::ParseIntError>;
 }
 impl crate::str::FromStr for {T} {
     type Err = crate::num::ParseIntError;
     fn from_str(s: &str) -> Result<{T}, crate::num::ParseIntError> { crate::intrinsics::parse_int(s) }
+}
+"""
+UNSIGNED_METHODS = """
+impl {T} {
+    pub fn checked_add_signed(self, rhs: {S}) -> Option<{T}> {
+        if rhs >= 0 { self.checked_add(rhs as {T}) } else { self.checked_sub(rhs.unsigned_abs()) }
+    }
+    pub fn saturating_add_signed(self, rhs: {S}) -> {T} {
+        if rhs >= 0 { self.saturating_add(rhs as {T}) } else { self.saturating_sub(rhs.unsigned_abs()) }
+    }
+    pub fn wrapping_add_signed(self, rhs: {S}) -> {T} { self.wrapping_add(rhs as {T}) }
+    pub fn checked_next_power_of_two(self) -> Option<{T}> {
+        if self <= 1 { return Some(1); }
+        let shift = {T}::BITS - (self - 1).leading_zeros();
+        if shift >= {T}::BITS { None } else { Some(1 << shift) }
+    }
+    pub fn div_ceil(self, rhs: {T}) -> {T} {
+        let quotient = self / rhs;
+        if self % rhs > 0 { quotient + 1 } else { quotient }
+    }
 }
 """
 FLOAT_METHODS = """
@@ -1046,8 +1069,16 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
             }
         }
     }
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct ParseFloatError { empty: bool }
+    #[derive(Debug)]
+    enum FloatErrorKind { Empty, Invalid }
+    impl crate::fmt::Debug for ParseFloatError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            let kind = if self.empty { FloatErrorKind::Empty } else { FloatErrorKind::Invalid };
+            f.debug_struct("ParseFloatError").field("kind", &kind).finish()
+        }
+    }
     impl crate::fmt::Display for ParseFloatError {
         fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
             if self.empty { write!(f, "cannot parse float from empty string") } else { write!(f, "invalid float literal") }
@@ -1061,12 +1092,19 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         }
     }
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ParseCharError;
+    pub struct ParseCharError { kind: CharErrorKind }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CharErrorKind { EmptyString, TooManyChars }
     impl crate::fmt::Display for ParseCharError {
-        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid character") }
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            match self.kind {
+                CharErrorKind::EmptyString => write!(f, "cannot parse char from empty string"),
+                CharErrorKind::TooManyChars => write!(f, "too many characters in string"),
+            }
+        }
     }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TryFromIntError;
+    pub struct TryFromIntError(IntErrorKind);
     impl crate::fmt::Display for TryFromIntError {
         fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
             write!(f, "out of range integral type conversion attempted")
@@ -1084,7 +1122,8 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) => Ok(c),
-                _ => Err(ParseCharError),
+                (None, _) => Err(ParseCharError { kind: CharErrorKind::EmptyString }),
+                _ => Err(ParseCharError { kind: CharErrorKind::TooManyChars }),
             }
         }
     }
@@ -1093,7 +1132,10 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         fn from_str(s: &str) -> Result<String, crate::convert::Infallible> { Ok(s.to_string()) }
     }
 """ + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:])
+                                .replace("{N}", str(INTEGER_WIDTHS[kind] // 8))
               for kind in sorted(INTEGER_TYPES)) + "".join(
+    UNSIGNED_METHODS.replace("{T}", kind).replace("{S}", "i" + kind[1:])
+    for kind in sorted(INTEGER_TYPES) if kind.startswith("u")) + "".join(
     FLOAT_METHODS.replace("{T}", kind).replace("{B}", "u" + kind[1:]) for kind in sorted(FLOAT_TYPES)) + "}\n"
 def integer_conversions():
     """From impls for lossless integer conversions and TryFrom for the rest, as Rust's std provides."""
@@ -2567,6 +2609,12 @@ def loose_equal(first, second):
         return literal_compatible(second, first)
     if isinstance(first, AppliedType) and isinstance(second, AppliedType):
         return first.name == second.name and all(map(loose_equal, first.arguments, second.arguments))
+    if isinstance(first, TupleType) and isinstance(second, TupleType):
+        return len(first.elements) == len(second.elements) and all(map(loose_equal, first.elements, second.elements))
+    if isinstance(first, ReferenceType) and isinstance(second, ReferenceType):
+        return first.mutable == second.mutable and loose_equal(first.inner, second.inner)
+    if isinstance(first, (ArrayType, SliceType)) and type(first) is type(second):
+        return loose_equal(first.element, second.element)
     return first == second
 
 
@@ -2719,6 +2767,7 @@ class Program:
     dispatches: dict = field(default_factory=dict)
     traits_in_scope: dict = field(default_factory=dict)
     values_in_scope: dict = field(default_factory=dict)
+    structs_in_scope: dict = field(default_factory=dict)
     constants_in_scope: dict = field(default_factory=dict)
     statics: dict = field(default_factory=dict)
     opaque_witnesses: dict = field(default_factory=dict)
@@ -4550,6 +4599,9 @@ class Parser:
                     raise self.current.error("expected a macro delimiter")
                 if word in {"panic", "unreachable", "unimplemented", "todo"}:
                     return Expr("panic", token, self.arguments(opening))
+                if word == "format_args":
+                    # fmt::Arguments is modelled as the String it would render to.
+                    word, token = "format", replace(token, text="format")
                 if word in {"println", "print", "eprintln", "eprint", "format"}:
                     return Expr("format" if word == "format" else "print", token, self.arguments(opening))
                 if not self.fragment:
@@ -5731,7 +5783,7 @@ FORMAT_SPECIFICATION = re.compile(
     r"(?:(?P<fill>[^{}])(?P<filled_alignment>[<^>])|(?P<alignment>[<^>]))?"
     r"(?P<sign>[+-])?(?P<alternate>#)?(?P<zero>0(?!\$))?"
     r"(?P<width>[^\s$.:]+\$|[0-9]+)?"
-    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<kind>[?boxXeE])?"
+    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<debug_hex>[xX](?=\?))?(?P<kind>[?boxXeE])?"
 )
 
 
@@ -5750,6 +5802,7 @@ class FormatSpec:
     zero: bool
     width: int | FormatCount
     precision: int | FormatCount | None
+    debug_hex: str = ""
 
 
 @dataclass(frozen=True)
@@ -5775,7 +5828,8 @@ def parse_format_field(text, token):
     except ValueError:
         raise token.error("format argument is out of range") from None
     spec = FormatSpec(fields["kind"] or "", fields["fill"] or " ", fields["filled_alignment"] or fields["alignment"],
-                      fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision)
+                      fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision,
+                      fields["debug_hex"] or "")
     return FormatField(argument, spec)
 
 
@@ -7256,7 +7310,7 @@ class Checker:
         if id(expr) in self.program.call_functions or expr.kind in {
             "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
             "string_iterator", "iterator_terminal", "lazy_adapter", "enum_method", "string_method",
-            "vector_method", "to_string", "scalar_cast", "range_value", "chars_as_str", "enum_cast"
+            "vector_method", "to_string", "scalar_cast", "range_value", "chars_as_str", "enum_cast", "iterator_len"
         } and id(expr) in self.program.expr_types:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
@@ -7294,7 +7348,11 @@ class Checker:
             return actual
         target = expected.inner
         inner = self.resolve(actual.inner)
-        if isinstance(inner, ReferenceType) and not isinstance(self.resolve(target), (ReferenceType, TypeVariable)):
+        resolved_target = self.resolve(target)
+        numeric_literal = isinstance(resolved_target, TypeVariable) and (
+            resolved_target.integer_literal or resolved_target.float_literal)
+        if isinstance(inner, ReferenceType) and (numeric_literal or not isinstance(
+                resolved_target, (ReferenceType, TypeVariable))):
             # Deref coercion: &&T becomes &T by reading through the outer reference.
             original = replace(expr)
             for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
@@ -7652,6 +7710,12 @@ class Checker:
             return self.type_of(args[0], scope, expected)
         if kind == "name":
             ctor = self.program.constructors.get(token.text)
+            imported = self.program.structs_in_scope.get(token.module, {}).get(token.text)
+            if (ctor is None and imported in self.program.constructors and "::" not in token.text
+                    and self.local_binding(scope, token) is None):
+                # An imported tuple struct named as a value, as in `.map(Reverse)`.
+                token = expr.token = replace(token, text=imported)
+                ctor = self.program.constructors[imported]
             if ctor and ctor.style == "unit":
                 return self.constructor(expr, "unit", expected).annotation
             arity = self.path_arity(expr, scope)
@@ -8491,6 +8555,15 @@ class Checker:
                     self.type_of(original, scope)
                 expr.kind, expr.args = "chars_as_str", (original,)
                 return STR_REFERENCE
+        lazy_base = isinstance(base, AppliedType) and base.name == LAZY
+        if (isinstance(actual, IteratorType) or isinstance(base, IteratorType) or lazy_base) and name == "len" and (
+                not rest and expr.type_arguments is None):
+            # ExactSizeIterator::len counts the remaining items without consuming them.
+            if isinstance(actual, ReferenceType):
+                original = Expr("deref", original.token, (original, False))
+                self.type_of(original, scope)
+            expr.kind, expr.args = "iterator_len", (original,)
+            return "usize"
         if base in {STRING, "str"} and name in {"chars", "bytes"} and not rest and expr.type_arguments is None:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", original.token, (original, False))
@@ -8587,6 +8660,12 @@ class Checker:
                 and not isinstance(base, (TypeParameter, OpaqueType))):
             # Method lookup probes the receiver's own type first, so `iter.by_ref().take(n)` uses &mut I.
             receiver = actual
+        if len(candidates) > 1 and not isinstance(actual, ReferenceType):
+            # Method probing tries the by-value receiver before autoref, so `(1..3).eq(..)` is Iterator::eq.
+            by_value = [trait for trait in candidates
+                        if not isinstance(trait.methods[name].params[0][2], ReferenceType)]
+            if len(by_value) == 1:
+                candidates = by_value
         if len(candidates) > 1:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
@@ -10029,7 +10108,7 @@ class Ownership:
             return None
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"length", "is_empty", "to_string", "float_method", "chars_as_str", "enum_cast"}:
+        if kind in {"length", "is_empty", "to_string", "float_method", "chars_as_str", "enum_cast", "iterator_len"}:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "range_value":
             for item in args[:2]:
@@ -10646,6 +10725,8 @@ def format_exponent(value, kind, precision):
     if isinstance(value, float) and not math.isfinite(value):
         return format_float(value, False)
     decimal = decimal_float(value) if isinstance(value, float) else Decimal(value)
+    if decimal == 0:
+        decimal = Decimal(0).copy_sign(decimal)
     if precision is None:
         text = format(decimal, "e")
     elif isinstance(value, float):
@@ -10671,35 +10752,61 @@ def format_float(value, debug):
     return text + ".0" if debug and "." not in text else text
 
 
+PRETTY_SPEC = FormatSpec("?", " ", None, None, True, False, 0, None)
+
+
 def pretty_debug(value, indent=0):
+    return debug_text(value, PRETTY_SPEC, indent)
+
+
+def debug_text(value, spec, indent=0):
+    """`{:?}`/`{:#?}` of a built-in value: like Rust, the spec's width, precision, and sign reach the leaves."""
     while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         value = value.read()
+    pretty = spec.alternate
     if USER_FORMAT is not None and isinstance(value, Value):
-        text = USER_FORMAT(value, True, alternate=True)
+        text = USER_FORMAT(value, True, alternate=pretty, spec=spec)
         if text is not None:
-            return text.replace("\n", "\n" + " " * indent)
-    if isinstance(value, MapValue) and value.entries:
-        entries = MAP_ORDER(value)
+            return text.replace("\n", "\n" + " " * indent) if indent else text
+    nested = indent + 4 if pretty else 0
+    if isinstance(value, MapValue):
+        entries = MAP_ORDER(value) if MAP_ORDER else value.entries.values()
         if all(item[1] is MAP_MEMBER for item in entries):
-            lines = [pretty_debug(key, indent + 4) for key, _ in entries]
+            parts = [debug_text(key, spec, nested) for key, _ in entries]
         else:
-            lines = [f"{pretty_debug(key, indent + 4)}: {pretty_debug(item, indent + 4)}" for key, item in entries]
-        return "{\n" + "".join(" " * (indent + 4) + line + ",\n" for line in lines) + " " * indent + "}"
-    if isinstance(value, ArrayValue) and value.items:
+            parts = [f"{debug_text(key, spec, nested)}: {debug_text(item, spec, nested)}" for key, item in entries]
+        opening, closing = "{", "}"
+    elif isinstance(value, ArrayValue):
+        parts = [debug_text(item, spec, nested) for item in value.items]
         opening, closing = "[", "]"
-        entries = [pretty_debug(item, indent + 4) for item in value.items]
     elif isinstance(value, Value) and value.fields:
         ctor = value.constructor
         name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
-        entries = [pretty_debug(item, indent + 4) for item in value.fields]
+        parts = [debug_text(item, spec, nested) for item in value.fields]
         if ctor.style == "record":
+            parts = [f"{field}: {part}" for (field, _), part in zip(ctor.fields, parts)]
             opening, closing = f"{name} {{", "}"
-            entries = [f"{field}: {entry}" for (field, _), entry in zip(ctor.fields, entries)]
+            if not pretty:
+                return f"{name} {{ {', '.join(parts)} }}"
         else:
             opening, closing = f"{name}(", ")"
+            if not pretty and not name:
+                return tuple_text(parts)
+    elif isinstance(value, int) and not isinstance(value, bool) and spec.debug_hex:
+        # `{:x?}` prints integers in hex; leaves carry no width, so negatives print as 128-bit two's complement.
+        return format_value(value, "i128", dataclass_replace(spec, kind=spec.debug_hex, alternate=False))
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        annotation = "f64" if isinstance(value, float) else "i64"
+        return format_value(value, annotation, dataclass_replace(spec, alternate=False))
+    elif value is None or isinstance(value, bool):
+        return format_value(display(value, True), None, dataclass_replace(spec, kind="", precision=None))
     else:
         return display(value, True)
-    lines = "".join(" " * (indent + 4) + entry + ",\n" for entry in entries)
+    if not pretty:
+        return opening + ", ".join(parts) + closing
+    if not parts:
+        return opening + closing
+    lines = "".join(" " * (indent + 4) + part + ",\n" for part in parts)
     return opening + "\n" + lines + " " * indent + closing
 
 
@@ -10724,8 +10831,8 @@ def format_value(value, annotation, spec):
         text = format_exponent(value, kind, spec.precision)
     elif isinstance(value, float) and spec.precision is not None and math.isfinite(value):
         text = format(value, f".{spec.precision}f")
-    elif kind == "?" and spec.alternate:
-        text = pretty_debug(value)
+    elif kind == "?" and (spec.debug_hex or not (isinstance(value, (int, float)) and not isinstance(value, bool))):
+        return debug_text(value, spec)
     else:
         text = display(value, kind == "?")
         if spec.precision is not None and not numeric and kind == "":
@@ -11332,6 +11439,7 @@ class Interpreter:
         function = self.functions[name]
         if function.body is None:
             previous = self.type_arguments
+            previous_types = getattr(self, "intrinsic_types", None)
             self.type_arguments = {p: self.program.normalize(substitute(t, previous))
                                    for p, t in (arguments or {}).items()}
             try:
@@ -11350,6 +11458,7 @@ class Interpreter:
                 return INTRINSICS[key](self, result, *values)
             finally:
                 self.type_arguments = previous
+                self.intrinsic_types = previous_types
         own = {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
@@ -11555,7 +11664,8 @@ class Interpreter:
             if isinstance(result, AppliedType) and result.name in {OPTION, RESULT}:
                 inner = result.arguments[0]
                 product = token.text == "product"
-                total = rounded_float(float(int(product)), inner) if inner in FLOAT_TYPES else int(product)
+                # Rust's float Sum starts from -0.0, so an empty sum is -0.
+                total = (1.0 if product else -0.0) if inner in FLOAT_TYPES else int(product)
                 for value in values:
                     value = map_of(value)
                     variant = value.constructor.path.rsplit("::", 1)[-1]
@@ -11571,7 +11681,7 @@ class Interpreter:
             product = token.text == "product"
             total = int(product)
             if result in FLOAT_TYPES:
-                total = rounded_float(float(total), result)
+                total = 1.0 if product else -0.0
             for value in values:
                 element = value.read() if isinstance(value, Address) else value
                 if result in FLOAT_TYPES:
@@ -11584,6 +11694,13 @@ class Interpreter:
         if kind == "enum_cast":
             value = map_of(self.eval(args[0], scope))
             return truncate_integer(self.program.discriminant(value.constructor), args[1])
+        if kind == "iterator_len":
+            iterator = self.eval(args[0], scope)
+            if iterator.cursor is None:
+                return sum(1 for _ in self.iteration_values(iterator, None, token))
+            first, second = itertools.tee(iterator.cursor[0])
+            iterator.cursor[0] = first
+            return sum(1 for _ in second)
         if kind == "chars_as_str":
             iterator = self.eval(args[0], scope)
             if iterator.cursor is None:
@@ -12417,11 +12534,17 @@ INTRINSICS[".last_mut"] = method_last
 @intrinsic
 def method_get(interpreter, result, items, index):
     if isinstance(index, Value):
+        text = text_of(items)
+        if isinstance(text, str):
+            data = text.encode()
+            start, stop = interpreter.range_bounds(index, len(data))
+            if start is None or any(0 < at < len(data) and data[at] & 0xC0 == 0x80 for at in (start, stop)):
+                return option(interpreter, result)
+            return option(interpreter, result, shared(data[start:stop].decode()))
         start, stop = interpreter.range_bounds(index, len(items_of(items)))
         if start is None:
             return option(interpreter, result)
-        return option(interpreter, result, SliceAddress(*interpreter.slice_parts(items), start, stop)
-                      if not isinstance(text_of(items), str) else shared(text_of(items).encode()[start:stop].decode()))
+        return option(interpreter, result, SliceAddress(*interpreter.slice_parts(items), start, stop))
     return option(interpreter, result, child(items, index)) if index < len(items_of(items)) else option(interpreter, result)
 
 
@@ -12606,14 +12729,12 @@ def method_fill(interpreter, result, items, value):
     items.write(ArrayValue(tuple(interpreter.clone_value(value) for _ in items_of(items))))
 
 
-@intrinsic
-def method_rotate_left(interpreter, result, items, middle):
+def slice_rotate_left(interpreter, result, items, middle):
     values = items_of(items)
     items.write(ArrayValue(values[middle:] + values[:middle]))
 
 
-@intrinsic
-def method_rotate_right(interpreter, result, items, count):
+def slice_rotate_right(interpreter, result, items, count):
     values = items_of(items)
     split = len(values) - count
     items.write(ArrayValue(values[split:] + values[:split]))
@@ -12782,8 +12903,9 @@ def method_retain(interpreter, result, items, keep):
     if isinstance(value, str):
         items.write("".join(char for char in value if interpreter.call_value(keep, Character(char))))
         return None
-    items.write(ArrayValue(tuple(item for index, item in enumerate(value.items)
-                                 if interpreter.call_value(keep, child(items, index)))))
+    keeps = [interpreter.call_value(keep, child(items, index)) for index in range(len(value.items))]
+    # Read the elements again: retain_mut's closure may have changed them.
+    items.write(ArrayValue(tuple(item for item, kept in zip(items_of(items), keeps) if kept)))
 
 
 INTRINSICS[".retain_mut"] = method_retain
@@ -12935,6 +13057,23 @@ def rust_iter_collect(interpreter, result, iterator):
 @intrinsic
 def rust_lazy_next(interpreter, result, address):
     return interpreter.iterator_next(address, result)
+
+
+@intrinsic
+def rust_vec_to_array(interpreter, result, items):
+    # Vectors and arrays share one runtime representation.
+    return items
+
+
+@intrinsic
+def rust_lazy_next_back(interpreter, result, address):
+    iterator = interpreter.start_iterator(address)
+    items = list(iterator.cursor[0])
+    if not items:
+        return option(interpreter, result)
+    item = items.pop()
+    iterator.cursor[0] = iter(items)
+    return option(interpreter, result, item)
 
 
 def make_tuple(interpreter, annotation, *values):
@@ -13508,6 +13647,8 @@ def method_trailing_ones(interpreter, result, value):
 
 @intrinsic
 def method_rotate_left(interpreter, result, value, amount):
+    if result not in INTEGER_WIDTHS:
+        return slice_rotate_left(interpreter, result, value, amount)
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits << amount) | (bits >> (width - amount))) & ((1 << width) - 1), result)
@@ -13515,6 +13656,8 @@ def method_rotate_left(interpreter, result, value, amount):
 
 @intrinsic
 def method_rotate_right(interpreter, result, value, amount):
+    if result not in INTEGER_WIDTHS:
+        return slice_rotate_right(interpreter, result, value, amount)
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits >> amount) | (bits << (width - amount))) & ((1 << width) - 1), result)
@@ -13593,6 +13736,19 @@ def method_to_le_bytes(interpreter, result, value):
     return ArrayValue(tuple(unsigned_bits(value, width).to_bytes(width // 8, "little")))
 
 
+@intrinsic
+def method_from_be_bytes(interpreter, result, data):
+    return wrap(int.from_bytes(bytes(items_of(data)), "big"), result)
+
+
+@intrinsic
+def method_from_le_bytes(interpreter, result, data):
+    return wrap(int.from_bytes(bytes(items_of(data)), "little"), result)
+
+
+INTRINSICS[".from_ne_bytes"] = method_from_le_bytes
+
+
 def parse_error(interpreter, result, kind):
     error = result.arguments[1]
     kinds = MODULE_SEPARATOR.join(("std", "num", "IntErrorKind"))
@@ -13634,8 +13790,7 @@ def rust_try_integer(interpreter, result, value):
     low, high = INTEGER_BOUNDS[result.arguments[0]]
     if low <= value < high:
         return interpreter.variant(result, "Ok", value)
-    error = result.arguments[1]
-    return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], ()))
+    return parse_error(interpreter, result, "PosOverflow" if value >= high else "NegOverflow")
 
 
 @intrinsic
@@ -13901,9 +14056,13 @@ def rust_map_retain(interpreter, result, value, keep):
 @intrinsic
 def rust_map_extend(interpreter, result, value, items):
     target = map_of(value)
+    owner = interpreter.program.concrete_type(interpreter.intrinsic_types[0])
+    owner = owner.inner if isinstance(owner, ReferenceType) else owner
+    borrowed = [isinstance(kind, ReferenceType) for kind in getattr(owner, "arguments", ())] or [False, False]
     for pair in interpreter.iterate(items, 1):
         pair = map_of(pair)
-        key, item = (field.read() if isinstance(field, Address) else field for field in pair.fields)
+        key, item = (field.read() if isinstance(field, Address) and not keeps else field
+                     for field, keeps in zip(pair.fields, borrowed))
         target.entries[interpreter.map_key(key)] = [key, item]
 
 
@@ -14057,6 +14216,14 @@ def rust_lazy_elements(interpreter, result, items):
     if isinstance(items, (Address, SliceAddress)):
         return lazy(child(items, index) for index in range(len(items_of(items))))
     return lazy(items.items)
+
+
+@intrinsic
+def rust_range_resolve(interpreter, result, bounds, size):
+    start, stop = interpreter.range_bounds(bounds, size)
+    if start is None:
+        raise RustPanic(f"range end index out of range for slice of length {size}")
+    return make_tuple(interpreter, result, start, stop)
 
 
 @intrinsic
@@ -14546,6 +14713,8 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
         }
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
                                               if symbol and symbol.kind == "fn"}
+        program.structs_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
+                                               if symbol and symbol.kind == "struct"}
         program.constants_in_scope[unit.path] = {name: scalars[symbol.name] for name, symbol in symbols.items()
                                                  if symbol and symbol.kind in {"const", "static"}
                                                  and symbol.name in scalars}

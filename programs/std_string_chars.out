@@ -1,0 +1,37 @@
+0
+non-ascii 'é' at byte 1
+non-ascii 'ö' at byte 8
+chars: 11, bytes: 13
+reversed: dlröw olléh
+upper: HÉLLO WÖRLD
+lower: mixed case
+ascii upper: ABC-é
+caesar: Khoor, Zruog!
+decoded: Round Trip
+"A man, a plan, a canal: Panama" palindrome? true
+"not one" palindrome? false
+"Was it a car or a cat I saw?" palindrome? true
+bytes: [65, 90, 97, 122, 48, 57]
+byte sum: 532
+as_bytes[1]: 101
+============
+abcdefghijklmnopqrstuvwxyz
+afkpuz
+repeated: o=2
+title: Hello Big World
+>> abcdef len=9 cap>=true
+Some('f') '>' > abcde
+truncated: "> a"
+retained: ">a"
+empty: true ""
+digits: [4, 0, 9, 6]
+hex: [Some(15), Some(10), None]
+from_digit: Some('7') Some('b')
+from_u32: Some('A')
+punct: true false true
+numeric: true false
+char as u32: 65, u8 as char: a
+len_utf8: 1 2
+sorted unique: acenrstu
+escape: a\nb tab\t
+char from u8 arithmetic: ABCDE

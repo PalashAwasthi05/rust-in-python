@@ -1,0 +1,65 @@
+// Formatting specs: width, precision, sign, radix, exponent, alignment.
+fn main() {
+    let pi = 3.14159265_f64;
+    println!("[{:8.3}]", pi);
+    println!("[{:<8.2}]", pi);
+    println!("[{:^9.1}]", pi);
+    println!("[{:+}]", 42);
+    println!("[{:+.2}]", -1.5);
+    println!("[{:08.3}]", -pi);
+    println!("[{:+08}]", 7);
+    println!("[{:x}] [{:X}] [{:#x}] [{:#010x}]", 255, 255, 255, 255);
+    println!("[{:o}] [{:#o}] [{:b}] [{:#b}] [{:010b}]", 8, 8, 5, 5, 5);
+    println!("[{:e}] [{:E}] [{:e}] [{:.2e}]", 1234.5, 0.00012, 0.0, 123456.0);
+    println!("[{:e}]", 100);
+    let width = 10;
+    let prec = 2;
+    println!("[{:>width$}]", "right");
+    println!("[{:<width$}]", "left");
+    println!("[{:^width$}]", "mid");
+    println!("[{:>1$}]", "dyn", 6);
+    println!("[{:.*}]", 3, 2.0f64.sqrt());
+    println!("[{:>width$.prec$}]", pi, width = width, prec = prec);
+    println!("[{:*^12}]", "star");
+    println!("[{:-<7}]", 'c');
+    println!("[{:>5}]", true);
+    println!("[{:5}] [{:<5}] [{:^5}]", 12, 12, 12);
+    println!("[{:.3}]", "truncate");
+    println!("[{:10.3}]", "truncate");
+    println!("[{0} {1} {0}]", "a", "b");
+    let name = "Ferris";
+    let age = 7;
+    println!("{name} is {age} years old, {age:>4}");
+    println!("{{literal}} {}", 1);
+    println!("[{:?}] [{:?}] [{:?}]", "quote\"d", 'x', "tab\tnew\n");
+    println!("[{:10?}] [{:<10?}]", Some(1), "s");
+    println!("{:.0} {:.0} {:.0} {:.1}", 0.5, 1.5, 2.5, 0.25);
+    println!("{} {} {} {}", 1.0, 0.1 + 0.2, 1e21, 1e-7);
+    println!("{} {} {}", f64::MAX, f64::MIN_POSITIVE, 1.0f32 / 3.0);
+    println!("{:?} {:?} {:?}", 1.0, 0.1f32, -0.0);
+    println!("{} {} {}", f64::NAN, f64::INFINITY, -f64::INFINITY);
+    println!("{:>6} {:<6}|", f64::NAN, f64::INFINITY);
+    println!("{:5}|{:<5}|{:>5}|", 'a', 'b', 'c');
+    println!("{:#?}", (1, "two"));
+    println!("{:x} {:X}", -1i8, 3735928559u32);
+    println!("{:b}", -2i32);
+    println!("{:>+8.2}", 3.14159);
+    println!("{:<+8.2}|", 3.14159);
+    println!("{:08.2}", 3.14159);
+    println!("{:#06x} {:#06b}", 10, 3);
+    let items = [("apple", 1.5, 3), ("kiwi", 0.25, 12), ("watermelon", 4.0, 1)];
+    println!("{:<12}|{:>8}|{:>4}", "item", "price", "qty");
+    println!("{}", "-".repeat(26));
+    for (n, p, q) in items.iter() {
+        println!("{:<12}|{:>8.2}|{:>4}", n, p, q);
+    }
+    let total: f64 = items.iter().map(|(_, p, q)| p * *q as f64).sum();
+    println!("{:<12}|{:>8.2}|", "total", total);
+    let s = format!("{:>w$}", 5, w = 3);
+    println!("{:?}", s);
+    println!("{:?}", format!("{:05}", -42));
+    println!("{:10.3e}|", 1234.5678);
+    println!("{:?} {:?}", u64::MAX, i128::MIN);
+    println!("{:.3?}", vec![1.0, 2.5]);
+    println!("{:5}|{:<3}|", "", "toolong");
+}

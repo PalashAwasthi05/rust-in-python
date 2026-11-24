@@ -1,0 +1,41 @@
+0
+split: ["alpha", "beta", "", "gamma", "delta"]
+splitn: ["alpha", "beta", ",gamma,delta"]
+rsplit: ["delta", "gamma", "", "beta", "alpha"]
+rsplitn: ["delta", "alpha,beta,,gamma"]
+split_terminator: ["a", "b", "c"]
+split_once: name -> Ferris=crab
+rsplit_once: name=Ferris -> crab
+none: None
+whitespace: ["lots", "of", "space", "here"]
+by str: ["one", "two", "three"]
+by closure: ["a", "b", "", "c", "", "", "d"]
+by char set: ["x", "y", "z", "w"]
+split_inclusive: ["line one\n", "line two\n", "last"]
+lines: ["first", "second", "", "fourth"]
+find the: Some(0)
+rfind the: Some(31)
+find vowel: Some(2)
+rfind vowel: Some(41)
+find z: Some(37)
+find missing: None
+o positions: [12, 17, 26, 41]
+matches of 'the': 2
+contains fox: true, starts: true, ends: true
+trim_matches: hello world
+trim_start_matches: hello worldxx
+trim_end_matches: xxhello world
+strip_prefix: Some("1.2.3")
+strip_prefix none: None
+strip_suffix: Some("file")
+version: [1, 20, 3]
+replace: a quick brown fox jumps over a lazy dog
+replacen: the quick br0wn f0x jumps over the lazy dog
+rows: [["1", "ann"], ["2", "bob"]]
+char_indices last: Some((10, 'd'))
+is_char_boundary: false true
+get: Some("Hello") None
+slice: World Hello ll
+split_at: "Hello" " World"
+eq_ignore_ascii_case: true
+cmp: Less true

@@ -1,0 +1,27 @@
+101
+15 chars, 20 bytes
+hex 4772c3bcc39f652c
+decode Ok([72, 101, 108, 108, 111])
+decode odd Err("odd length 3")
+decode bad Err("at 0: invalid digit found in string")
+from_utf8 Ok(20)
+str from_utf8 Ok("Gr")
+invalid true
+lossy Hi�!
+adler32 11e60398
+byte literal [104, 105, 10] 65
+upper SHOUT
+is_ascii true false
+char_indices rev [(3, 'b'), (1, 'ñ'), (0, 'a')]
+nth char Some('ß') None
+rle 3ab2c5de
+escape "tab\there ❤" q\"uote
+unicode escape \u{2764}
+char code 2764 3
+case-insensitive sort ["Alpha", "beta", "zeta"]
+byte sort ["Alpha", "beta", "zeta"]
+reduce Some("Alpha|beta|zeta")
+checked_next_power_of_two Some(8) None
+div_ceil 4 4
+[a, ff] (AB, CD)
+widened total 270
