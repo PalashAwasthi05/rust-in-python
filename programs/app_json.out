@@ -1,0 +1,55 @@
+0
+{
+  "empty": {},
+  "items": [
+    {
+      "id": 1,
+      "price": 9.5,
+      "qty": 4
+    },
+    {
+      "id": 2,
+      "price": 12,
+      "qty": 0
+    },
+    {
+      "id": 3,
+      "price": -12.5,
+      "qty": 2
+    }
+  ],
+  "name": "inventory",
+  "none": [],
+  "owner": {
+    "active": true,
+    "first": "Ada",
+    "last": "Lovelace",
+    "manager": null
+  },
+  "ratio": 0.75,
+  "tags": [
+    "tools",
+    "garden",
+    "a\"quoted\""
+  ],
+  "unicode": "café \t tab",
+  "version": 3
+}
+depth = 3
+sum of numbers = 24.75
+owner.first    => "Ada"
+items.1.price  => 12
+tags.2         => "a\"quoted\""
+items.7        => <missing>
+version.x      => <missing>
+empty          => {}
+inventory value = 13.00
+roundtrip equal: true
+      [1, 2, -> unexpected end of input
+     {"a" 1} -> unexpected '1' at 5
+         tru -> unexpected end of input
+       [1] x -> trailing input at 4
+    "bad \q" -> bad escape \q
+           - -> bad number "-"
+           @ -> unexpected '@' at 0
+Array([Number(1.0), Array([Bool(true), Null]), Object({"k": Str("v")})])

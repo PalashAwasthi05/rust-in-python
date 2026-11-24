@@ -1,0 +1,60 @@
+0
+workload head: [0, 12, 4, 2, 3, 0, 13, 0, 2, 1, 1, 3, 0, 3, 1]
+tiny (capacity 2, ttl None)
+  [tiny] t=  11 req  0 -> user-000:0
+  [tiny] evicted 0 to make room for 4
+  [tiny] evicted 12 to make room for 2
+  [tiny] evicted 4 to make room for 3
+  [tiny] evicted 2 to make room for 0
+  [tiny] evicted 3 to make room for 13
+  [tiny] evicted 13 to make room for 2
+  [tiny] evicted 0 to make room for 1
+  [tiny] t= 169 req  1 -> user-001:761
+  [tiny] evicted 2 to make room for 3
+  [tiny] t= 287 req  1 -> user-001:761
+  [tiny] t= 376 req  3 -> user-003:987
+  [tiny] t= 488 req 23 -> user-023:359
+  [tiny] t= 647 req 13 -> user-013:525
+  [tiny] t= 787 req  2 -> user-002:226
+  [tiny] final MRU order [4, 2], purged 0 at end
+lru-5 (capacity 5, ttl None)
+  [lru-5] t=  11 req  0 -> user-000:0
+  [lru-5] evicted 12 to make room for 13
+  [lru-5] evicted 4 to make room for 1
+  [lru-5] t= 143 req  1 -> user-001:761
+  [lru-5] t= 178 req  1 -> user-001:761
+  [lru-5] t= 244 req  3 -> user-003:987
+  [lru-5] t= 301 req 23 -> user-023:359
+  [lru-5] t= 437 req 13 -> user-013:525
+  [lru-5] t= 564 req  2 -> user-002:226
+  [lru-5] final MRU order [4, 2, 12, 24, 13], purged 0 at end
+lru-5-ttl (capacity 5, ttl Some(60))
+  [lru-5-ttl] t=  11 req  0 -> user-000:0
+  [lru-5-ttl] evicted 12 to make room for 13
+  [lru-5-ttl] evicted 4 to make room for 1
+  [lru-5-ttl] t= 169 req  1 -> user-001:761
+  [lru-5-ttl] t= 274 req  1 -> user-001:761
+  [lru-5-ttl] t= 340 req  3 -> user-003:987
+  [lru-5-ttl] t= 410 req 23 -> user-023:359
+  [lru-5-ttl] t= 569 req 13 -> user-013:525
+  [lru-5-ttl] t= 709 req  2 -> user-002:226
+  [lru-5-ttl] final MRU order [], purged 5 at end
+big (capacity 32, ttl None)
+  [big] t=  11 req  0 -> user-000:0
+  [big] t= 143 req  1 -> user-001:761
+  [big] t= 178 req  1 -> user-001:761
+  [big] t= 200 req  3 -> user-003:987
+  [big] t= 209 req 23 -> user-023:359
+  [big] t= 218 req 13 -> user-013:525
+  [big] t= 246 req  2 -> user-002:226
+  [big] final MRU order [4, 2, 12, 24, 13, 1, 0, 23, 3, 22, 14], purged 0 at end
+config      hits misses expired evicted    rate   time
+tiny          10     50       0      48   16.7%    896
+lru-5         29     31       0      26   48.3%    616
+lru-5-ttl     17     43      17      26   28.3%    796
+big           49     11       0       0   81.7%    251
+fastest: big at t=251
+Some(1) ["a", "c", "b"]
+Some(("b", 2))
+None Some(4) ["d", "c"]
+["c", "d"] Stats { hits: 2, misses: 1, expired: 3, evicted: 1 }

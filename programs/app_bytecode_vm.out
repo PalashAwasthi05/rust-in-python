@@ -1,0 +1,19 @@
+0
+factorial   ok   [3628800 2432902008176640000] in 417 steps, stack=[]
+fib(11)     ok   [89] in 2870 steps, stack=[]
+              local    717
+               call    574
+               push    574
+              arith    429
+             branch    287
+              logic    287
+               misc      2
+collatz(27) ok   [111] in 2091 steps, stack=[]
+underflow   err  stack underflow at pc=2 (Add) (output so far: [])
+divzero     err  divide by zero at pc=3 (output so far: [])
+spin        err  gave up after 500 steps (output so far: [])
+deep        err  call stack overflow (output so far: [])
+badlabel    assembly failed: line 1: unknown label nowhere
+badop       assembly failed: line 2: unknown op 'frobnicate'
+badnum      assembly failed: line 1: invalid digit found in string
+factorial is 25 instructions; first five: [Push(10), Call(7), Print, Push(20), Call(7)]

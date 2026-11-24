@@ -1,0 +1,31 @@
+0
+<h1 id="release-notes-for-v20">Release <em>notes</em> for v2.0</h1>
+<p>This release is <strong>big</strong>. It has <code>fn main() {}</code> and a <a href="https://example.com/a?b=1&amp;c=2">link to docs</a>. Lines in a paragraph are joined.</p>
+<h2 id="whats-new">What's new</h2>
+<ul>
+  <li>Faster <em>parsing</em> of <code>&lt;tags&gt;</code></li>
+  <li>A <strong>bold <em>nested</em> claim</strong> that wraps onto two lines</li>
+  <li>star bullets too</li>
+</ul>
+<ol start="3">
+  <li>third</li>
+  <li>fourth item with *escaped stars*</li>
+</ol>
+<blockquote>
+  <p>Quoted text with <strong>emphasis</strong>.</p>
+  <h1 id="heading-inside-quote">Heading inside quote</h1>
+  <ul>
+    <li>nested list</li>
+  </ul>
+</blockquote>
+<hr />
+<pre><code class="language-rust">fn main() {
+    println!(&quot;&lt;hi&gt; &amp; bye&quot;);
+}</code></pre>
+<p>Unclosed `backtick and *star and [bracket</p>
+<hr />
+<p>Trailing paragraph with 2 * 3 = 6 and snake<em>case</em>name.</p>
+blocks: 11 [2, 3, 1, 1, 2, 2]
+Heading(1, "Release *notes* for v2.0")
+ordered items: ["third", "fourth item with \\*escaped stars\\*"]
+plain &lt;text&gt; &amp; <em>more</em>

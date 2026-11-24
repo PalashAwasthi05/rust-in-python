@@ -966,6 +966,12 @@ impl {T} {
     pub fn to_be_bytes(self) -> Vec<u8>;
     pub fn to_le_bytes(self) -> Vec<u8>;
     pub fn from_str_radix(src: &str, radix: u32) -> Result<{T}, crate::num::ParseIntError>;
+    pub fn checked_rem_euclid(self, rhs: {T}) -> Option<{T}> {
+        match self.checked_rem(rhs) { Some(_) => Some(self.rem_euclid(rhs)), None => None }
+    }
+    pub fn checked_div_euclid(self, rhs: {T}) -> Option<{T}> {
+        match self.checked_div(rhs) { Some(_) => Some(self.div_euclid(rhs)), None => None }
+    }
 }
 impl crate::str::FromStr for {T} {
     type Err = crate::num::ParseIntError;
@@ -2475,6 +2481,7 @@ class Trait:
     associated: dict
     parameters: tuple = ()
     defaults: tuple = ()
+    bindings: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -2886,7 +2893,7 @@ class Program:
                 if isinstance(owner, OpaqueType):
                     bindings = owner.bindings
                 elif isinstance(owner, TypeParameter):
-                    bindings = owner.associated_bindings.items()
+                    bindings = (*owner.associated_bindings.items(), *self.supertrait_bindings(owner))
                 else:
                     bindings = ()
                 for binding, kind in bindings:
@@ -2943,6 +2950,14 @@ class Program:
             arguments = dict(zip(function.type_parameters, annotation.arguments))
             annotation = self.normalize(substitute(self.opaque_witnesses[function.name.text], arguments))
         return annotation
+
+    def supertrait_bindings(self, parameter):
+        """Associated type bindings a parameter inherits from supertrait bounds like `trait T: Add<Output = Self>`."""
+        for name in self.trait_closure(parameter.bounds):
+            trait = self.traits.get(name)
+            if trait is not None and trait.bindings:
+                for binding, kind in trait.bindings.items():
+                    yield binding, substitute(kind, {trait.self_type: parameter})
 
     def trait_closure(self, bounds):
         pending = list(bounds)
@@ -3702,7 +3717,8 @@ class Parser:
         self.lifetime_scope = {**outer_trait_lifetimes, **trait_lifetimes}
         defaults = tuple(self.parameter_defaults.get(parameter) for parameter in trait_parameters)
         self.type_parameters = {"Self": self_type, **trait_parameters}
-        bounds = self.trait_bounds(bindings={}) if self.accept(":") else set()
+        super_bindings = {}
+        bounds = self.trait_bounds(bindings=super_bindings) if self.accept(":") else set()
         self_type.bounds.update(bounds)
         self.where_clause({})
         self.current_trait = name.text
@@ -3715,7 +3731,7 @@ class Parser:
         self.current_trait = None
         self.type_parameters = {}
         program.traits[name.text] = Trait(name, self_type, bounds, methods, associated,
-                                          tuple(trait_parameters.values()), defaults)
+                                          tuple(trait_parameters.values()), defaults, super_bindings)
 
     def impl_item(self, program, token):
         lifetimes, parameters = self.generic_parameters()
@@ -3750,6 +3766,8 @@ class Parser:
         methods = {}
         associated = {}
         while not self.accept("}"):
+            if self.current.text == "#" and self.attributes():
+                raise self.current.error("derive requires a struct or enum")
             visible = self.member_visibility()
             if self.accept("type"):
                 name = self.identifier()
@@ -4680,7 +4698,7 @@ class Parser:
                 lifetime = LifetimeArgument(self.lifetime_token(self.advance()).text)
                 if lifetimes:
                     arguments.append(lifetime)
-            elif (word in {"{", "-", "true", "false"} or self.unqualified_constant()
+            elif (word in {"{", "-", "true", "false"} or (not parameter and self.unqualified_constant())
                   or word and word[0].isdigit()
                   or word.endswith("'") and word.startswith(("'", "b'"))
                   or (parameter and parameter.const_type)):
@@ -4706,7 +4724,8 @@ class Parser:
             return value
         negative = self.accept("-")
         token = self.advance()
-        if not negative and self.constants and is_identifier(token.text):
+        if (not negative and self.constants and is_identifier(token.text)
+                and identifier_text(token.text) not in self.type_parameters):
             path = self.qualified_token(token, (token.text,), bare=True)
             if path.text in self.constants:
                 return self.constants[path.text]
@@ -7702,7 +7721,9 @@ class Checker:
         if kind == "borrow":
             value, mutable = args
             hint = expected.inner if isinstance(expected, ReferenceType) else None
-            if hint == "str" or isinstance(self.resolve(hint), (SliceType, DynType)):
+            if hint == "str" or isinstance(self.resolve(hint), DynType) or (
+                    isinstance(self.resolve(hint), SliceType) and ungroup(value).kind != "array"):
+                # An array literal borrowed as a slice still learns its element type from the slice.
                 hint = None
             if mutable:
                 self.mark_mutable_place(value)
@@ -7963,6 +7984,16 @@ class Checker:
                     trait, method = OPERATOR_TRAITS[token.text]
                     return self.operator_call(expr, scope, expected, trait, method, args, left_type)
                 self.pretyped[id(args[0])] = left_type
+                unresolved = self.resolve(left_type)
+                if (isinstance(unresolved, TypeVariable) and not unresolved.integer_literal
+                        and not unresolved.float_literal and not self.unsuffixed_number(args[1])):
+                    # `m[i] - x` before m's element type is known: an operand of a user type fixes the other.
+                    right_type = self.type_of(args[1], scope)
+                    self.pretyped[id(args[1])] = right_type
+                    if self.overloadable(right_type) and not isinstance(self.resolve(right_type), ReferenceType):
+                        self.require(left_type, right_type, token)
+                        trait, method = OPERATOR_TRAITS[token.text]
+                        return self.operator_call(expr, scope, expected, trait, method, args, right_type)
             if token.text in {"&&", "||"}:
                 hint = "bool"
             elif (hint not in NUMBER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
@@ -8363,6 +8394,10 @@ class Checker:
             callee = self.resolve(callable_signature(callee))
         if not isinstance(callee, FunctionType):
             raise expr.token.error(f"expected a callable value, found {callee}")
+        closure = self.program.functions.get(callee.closure) if callee.closure else None
+        if closure is not None and any(capture.mutable for capture in closure.captures):
+            # Calling an FnMut closure from inside another closure captures it by unique borrow.
+            CaptureContext.mark_mutable(scope, expr.args[0])
         token = expr.token
         params = [(replace(token, text="_"), False, kind) for kind in callee.parameters]
         inputs = Parser.return_inputs(token, params, callee.result, {})
@@ -10823,6 +10858,7 @@ class Interpreter:
         MAP_ORDER = self.map_order
         self.track_drops = any(impl.trait == DROP for impl in program.impls)
         self.implementations = {}
+        self.copy_types = {}
         self.temporaries = []
         self.program = program
         self.functions = program.functions
@@ -10836,14 +10872,24 @@ class Interpreter:
             scope = {}
             for name, item in bindings.items():
                 annotation, mutable = types[name]
-                if isinstance(item, FunctionValue) and item.environment and self.program.is_copy(annotation):
+                if isinstance(item, FunctionValue) and item.environment and self.is_copy(annotation):
                     item = self.clone_value(item)
                 if (self.track_drops and isinstance(address, Address) and isinstance(address.binding, Binding)
                         and not isinstance(item, (Address, SliceAddress, StringAddress, DynAddress))
-                        and not self.program.is_copy(self.program.normalize(substitute(annotation, self.type_arguments)))):
+                        and not self.is_copy(self.program.normalize(substitute(annotation, self.type_arguments)))):
                     address.binding.moved = True
                 scope[name] = Binding(item, mutable)
             yield scope
+
+    def is_copy(self, annotation):
+        """Memoized Program.is_copy; the program's impls are fixed once it runs."""
+        try:
+            return self.copy_types[annotation]
+        except KeyError:
+            result = self.copy_types[annotation] = self.program.is_copy(annotation)
+            return result
+        except TypeError:
+            return self.program.is_copy(annotation)
 
     def eval_chain(self, conditions, scope):
         inner = Scope(scope)
