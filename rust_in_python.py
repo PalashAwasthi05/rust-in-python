@@ -948,6 +948,10 @@ impl {T} {
     pub fn trailing_zeros(self) -> u32;
     pub fn leading_ones(self) -> u32;
     pub fn trailing_ones(self) -> u32;
+    pub fn checked_shl(self, rhs: u32) -> Option<{T}>;
+    pub fn checked_shr(self, rhs: u32) -> Option<{T}>;
+    pub fn wrapping_shl(self, rhs: u32) -> {T};
+    pub fn wrapping_shr(self, rhs: u32) -> {T};
     pub fn rotate_left(self, n: u32) -> {T};
     pub fn rotate_right(self, n: u32) -> {T};
     pub fn swap_bytes(self) -> {T};
@@ -1023,7 +1027,7 @@ impl crate::str::FromStr for {T} {
     fn from_str(s: &str) -> Result<{T}, crate::num::ParseFloatError> { crate::intrinsics::parse_float(s) }
 }
 """
-SCALAR_STD = "pub mod num {\n" + """
+SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ParseIntError { kind: IntErrorKind }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1144,10 +1148,18 @@ OPERATOR_TRAITS = {
 }
 UNARY_TRAITS = {"-": ("Neg", "neg"), "!": ("Not", "not")}
 BUILTIN_OPERATORS = {MODULE_SEPARATOR.join(("std", "ops", trait)): symbol
-                     for symbol, (trait, _) in {**OPERATOR_TRAITS, **UNARY_TRAITS}.items()}
+                     for table in (OPERATOR_TRAITS, UNARY_TRAITS) for symbol, (trait, _) in table.items()}
 BUILTIN_OPERATORS.update({MODULE_SEPARATOR.join(("std", "ops", trait + "Assign")): symbol + "="
                           for symbol, (trait, _) in OPERATOR_TRAITS.items()})
 
+BUILTIN_METHOD_ARITIES = {name: 1 for name in (
+    "is_some", "is_none", "is_ok", "is_err", "unwrap", "len", "is_empty", "to_string", "to_owned", "clone",
+    "abs", "sqrt", "is_nan", "is_finite", "chars", "bytes", "iter", "into_iter", "trim", "to_uppercase",
+    "to_lowercase", "as_str", "pop")}
+BUILTIN_METHOD_ARITIES.update({"expect": 2, "unwrap_or": 2, "push": 2, "push_str": 2, "contains": 2})
+PRELUDE_OWNERS = {MODULE_SEPARATOR.join(parts) for parts in (
+    ("core", "option", "Option"), ("core", "result", "Result"), ("alloc", "vec", "Vec"), ("alloc", "string", "String"),
+    ("alloc", "boxed", "Box"))}
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -1256,6 +1268,7 @@ class Modules:
         self.type_aliases = {}
         self.alias_names = set()
         self.lazy_items = {}
+        self.lazy_fallback = False
         self.enum_variants = {}
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
@@ -1464,44 +1477,128 @@ class Modules:
         output = []
         taken = {tree_text(items[index + 1]) for index in range(len(items) - 1)
                  if tree_text(items[index]) in {"fn", "struct", "enum", "trait", "type", "const", "static"}}
+        taken |= {alias for index in range(len(items)) if tree_text(items[index]) == "use"
+                  for alias in [self.use_alias(items[index:self.item_end(items, index, "use")])[0]] if alias}
         index = 0
         while index < len(items):
             item = items[index]
-            if tree_text(item) == "fn" and index + 1 < len(items):
-                end = self.item_end(items, index, "fn")
+            word = tree_text(item)
+            if word in {"fn", "impl", "trait"} and index + 1 < len(items):
+                end = self.item_end(items, index, "fn" if word == "fn" else word)
                 body_index = end - 1
                 if body_index > index and isinstance(items[body_index], TokenGroup) and tree_text(items[body_index]) == "{":
                     hoisted = []
-                    body = self.extract_items(items[body_index], hoisted)
-                    renames = {}
-                    for inner in hoisted:
-                        kind_index = next((position for position, tree in enumerate(inner)
-                                           if tree_text(tree) in self.INNER_ITEMS | {"const"}), None)
-                        if kind_index is None or tree_text(inner[kind_index]) in {"use", "impl", "mod"}:
-                            continue
-                        name = tree_text(inner[kind_index + 1])
-                        if name in taken:
-                            renames[name] = f"{name}_in_{tree_text(items[index + 1])}_{len(taken)}"
-                        taken.add(renames.get(name, name))
-                    hoisted_trees = [tree for inner in hoisted for tree in inner]
-                    if renames:
-                        body = self.rename_tokens(body, renames)
-                        hoisted_trees = [self.rename_tokens(tree, renames) for tree in hoisted_trees]
+                    if word == "fn":
+                        body = self.hoist_from_function(items[body_index], tree_text(items[index + 1]), taken, hoisted)
+                    else:
+                        body = self.hoist_from_members(items[body_index], taken, hoisted)
                     output.extend(items[index:body_index])
                     output.append(body)
-                    output.extend(self.hoist_inner_items(tuple(hoisted_trees)))
+                    output.extend(self.hoist_inner_items(tuple(hoisted)))
                     index = end
                     continue
-            if isinstance(item, TokenGroup) and tree_text(item) == "{" and index and tree_text(items[index - 1]) != "=":
-                # Method bodies inside impl and trait blocks.
-                item = replace(item, items=self.hoist_method_items(item.items))
             output.append(item)
             index += 1
         return tuple(output)
 
-    def hoist_method_items(self, items):
-        hoisted = self.hoist_inner_items(items)
-        return hoisted
+    def hoist_from_members(self, group, taken, hoisted):
+        """Hoist the inner items of each method in an impl or trait body."""
+        items = group.items
+        output = []
+        index = 0
+        while index < len(items):
+            if tree_text(items[index]) == "fn" and index + 1 < len(items):
+                end = self.item_end(items, index, "fn")
+                body_index = end - 1
+                if isinstance(items[body_index], TokenGroup) and tree_text(items[body_index]) == "{":
+                    output.extend(items[index:body_index])
+                    output.append(self.hoist_from_function(items[body_index], tree_text(items[index + 1]),
+                                                           taken, hoisted))
+                    index = end
+                    continue
+            output.append(items[index])
+            index += 1
+        return replace(group, items=tuple(output))
+
+    def hoist_from_function(self, body, function_name, taken, hoisted):
+        return self.hoist_block(body, function_name, taken, hoisted)
+
+    def hoist_block(self, group, function_name, taken, hoisted):
+        """Hoist one block's items, renaming collisions within that block only, as Rust scopes them."""
+        items = group.items
+        kept, own = [], []
+        index = 0
+        while index < len(items):
+            start = index
+            statement_start = index == 0 or tree_text(items[index - 1]) in {";", "}"} or (
+                isinstance(items[index - 1], TokenGroup) and tree_text(items[index - 1]) == "{")
+            if statement_start:
+                cursor = index
+                while (cursor + 1 < len(items) and tree_text(items[cursor]) == "#"
+                       and isinstance(items[cursor + 1], TokenGroup)):
+                    cursor += 2
+                if cursor < len(items) and tree_text(items[cursor]) == "pub":
+                    cursor += 1
+                word = tree_text(items[cursor]) if cursor < len(items) else ""
+                is_const_item = (word == "const" and cursor + 2 < len(items)
+                                 and isinstance(items[cursor + 1], Token) and tree_text(items[cursor + 2]) == ":")
+                if word == "fn" and (cursor + 1 >= len(items) or not isinstance(items[cursor + 1], Token)
+                                     or not is_identifier(tree_text(items[cursor + 1]))):
+                    word = ""
+                if word in self.INNER_ITEMS or is_const_item:
+                    end = self.item_end(items, cursor, word if word != "mod" else "fn")
+                    own.append((word, cursor - start, items[start:end]))
+                    index = end
+                    continue
+            item = items[index]
+            if isinstance(item, TokenGroup):
+                item = self.hoist_block(item, function_name, taken, hoisted)
+            kept.append(item)
+            index += 1
+        renames = {}
+        rewritten = []
+        for kind, offset, inner in own:
+            if kind == "use":
+                alias, position = self.use_alias(inner)
+                if alias and alias in taken:
+                    fresh = f"{alias}_in_{function_name}_{len(taken)}"
+                    renames[alias] = fresh
+                    renamed = replace(inner[position], text=fresh)
+                    if position > 0 and tree_text(inner[position - 1]) == "as":
+                        inner = (*inner[:position], renamed, *inner[position + 1:])
+                    else:
+                        inner = (*inner[:position + 1], replace(inner[position], text="as"), renamed,
+                                 *inner[position + 1:])
+                    alias = fresh
+                if alias:
+                    taken.add(alias)
+            elif kind not in {"impl", "mod"}:
+                name_index = offset + 1 + (1 if kind == "static" and tree_text(inner[offset + 1]) == "mut" else 0)
+                name = tree_text(inner[name_index])
+                if name in taken:
+                    renames[name] = f"{name}_in_{function_name}_{len(taken)}"
+                taken.add(renames.get(name, name))
+            rewritten.append((kind, inner))
+        if renames:
+            kept = [self.rename_tokens(item, renames) for item in kept]
+        for kind, inner in rewritten:
+            if kind == "fn":
+                # Items nested in a hoisted function body are handled when it is hoisted in turn.
+                pass
+            hoisted.extend(inner if kind == "use" else (self.rename_tokens(tree, renames) for tree in inner))
+        return replace(group, items=tuple(kept))
+
+    @staticmethod
+    def use_alias(item):
+        """The name a simple `use` binds and the index of its token, or (None, None) for groups and globs."""
+        trees = [tree for tree in item if tree_text(tree) != ";"]
+        if not trees or any(isinstance(tree, TokenGroup) for tree in trees):
+            return None, None
+        last = len(trees) - 1
+        name = tree_text(trees[last])
+        if name == "*" or not is_identifier(name):
+            return None, None
+        return identifier_text(name), item.index(trees[last])
 
     def extract_items(self, group, hoisted):
         items = group.items
@@ -1675,6 +1772,13 @@ class Modules:
             return symbol
         if len(path) == 1 and symbol.kind in {"struct", "unit_struct", "enum", "trait"}:
             return ModuleSymbol((*symbol.path[:-1], f"{symbol.path[-1]}::{path[0]}"), "associated", (), token)
+        if len(path) == 1 and symbol.kind == "type" and symbol.name in self.type_aliases:
+            # `Alias::Variant` names the variant of the aliased enum.
+            target = self.type_aliases[symbol.name].target
+            name = target.name if isinstance(target, AppliedType) else target
+            if isinstance(name, str):
+                parts = name.split(MODULE_SEPARATOR)
+                return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{path[0]}"), "associated", (), token)
         raise token.error("unresolved associated path")
 
     @staticmethod
@@ -1918,7 +2022,10 @@ class Modules:
                 except RustError as error:
                     remaining.append((unit, segment, error))
             if len(remaining) == len(pending):
-                raise remaining[0][2]
+                if self.lazy_fallback:
+                    raise remaining[0][2]
+                # Nothing resolved this round: evaluate what const evaluation cannot at first use instead.
+                self.lazy_fallback = True
             pending = [(unit, segment) for unit, segment, _ in remaining]
 
     def read_const_function(self, name):
@@ -2411,10 +2518,26 @@ def match_types(template, actual, parameters, result):
     return template == actual
 
 
+def literal_compatible(variable, other):
+    """Whether an {integer} or {float} inference variable could become the other type."""
+    if isinstance(other, (TypeVariable, TypeParameter)):
+        return True
+    if variable.integer_literal:
+        return other in INTEGER_TYPES
+    if variable.float_literal:
+        return other in FLOAT_TYPES
+    return True
+
+
 def loose_match(template, actual, parameters, result):
     """match_types, except that inference variables in the actual type match anything."""
     if isinstance(actual, TypeVariable):
-        return True
+        if template in parameters:
+            if template in result:
+                return loose_equal(result[template], actual)
+            result[template] = actual
+            return True
+        return isinstance(template, TypeParameter) or literal_compatible(actual, template)
     if template in parameters:
         if template in result:
             return loose_equal(result[template], actual)
@@ -2435,8 +2558,10 @@ def loose_match(template, actual, parameters, result):
 
 
 def loose_equal(first, second):
-    if isinstance(first, TypeVariable) or isinstance(second, TypeVariable):
-        return True
+    if isinstance(first, TypeVariable):
+        return literal_compatible(first, second)
+    if isinstance(second, TypeVariable):
+        return literal_compatible(second, first)
     if isinstance(first, AppliedType) and isinstance(second, AppliedType):
         return first.name == second.name and all(map(loose_equal, first.arguments, second.arguments))
     return first == second
@@ -2483,6 +2608,9 @@ CALLABLE_TRAITS = ("Fn", "FnMut", "FnOnce")
 CALL_ITEM = "@call"
 # Bounds declared in where clauses on projections such as `C::Item: Display`, keyed by owner and item.
 PROJECTION_BOUNDS = {}
+# `#![allow(overflowing_literals)]` makes out-of-range literals wrap instead of failing to compile.
+OVERFLOWING_LITERALS = [False]
+TYPE_BOUNDS = set()
 ARGS_ITEM = "@args"
 SUPERTRAITS = {
     "Copy": {"Clone"}, "Eq": {"PartialEq"}, "PartialOrd": {"PartialEq"},
@@ -2597,6 +2725,7 @@ class Program:
     moves: set = field(default_factory=set)
     cross_compares: dict = field(default_factory=dict)
     discriminants: dict = field(default_factory=dict)
+    crate_name: str = "main"
 
     def discriminant(self, ctor):
         """The integer a C-like enum variant casts to: its explicit value, or one past the previous variant."""
@@ -2723,7 +2852,10 @@ class Program:
                 return self.normalize(AssociatedType(owner.owner, "Item", INTO_ITERATOR), seen)
             primitive = owner.inner if isinstance(owner, ReferenceType) else owner
             if (annotation.item == "Output" and annotation.trait in BUILTIN_OPERATORS
-                    and (primitive in PRIMITIVES or primitive == STRING)):
+                    and (primitive in PRIMITIVES or primitive == STRING)
+                    and not any(isinstance(kind, AppliedType) or kind not in PRIMITIVES and isinstance(kind, str)
+                                for kind in annotation.trait_arguments)):
+                # Built-in arithmetic yields the operand type; impls like Mul<Vec2> for f64 are user-defined.
                 return primitive
             if (annotation.item == "Item" and annotation.trait == INTO_ITERATOR
                     and not isinstance(owner, (TypeParameter, TypeVariable, AssociatedType, OpaqueType))
@@ -3226,6 +3358,10 @@ class Parser:
                     if not self.accept(","):
                         break
                 self.expect(">")
+            while self.current.text == "+" and (is_lifetime(self.peek()) or self.peek() in {"Send", "Sync", "Unpin"}):
+                # Auto traits and lifetime bounds on trait objects do not change behaviour here.
+                self.advance()
+                self.advance()
             return DynType(trait, tuple(sorted(bindings)))
         if token.text == "Self" and self.self_type is not None:
             if self.accept("::"):
@@ -3323,6 +3459,7 @@ class Parser:
 
     def parse(self, program=None):
         program = Program() if program is None else program
+        self.current_program = program
         while self.current.text:
             if self.accept("@macro_definition"):
                 continue
@@ -3337,9 +3474,15 @@ class Parser:
                     self.accept(",")
                     self.expect(")")
                 elif attribute.text in {"allow", "warn", "deny", "forbid"}:
+                    if attribute.text == "allow" and self.current.text == "(" and self.peek() == "overflowing_literals":
+                        OVERFLOWING_LITERALS[0] = True
                     self.skip_group()
                 else:
-                    raise attribute.error("unsupported inner attribute")
+                    while self.current.text not in {"]", ""}:
+                        if self.current.text in {"(", "[", "{"}:
+                            self.skip_group()
+                        else:
+                            self.advance()
                 self.expect("]")
                 continue
             if self.accept("use"):
@@ -3462,7 +3605,17 @@ class Parser:
             return
         if annotation not in CONST_VALUE_TYPES:
             raise name.error("unsupported constant type")
-        value = self.const_expression(expression, annotation)
+        try:
+            value = self.const_expression(expression, annotation)
+        except RustError as error:
+            if ("unsupported constant expression" not in str(error) or self.modules is None
+                    or not self.modules.lazy_fallback):
+                raise
+            # Initializers like `"hello".len()` run at first use instead of at compile time.
+            self.expect(";")
+            self.modules.lazy_items[name.text] = LazyItem(name, "static" if static else "const", annotation,
+                                                          expression, mutable)
+            return
         if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
             raise name.error(f"expected a {annotation} constant")
         if ((annotation == "bool") != value.boolean
@@ -3541,7 +3694,9 @@ class Parser:
         self.self_type = self_type
         self.type_parameters = {"Self": self_type}
         self.parameter_defaults = {}
-        _, trait_parameters = self.generic_parameters()
+        trait_lifetimes, trait_parameters = self.generic_parameters()
+        outer_trait_lifetimes = self.lifetime_scope
+        self.lifetime_scope = {**outer_trait_lifetimes, **trait_lifetimes}
         defaults = tuple(self.parameter_defaults.get(parameter) for parameter in trait_parameters)
         self.type_parameters = {"Self": self_type, **trait_parameters}
         bounds = self.trait_bounds(bindings={}) if self.accept(":") else set()
@@ -3552,6 +3707,7 @@ class Parser:
         self.expect("{")
         methods, associated = self.methods(program, declaration=True, prefix=f"@trait:{name.text}")
         self.current_trait_parameters = ()
+        self.lifetime_scope = outer_trait_lifetimes
         self.self_type = old_self
         self.current_trait = None
         self.type_parameters = {}
@@ -3867,13 +4023,18 @@ class Parser:
                 continue
             quantified = self.bound_lifetimes(lifetimes) if self.accept("for") else ()
             if self.current.text == "<" or (self.peek() == "::" and self.current.text != "Self") or (
-                    self.current.text == "Self" and self.peek() == "::"):
+                    self.current.text == "Self" and self.peek() == "::") or (
+                    self.peek() in {"<", "("} and identifier_text(self.current.text) not in self.type_parameters) or (
+                    self.current.text in {"&", "[", "("}):
                 # A bound on a projection, like `C::Item: Into<u64>`.
                 projection = self.type_name(signature=lifetimes)
                 self.expect(":")
                 bounds = self.trait_bounds(bindings={}, signature=lifetimes)
                 if isinstance(projection, AssociatedType):
                     PROJECTION_BOUNDS.setdefault((id(projection.owner), projection.item), set()).update(bounds)
+                # Bounds on other types, like `Option<T>: Debug`, are assumed rather than checked.
+                for bound in bounds:
+                    TYPE_BOUNDS.add((projection, bound))
                 if not self.accept(","):
                     break
                 continue
@@ -3939,8 +4100,16 @@ class Parser:
 
     def attributes(self):
         derives = {}
-        while self.accept("#"):
+        while self.current.text == "#" and self.peek() == "[":
+            self.expect("#")
             self.expect("[")
+            if self.current.text != "derive":
+                # repr, allow, inline, must_use, doc, and similar attributes do not change behaviour here.
+                depth = 1
+                while depth:
+                    token = self.advance()
+                    depth += {"[": 1, "]": -1}.get(token.text, 0)
+                continue
             self.expect("derive")
             self.expect("(")
             while self.current.text != ")":
@@ -4055,6 +4224,9 @@ class Parser:
                 continue
             if self.accept(";"):
                 continue
+            if self.current.text == "#" and self.peek() == "[":
+                self.attributes()
+                continue
             let = self.accept("let")
             if let:
                 pattern = self.pattern()
@@ -4159,6 +4331,11 @@ class Parser:
             )
             left = Expr("assign" if precedence == 1 else "binary", token, (left, right))
         return left
+
+    def prefix_borrow(self, token, allow_record):
+        mutable = bool(self.accept("mut"))
+        operand = self.expression(PRECEDENCE["*"] + 2, allow_record=allow_record)
+        return Expr("borrow", replace(token, text="&"), (operand, mutable))
 
     def range_end(self, token, allow_record):
         if self.current.text in {")", "]", "}", ",", ";", "=>", ""} or (
@@ -4317,6 +4494,9 @@ class Parser:
             return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
             return Expr("unary", token, (self.expression(PRECEDENCE["*"] + 2, allow_record=allow_record),))
+        if word == "&&":
+            inner = self.prefix_borrow(token, allow_record)
+            return Expr("borrow", token, (inner, False))
         if word in {"&", "*"}:
             mutable = bool(self.accept("mut")) if word == "&" else False
             operand = self.expression(PRECEDENCE["*"] + 2, allow_record=allow_record)
@@ -4583,6 +4763,15 @@ class Parser:
                 return self.constants[expr.token.text]
             if expr.token.text in self.statics:
                 return self.statics[expr.token.text]
+            owner, separator, member = expr.token.text.rpartition("::")
+            program = getattr(self, "current_program", None)
+            if separator and program is not None:
+                # `Config::MAX_USERS` reads an associated constant of an inherent impl.
+                for impl in program.impls:
+                    target = impl.target.name if isinstance(impl.target, AppliedType) else impl.target
+                    method = impl.methods.get(member)
+                    if impl.trait is None and target == owner and method is not None and method.associated_const:
+                        return read(method.body, method.result)
         if expr.kind == "call" and expr.qualified is None and expr.type_arguments is None:
             if self.modules is None or expr.token.text not in self.modules.const_functions:
                 raise expr.token.error("constant evaluation requires a const function")
@@ -4851,11 +5040,17 @@ class Parser:
         if token.text == "ref":
             mutable = bool(self.accept("mut"))
             return Expr("bind", self.identifier(), (False, mutable))
-        if token.text not in {"crate", "self", "super"} and (
+        if token.text == "Self" and self.self_type is not None and self.current.text == "::":
+            owner = self.self_type.name if isinstance(self.self_type, AppliedType) else self.self_type
+            self.expect("::")
+            variant = self.identifier()
+            path, type_arguments = replace(variant, text=f"{owner}::{variant.text}"), None
+        elif token.text not in {"crate", "self", "super"} and (
             not is_identifier(token.text) or token.text in self.reserved
         ):
             raise token.error("expected a pattern")
-        path, type_arguments = self.expression_path(token)
+        else:
+            path, type_arguments = self.expression_path(token)
         if path.text in SCALAR_CONSTANTS:
             return Expr("literal", path, SCALAR_CONSTANTS[path.text])
         if path.text in self.constants:
@@ -5047,6 +5242,8 @@ class CaptureContext:
         old = scope.captures.captures.get(root.token.key)
         if old:
             scope.captures.captures[root.token.key] = replace(old, mutable=True)
+            # A closure nested in another closure makes the outer capture mutable too.
+            CaptureContext.mark_mutable(scope.captures.enclosing, expr)
 
 
 def require(actual, expected, token):
@@ -6068,6 +6265,11 @@ class Checker:
         actual, expected = self.resolve(actual), self.resolve(expected)
         if actual in {NEVER, expected}:
             return
+        if (isinstance(actual, TypeVariable) and isinstance(expected, TypeVariable)
+                and (expected.integer_literal or expected.float_literal)
+                and not (actual.integer_literal or actual.float_literal)):
+            # Keep the literal variable as the representative so it still defaults to i32 or f64.
+            actual, expected = expected, actual
         if isinstance(expected, TypeVariable) and not self.occurs(expected, actual):
             self.check_variable_binding(expected, actual, token)
             self.substitutions[expected] = actual
@@ -6268,9 +6470,17 @@ class Checker:
 
     def finish_inference(self):
         self.solve_callables()
-        for name, item, result, token in self.iterator_results:
-            # Collect targets can pin literal element types, so settle them before literals default.
-            if name == "collect" and not isinstance(self.resolve(result), TypeVariable):
+        settled = set()
+        progress = True
+        while progress:
+            # Collect targets can pin literal element types and nested collect targets, so settle
+            # them, outermost first, before literals default.
+            progress = False
+            for index, (name, item, result, token) in enumerate(self.iterator_results):
+                if index in settled or name != "collect" or isinstance(self.resolve(result), TypeVariable):
+                    continue
+                settled.add(index)
+                progress = True
                 try:
                     self.check_collect(item, result, token)
                 except RustError:
@@ -6283,7 +6493,8 @@ class Checker:
                 resolved = "i32"
             if resolved not in INTEGER_TYPES:
                 raise token.error(f"expected an integer, found {resolved}")
-            checked(value, token, resolved)
+            if not OVERFLOWING_LITERALS[0]:
+                checked(value, token, resolved)
         for annotation, value, token in self.float_literals:
             resolved = self.resolve(annotation)
             if isinstance(resolved, TypeVariable):
@@ -6345,6 +6556,8 @@ class Checker:
             assumed = self.obligation_assumptions.get(index, ())
             if any(annotation is parameter and trait in self.program.trait_closure(bounds)
                    for parameter, bounds, _ in assumed):
+                continue
+            if (annotation, trait) in TYPE_BOUNDS:
                 continue
             if annotation != NEVER and not self.implements(annotation, trait):
                 raise token.error(f"{annotation} does not implement {trait}")
@@ -7313,6 +7526,11 @@ class Checker:
                     expr.kind = "enum_cast"
                     return target
                 self.pretyped[id(value)] = actual
+            if isinstance(target, AppliedType) and target.name in POINTER_TYPES and isinstance(target.arguments[0], DynType):
+                result = self.type_of(value, scope, target)
+                self.require_argument(result, target, token)
+                expr.kind, expr.args = "group", (value,)
+                return result
             if target in SCALAR_BOUNDS or target in FLOAT_TYPES:
                 hint = ("u8" if target == "char" else target) if self.unsuffixed_number(value) else None
                 actual = self.type_of(value, scope, hint)
@@ -7361,7 +7579,7 @@ class Checker:
                     self.require(variable, hint, token)
                 self.integer_literals.append((variable, value, token))
                 return variable
-            if annotation in INTEGER_TYPES:
+            if annotation in INTEGER_TYPES and not OVERFLOWING_LITERALS[0]:
                 checked(value, token, annotation)
             return annotation
         if kind == "byte_string":
@@ -7578,13 +7796,11 @@ class Checker:
                 self.ascriptions.append(expr)
             annotation = self.resolve(annotation or actual)
             if isinstance(annotation, ReferenceType):
-                if value is None or (otherwise and source.kind in {"bind", "wild"}):
+                if value is not None and otherwise and source.kind in {"bind", "wild"}:
                     raise token.error("reference let requires a simple initialized binding")
             pattern, bindings = self.prepare_pattern(source, annotation)
             if value is None:
                 for kind, _ in bindings.values():
-                    if isinstance(kind, ReferenceType):
-                        raise token.error("reference let requires a simple initialized binding")
                     if isinstance(kind, TypeVariable):
                         self.deferred_binding_types.add(kind)
             self.program.patterns[id(source)] = (pattern, bindings)
@@ -7766,6 +7982,25 @@ class Checker:
             if left == STRING and token.text == "+":
                 right = self.coerce_reference(args[1], right, STR_REFERENCE)
                 self.program.expr_types[id(args[1])] = right
+            if (token.text in OPERATOR_TRAITS and not self.overloadable(left) and self.overloadable(right)
+                    and not isinstance(self.resolve(left), TypeVariable) or (
+                        token.text in OPERATOR_TRAITS and isinstance(self.resolve(left), TypeVariable)
+                        and self.resolve(left).float_literal | self.resolve(left).integer_literal
+                        and self.overloadable(right))):
+                # `2.0 * v` uses an impl like `Mul<Vec2> for f64`.
+                trait_name, method = OPERATOR_TRAITS[token.text]
+                trait = MODULE_SEPARATOR.join(("std", "ops", trait_name))
+                left_type = self.resolve(left)
+                if isinstance(left_type, TypeVariable):
+                    owners = [impl.target for impl in self.program.impls if impl.trait == trait
+                              and impl.target in PRIMITIVES and any(
+                                  self.resolve(right) == argument for argument in impl.trait_arguments)]
+                    if len(owners) == 1:
+                        self.require(left_type, owners[0], token)
+                        left_type = owners[0]
+                if self.program.implementation(left_type, trait, arguments_wanted=(self.resolve(right),)):
+                    self.pretyped[id(args[1])] = right
+                    return self.operator_call(expr, scope, expected, trait_name, method, args, left_type)
             if token.text in COMPARE and NEVER not in {left, right}:
                 peeled_left, peeled_right = self.resolve(left), self.resolve(right)
                 while isinstance(peeled_left, ReferenceType) and isinstance(peeled_right, ReferenceType):
@@ -7985,7 +8220,10 @@ class Checker:
                 return self.indirect_type(expr, scope, expected, local.value)
         if expr.qualified:
             owner, trait = expr.qualified
-            self.check_type(owner, token)
+            if owner == "str" or isinstance(owner, (SliceType, DynType)):
+                self.check_type(ReferenceType(owner, False), token)
+            else:
+                self.check_type(owner, token)
             if trait:
                 return self.trait_call(expr, scope, expected, owner, trait, token.text)
             return self.call_on_type(expr, scope, expected, owner, token.text)
@@ -8077,6 +8315,12 @@ class Checker:
             self.require_argument(result, expected, token)
         for parameter, owner in arguments.items():
             if isinstance(parameter, TypeParameter):
+                for binding, value in parameter.associated_bindings.items():
+                    if binding.item == ARGS_ITEM and isinstance(value, TupleType) and binding.bound in self.program.traits:
+                        # A bound like `B: Extend<Self::Item>` lets a unique impl settle B.
+                        self.pending_selections.append((owner, binding.bound,
+                                                        tuple(substitute(kind, arguments) for kind in value.elements),
+                                                        token))
                 signature = callable_signature(parameter)
                 if signature is not None:
                     self.require_callable(owner, substitute(signature, arguments), token)
@@ -8345,6 +8589,15 @@ class Checker:
                 if not isinstance(method.params[0][2], ReferenceType) and not is_box(method.params[0][2]):
                     raise expr.token.error("cannot pass an unsized trait object by value")
             bindings = self.trait_bindings(trait, receiver, expr)
+            if trait.name.text == ITERATOR and name == "unzip":
+                # Iterator::unzip requires Item = (A, B), which its std signature cannot state here.
+                method = trait.methods[name]
+                local = self.specialize(method.method_parameters, expr.type_arguments, expr.token,
+                                        callables=False, requirements=False)
+                first, second = (local[parameter] for parameter in method.method_parameters[:2])
+                self.require(self.resolve(AssociatedType(receiver, "Item", ITERATOR)), TupleType((first, second)),
+                             expr.token)
+                expr.type_arguments = tuple(local[parameter] for parameter in method.method_parameters)
             return self.receiver_call(expr, scope, expected, trait.methods[name], bindings, actual)
         if is_box(base) and not (
             name == "clone" and self.implements(base, "Clone")
@@ -8542,6 +8795,8 @@ class Checker:
             elif name in {"sum", "product"} and resolved in NUMBER_TYPES:
                 item = iterator.item.inner if isinstance(iterator.item, ReferenceType) else iterator.item
                 self.require(item, resolved, token)
+            elif name in {"sum", "product"} and isinstance(resolved, AppliedType) and resolved.name in {OPTION, RESULT}:
+                self.require(iterator.item, resolved, token)
             self.iterator_results.append((name, iterator.item, result, token))
         expr.kind = "iterator_terminal"
         return result
@@ -8553,6 +8808,12 @@ class Checker:
             self.check_collect(item, target, token)
         else:
             element = item.inner if isinstance(item, ReferenceType) else item
+            if isinstance(target, AppliedType) and target.name in {OPTION, RESULT}:
+                # Summing Options or Results stops at the first None or Err.
+                self.require(element, target, token)
+                if target.arguments[0] not in NUMBER_TYPES:
+                    raise token.error(f"{method} requires a numeric result, found {target.arguments[0]}")
+                return
             if target not in NUMBER_TYPES:
                 raise token.error(f"{method} requires a numeric result, found {target}")
             self.require(element, target, token)
@@ -8569,6 +8830,13 @@ class Checker:
         elif target == STRING and (item in {"char", STRING} or is_str_reference(item)
                                    or isinstance(item, ReferenceType) and item.inner in {"char", STRING}):
             return
+        elif name in {OPTION, RESULT} and isinstance(item, TypeVariable) and not (
+                item.integer_literal or item.float_literal):
+            # Collecting into Result<C, E> or Option<C> means the items are Results or Options too.
+            element = TypeVariable("collected element", token)
+            self.variables.append(element)
+            self.require(item, AppliedType(name, (element, *target.arguments[1:])), token)
+            self.check_collect(element, target.arguments[0], token)
         elif name in {OPTION, RESULT} and isinstance(item, AppliedType) and item.name == name:
             if name == RESULT:
                 self.require(item.arguments[1], target.arguments[1], token)
@@ -8639,6 +8907,13 @@ class Checker:
 
     def select_trait_impls(self):
         """When exactly one impl fits a generic trait call's known types, let it settle the unknown ones."""
+        for _ in range(4):
+            before = len(self.substitutions)
+            self.select_trait_impls_once()
+            if len(self.substitutions) == before:
+                return
+
+    def select_trait_impls_once(self):
         pending, self.pending_selections = self.pending_selections, []
         for entry in pending:
             receiver, trait, arguments, token = entry
@@ -8646,7 +8921,8 @@ class Checker:
             arguments = tuple(map(self.resolve, arguments))
             if not any(isinstance(part, TypeVariable) for kind in (receiver, *arguments) for part in type_leaves(kind)):
                 continue
-            if isinstance(receiver, (TypeVariable, TypeParameter, OpaqueType, DynType, AssociatedType)):
+            literal = isinstance(receiver, TypeVariable) and (receiver.integer_literal or receiver.float_literal)
+            if isinstance(receiver, (TypeVariable, TypeParameter, OpaqueType, DynType, AssociatedType)) and not literal:
                 self.pending_selections.append(entry)
                 continue
             matches = []
@@ -8675,6 +8951,13 @@ class Checker:
                         self.require(substitute(template, fresh), argument, token)
             except RustError:
                 continue
+            for parameter in impl.parameters:
+                # A bound like `U: From<T>` on the chosen impl is itself a selection to make.
+                for binding, value in getattr(parameter, "associated_bindings", {}).items():
+                    if binding.item == ARGS_ITEM and isinstance(value, TupleType):
+                        self.pending_selections.append((fresh[parameter], binding.bound,
+                                                        tuple(substitute(kind, fresh) for kind in value.elements),
+                                                        token))
 
     def builtin_trait_arguments(self, receiver, trait, arguments):
         """Built-in impls, such as f64: PartialOrd or i32: Add, that exist without an impl block."""
@@ -8719,6 +9002,19 @@ class Checker:
         if owner in self.parameters and isinstance(self.parameters[owner], TypeParameter):
             return self.call_on_type(expr, scope, expected, self.parameters[owner], name)
         if owner in PRIMITIVES or owner == "str":
+            if expr.args and not any(name in impl.methods and impl.target == owner and impl.trait is None
+                                     for impl in self.program.impls):
+                traits = [trait for trait in self.program.traits.values() if name in trait.methods
+                          and self.implements(owner, trait.name.text)]
+                if not traits:
+                    # Built-in methods like `str::len(s)` or `f64::sqrt(x)` take their receiver first.
+                    method = Expr("method", replace(expr.token, text=name), expr.args)
+                    result = self.method_type(method, scope, expected)
+                    expr.kind, expr.token, expr.args = method.kind, method.token, method.args
+                    for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
+                        if id(method) in table:
+                            table[id(expr)] = table.pop(id(method))
+                    return result
             return self.call_on_type(expr, scope, expected, owner, name)
         trait = self.program.traits.get(owner)
         if trait and name in trait.methods:
@@ -8735,6 +9031,19 @@ class Checker:
         if len(candidates) != 1:
             if owner in self.program.types and not self.program.type_parameters[owner]:
                 return self.call_on_type(expr, scope, expected, owner, name)
+            if not candidates and expr.args and owner in PRELUDE_OWNERS:
+                # `Option::is_some(&x)` and `Vec::len(&v)`: call the built-in method on the first argument.
+                try:
+                    method = Expr("method", replace(expr.token, text=name), expr.args)
+                    result = self.method_type(method, scope, expected)
+                    expr.kind, expr.token, expr.args = method.kind, method.token, method.args
+                    expr.type_arguments = method.type_arguments
+                    for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
+                        if id(method) in table:
+                            table[id(expr)] = table.pop(id(method))
+                    return result
+                except RustError:
+                    pass
             if not candidates and owner in self.program.type_parameters:
                 arguments = []
                 for parameter in self.program.type_parameters[owner]:
@@ -8764,6 +9073,14 @@ class Checker:
         if text in builtin:
             return builtin[text]
         owner, _, name = text.rpartition("::")
+        if owner in PRELUDE_OWNERS | PRIMITIVES | {"str"} and name in BUILTIN_METHOD_ARITIES:
+            if not any(name in impl.methods for impl in self.program.impls if impl.trait is None
+                       and (impl.target.name if isinstance(impl.target, AppliedType) else impl.target) == owner):
+                return BUILTIN_METHOD_ARITIES[name]
+        if owner in PRIMITIVES or owner == "str":
+            for trait in self.program.traits.values():
+                if name in trait.methods and self.implements(owner, trait.name.text):
+                    return len(trait.methods[name].params)
         if expr.qualified:
             owner_type, trait_name = expr.qualified
             trait = self.program.traits.get(trait_name) if trait_name else None
@@ -8839,6 +9156,8 @@ class Checker:
         variable = TypeVariable("float literal" if floating else "integer literal", literal.token,
                                 integer_literal=not floating, float_literal=floating)
         self.variables.append(variable)
+        (self.float_literals if floating else self.integer_literals).append(
+            (variable, 0.0 if floating else 0, literal.token))
         return variable
 
     def has_field(self, annotation, name):
@@ -11213,6 +11532,22 @@ class Interpreter:
                 return self.collect(values, result)
             if token.text == "count":
                 return checked(sum(1 for _ in values), token, "usize", runtime=True)
+            if isinstance(result, AppliedType) and result.name in {OPTION, RESULT}:
+                inner = result.arguments[0]
+                product = token.text == "product"
+                total = rounded_float(float(int(product)), inner) if inner in FLOAT_TYPES else int(product)
+                for value in values:
+                    value = map_of(value)
+                    variant = value.constructor.path.rsplit("::", 1)[-1]
+                    if variant in {"None", "Err"}:
+                        return Value(next(ctor for ctor in self.program.layout(result)[1]
+                                          if ctor.path.endswith(f"::{variant}")), value.fields)
+                    element = value.fields[0]
+                    if inner in FLOAT_TYPES:
+                        total = rounded_float(total * element if product else total + element, inner)
+                    else:
+                        total = binary("*" if product else "+", total, element, token, inner, runtime=True)
+                return self.variant(result, "Some" if result.name == OPTION else "Ok", total)
             product = token.text == "product"
             total = int(product)
             if result in FLOAT_TYPES:
@@ -11379,7 +11714,13 @@ class Interpreter:
                 return Address(Binding(args[1], False))
             if args[0] in FLOAT_TYPES:
                 return rounded_float(args[1], self.program.expr_types[id(expr)])
-            return args[1]
+            value = args[1]
+            if type(value) is int:
+                kind = self.program.expr_types.get(id(expr))
+                if kind in INTEGER_BOUNDS and not INTEGER_BOUNDS[kind][0] <= value < INTEGER_BOUNDS[kind][1]:
+                    # Only reachable under #![allow(overflowing_literals)]: the literal wraps.
+                    value = truncate_integer(value, kind)
+            return value
         if kind == "byte_string":
             return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
@@ -13040,6 +13381,32 @@ for _name, _operation in {
 
 
 @intrinsic
+def method_checked_shl(interpreter, result, value, amount):
+    kind = element_type(result)
+    if amount >= INTEGER_WIDTHS[kind]:
+        return option(interpreter, result)
+    return option(interpreter, result, wrap(value << amount, kind))
+
+
+@intrinsic
+def method_checked_shr(interpreter, result, value, amount):
+    kind = element_type(result)
+    if amount >= INTEGER_WIDTHS[kind]:
+        return option(interpreter, result)
+    return option(interpreter, result, value >> amount)
+
+
+@intrinsic
+def method_wrapping_shl(interpreter, result, value, amount):
+    return wrap(value << (amount % INTEGER_WIDTHS[result]), result)
+
+
+@intrinsic
+def method_wrapping_shr(interpreter, result, value, amount):
+    return value >> (amount % INTEGER_WIDTHS[result])
+
+
+@intrinsic
 def method_rem_euclid(interpreter, result, left, right):
     if isinstance(left, float):
         value = math.fmod(left, right)
@@ -14055,8 +14422,68 @@ def rust_pad_text(interpreter, result, text, width, precision, fill, align):
     return str(fill) * left + value + str(fill) * (gap - left)
 
 
+def rust_type_text(interpreter, annotation):
+    program = interpreter.program
+    annotation = program.concrete_type(program.normalize(annotation))
+    if isinstance(annotation, ReferenceType):
+        return ("&mut " if annotation.mutable else "&") + rust_type_text(interpreter, annotation.inner)
+    if isinstance(annotation, TupleType):
+        return "(" + ", ".join(rust_type_text(interpreter, kind) for kind in annotation.elements) + ")"
+    if isinstance(annotation, ArrayType):
+        return f"[{rust_type_text(interpreter, annotation.element)}; {annotation.length}]"
+    if isinstance(annotation, SliceType):
+        return f"[{rust_type_text(interpreter, annotation.element)}]"
+    if isinstance(annotation, DynType):
+        return "dyn " + annotation.trait.replace(MODULE_SEPARATOR, "::")
+    if isinstance(annotation, FunctionType):
+        arguments = ", ".join(rust_type_text(interpreter, kind) for kind in annotation.parameters)
+        result = "" if annotation.result == "()" else " -> " + rust_type_text(interpreter, annotation.result)
+        return f"fn({arguments}){result}"
+    name = annotation.name if isinstance(annotation, AppliedType) else str(annotation)
+    if annotation not in PRIMITIVES and annotation != "str" and name.split(MODULE_SEPARATOR)[0] not in STD_CRATES:
+        name = MODULE_SEPARATOR.join((program.crate_name, name))
+    text = name.replace(MODULE_SEPARATOR, "::")
+    if isinstance(annotation, AppliedType):
+        text += "<" + ", ".join(rust_type_text(interpreter, kind) for kind in annotation.arguments) + ">"
+    return text
+
+
+@intrinsic
+def rust_type_name(interpreter, result):
+    return shared(rust_type_text(interpreter, interpreter.intrinsic_types[0]))
+
+
+@intrinsic
+def rust_range_length(interpreter, result, bounds):
+    start, end = map_of(bounds).fields
+    return max(0, end - start)
+
+
+@intrinsic
+def rust_wrapping_op(interpreter, result, left, right, operator):
+    value = (left + right, left - right, left * right)[operator]
+    return wrap(value, result)
+
+
+@intrinsic
+def rust_from_utf8(interpreter, result, data):
+    raw = bytes(items_of(data))
+    try:
+        return interpreter.variant(result, "Ok", shared(raw.decode("utf-8")))
+    except UnicodeDecodeError as error:
+        return interpreter.variant(result, "Err", Value(interpreter.program.layout(result.arguments[1])[1][0],
+                                                        (error.start,)))
+
+
+@intrinsic
+def rust_box_unsized(interpreter, result, value):
+    return BoxValue(Address(Binding(value, True)), result.arguments[0])
+
+
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
     PROJECTION_BOUNDS.clear()
+    TYPE_BOUNDS.clear()
+    OVERFLOWING_LITERALS[0] = False
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
@@ -14067,6 +14494,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     modules = Modules(trees, source_path, edition)
     modules.expand()
     program = Program(type_aliases=modules.type_aliases, statics=modules.statics, lazy_items=modules.lazy_items)
+    program.crate_name = Path(source_path).stem.replace("-", "_") if source_path else "rust_out"
     program.add_prelude()
     scalars = modules.constants | modules.statics
     prelude = modules.units[STD_PRELUDE]

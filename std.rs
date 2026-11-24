@@ -4,6 +4,7 @@
 pub mod prelude {
     pub use crate::iter::Iterator;
     pub use crate::iter::IntoIterator;
+    pub use crate::iter::Extend;
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
@@ -42,6 +43,8 @@ pub mod intrinsics {
     pub fn iter_cycle<I, R>(iter: I) -> R;
     pub fn iter_chunks<I, R>(iter: I, size: usize) -> R;
     pub fn range_next<A>(range: &mut crate::ops::Range<A>) -> Option<A>;
+    pub fn range_length<A>(range: &crate::ops::Range<A>) -> usize;
+    pub fn wrapping_op<T>(left: T, right: T, operator: u8) -> T;
     pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
@@ -83,6 +86,7 @@ pub mod intrinsics {
     pub fn lazy_elements<C, R>(items: C) -> R;
     pub fn duration_debug(nanos: u128, f: &mut crate::fmt::Formatter) -> crate::fmt::Result;
     pub fn hash_value<T>(value: &T) -> u64;
+    pub fn box_unsized<T, U: ?Sized>(value: T) -> Box<U>;
     pub fn pad_text(text: &str, width: Option<usize>, precision: Option<usize>, fill: char, align: u8) -> String;
     pub fn clock_nanos() -> u128;
     pub fn wall_nanos() -> u128;
@@ -295,10 +299,10 @@ pub mod iter {
         fn rev(self) -> Rev<Self::Item> where Self: Sized {
             Rev { items: crate::intrinsics::iter_collect(self) }
         }
-        fn partition<B, F>(self, f: F) -> (B, B) where Self: Sized, F: FnMut(&Self::Item) -> bool {
+        fn partition<B, F>(self, f: F) -> (B, B) where Self: Sized, B: Default + Extend<Self::Item>, F: FnMut(&Self::Item) -> bool {
             crate::intrinsics::iter_partition(self, f)
         }
-        fn unzip<A, B, FromA, FromB>(self) -> (FromA, FromB) where Self: Sized {
+        fn unzip<A, B, FromA, FromB>(self) -> (FromA, FromB) where Self: Sized, FromA: Default + Extend<A>, FromB: Default + Extend<B> {
             crate::intrinsics::iter_unzip(self)
         }
         fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R where Self: Sized, F: FnMut(B, Self::Item) -> R {
@@ -322,6 +326,19 @@ pub mod iter {
         fn cycle(self) -> Lazy<Self::Item> where Self: Sized { crate::intrinsics::iter_cycle(self) }
         fn array_chunks_vec(self, size: usize) -> Lazy<Vec<Self::Item>> where Self: Sized { crate::intrinsics::iter_chunks(self, size) }
     }
+
+    // Extend carries no methods here; its impls let inference find a collection's element type.
+    pub trait Extend<A> {}
+    impl<T> Extend<T> for Vec<T> {}
+    impl<'a, T: Copy> Extend<&'a T> for Vec<T> {}
+    impl Extend<char> for String {}
+    impl<'a> Extend<&'a str> for String {}
+    impl Extend<String> for String {}
+    impl<T> Extend<T> for crate::collections::VecDeque<T> {}
+    impl<T> Extend<T> for crate::collections::HashSet<T> {}
+    impl<T> Extend<T> for crate::collections::BTreeSet<T> {}
+    impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> {}
+    impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> {}
 
     pub trait IntoIterator {
         type Item;
@@ -1225,8 +1242,13 @@ pub mod default {
 
 pub mod marker {
     pub trait Copy: Clone {}
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct PhantomData<T: ?Sized>;
+    impl<T: ?Sized> crate::fmt::Debug for PhantomData<T> {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "PhantomData<{}>", crate::any::type_name::<T>())
+        }
+    }
 }
 
 pub mod ops {
@@ -1283,6 +1305,7 @@ pub mod ops {
     impl<Idx: PartialOrd> Range<Idx> {
         pub fn contains(&self, item: &Idx) -> bool { *item >= self.start && *item < self.end }
         pub fn is_empty(&self) -> bool { !(self.start < self.end) }
+        pub fn len(&self) -> usize { crate::intrinsics::range_length(self) }
     }
     impl<Idx: PartialOrd> RangeInclusive<Idx> {
         pub fn contains(&self, item: &Idx) -> bool { *item >= self.start && *item <= self.end }
@@ -1336,6 +1359,36 @@ pub mod ops {
     impl RangeBounds for RangeFull {}
 }
 
+pub mod num_wrapping {
+    use crate::fmt;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct Wrapping<T>(pub T);
+    impl<T: fmt::Display> fmt::Display for Wrapping<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
+    }
+    impl<T> crate::ops::Add for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn add(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 0)) }
+    }
+    impl<T> crate::ops::Sub for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn sub(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 1)) }
+    }
+    impl<T> crate::ops::Mul for Wrapping<T> {
+        type Output = Wrapping<T>;
+        fn mul(self, other: Wrapping<T>) -> Wrapping<T> { Wrapping(crate::intrinsics::wrapping_op(self.0, other.0, 2)) }
+    }
+    impl<T> crate::ops::AddAssign for Wrapping<T> {
+        fn add_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 0); }
+    }
+    impl<T> crate::ops::SubAssign for Wrapping<T> {
+        fn sub_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 1); }
+    }
+    impl<T> crate::ops::MulAssign for Wrapping<T> {
+        fn mul_assign(&mut self, other: Wrapping<T>) { self.0 = crate::intrinsics::wrapping_op(self.0, other.0, 2); }
+    }
+}
+
 pub mod hash {
     pub trait Hasher {
         fn finish(&self) -> u64;
@@ -1383,6 +1436,18 @@ pub mod str {
     impl<const N: usize> Pattern for [char; N] {}
     impl<const N: usize> Pattern for &[char; N] {}
     impl<F: FnMut(char) -> bool> Pattern for F {}
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Utf8Error { valid_up_to: usize }
+    impl Utf8Error {
+        pub fn valid_up_to(&self) -> usize { self.valid_up_to }
+    }
+    impl crate::fmt::Display for Utf8Error {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "invalid utf-8 sequence of 1 bytes from index {}", self.valid_up_to)
+        }
+    }
+    pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error>;
 
     pub trait FromStr: Sized {
         type Err;
@@ -1453,6 +1518,9 @@ pub mod string {
 
     pub trait ToString {
         fn to_string(&self) -> String;
+    }
+    impl<T: crate::fmt::Display + ?Sized> ToString for T {
+        fn to_string(&self) -> String { format!("{}", self) }
     }
 
     impl String {
@@ -1569,6 +1637,9 @@ pub mod convert {
     impl From<&mut str> for String { fn from(value: &mut str) -> String { value.to_string() } }
     impl<T> From<T> for Option<T> { fn from(value: T) -> Option<T> { Some(value) } }
     impl<T> From<T> for Box<T> { fn from(value: T) -> Box<T> { Box::new(value) } }
+    impl From<String> for Box<str> { fn from(value: String) -> Box<str> { crate::intrinsics::box_unsized(value) } }
+    impl From<&str> for Box<str> { fn from(value: &str) -> Box<str> { crate::intrinsics::box_unsized(value.to_string()) } }
+    impl<T> From<Vec<T>> for Box<[T]> { fn from(value: Vec<T>) -> Box<[T]> { crate::intrinsics::box_unsized(value) } }
     impl<T: Clone> From<&[T]> for Vec<T> { fn from(value: &[T]) -> Vec<T> { value.to_vec() } }
     impl<T: Clone> From<&Vec<T>> for Vec<T> { fn from(value: &Vec<T>) -> Vec<T> { value.clone() } }
     impl<T, const N: usize> From<[T; N]> for Vec<T> { fn from(value: [T; N]) -> Vec<T> { value.into_iter().collect() } }
@@ -2220,6 +2291,8 @@ pub mod thread {
 
 pub mod any {
     pub trait Any {}
+    pub fn type_name<T: ?Sized>() -> &'static str;
+    pub fn type_name_of_val<T: ?Sized>(value: &T) -> &'static str { type_name::<T>() }
 }
 
 pub mod time {
