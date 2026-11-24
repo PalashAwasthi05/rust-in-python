@@ -4098,15 +4098,13 @@ class Checker:
         suffix = index + 1
         return (*enumerate(items[:index]), *enumerate(items[suffix:], start=size - len(items) + suffix))
 
-    def prepare_pattern(self, expr, annotation, *, borrowed=False):
+    def prepare_pattern(self, expr, annotation, *, borrowed=None):
         kind, token, args = expr.kind, expr.token, expr.args
         annotation = self.resolve(annotation)
         unit = self.program.constructors.get(token.text) if kind == "bind" else None
         structural = kind not in {"bind", "wild", "or"} or (unit and unit.style == "unit")
         if isinstance(annotation, ReferenceType) and structural:
-            if annotation.mutable:
-                raise token.error("matching a mutable reference requires explicit dereferencing")
-            inner, bindings = self.prepare_pattern(expr, annotation.inner, borrowed=True)
+            inner, bindings = self.prepare_pattern(expr, annotation.inner, borrowed=annotation.mutable)
             ctor = Constructor("&", annotation, "reference", (("0", annotation.inner),))
             return Pattern(tag=ctor, children=(inner,)), bindings
         if kind == "wild":
@@ -4156,9 +4154,9 @@ class Checker:
             if not unit or unit.style != "unit":
                 if isinstance(self.resolve(annotation), SliceType):
                     raise token.error("cannot bind an unsized slice value")
-                if borrowed and not args[0]:
+                if borrowed is not None and not args[0]:
                     return (Pattern(binding=token.key, by_reference=True),
-                            {token.key: (ReferenceType(annotation, False), False)})
+                            {token.key: (ReferenceType(annotation, borrowed), False)})
                 return Pattern(binding=token.key), {token.key: (annotation, args[0])}
             if args[0]:
                 raise token.error(f"cannot shadow unit struct {token.text!r}")
@@ -4221,14 +4219,13 @@ class Checker:
             children[index] = child_pattern
         if isinstance(ctor, SlicePattern):
             for annotation, _ in bindings.values():
-                self.obligation(annotation, "Copy", token)
+                if not isinstance(annotation, ReferenceType):
+                    self.obligation(annotation, "Copy", token)
         return Pattern(tag=ctor, children=tuple(children)), bindings
 
     def match_type(self, expr, scope, expected=None):
         scrutinee, arms = expr.args
         annotation = self.type_of(scrutinee, scope)
-        if isinstance(annotation, ReferenceType) and annotation.mutable:
-            raise scrutinee.token.error("matching a mutable reference requires explicit dereferencing")
         coverage = []
         result = NEVER
         for source, guard, body in arms:
@@ -4278,8 +4275,6 @@ class Checker:
                     self.require(test, "bool", condition.token)
                 else:
                     source = args[1]
-                    if isinstance(test, ReferenceType) and test.mutable:
-                        raise condition.token.error("matching a mutable reference requires explicit dereferencing")
                     pattern, bindings = self.prepare_pattern(source, test)
                     self.program.patterns[id(source)] = (pattern, bindings)
                     scope = Scope(scope, {name: Binding(kind, mutable)
@@ -5196,6 +5191,14 @@ class FlowNode:
     edges: list = field(default_factory=list)
 
 
+@dataclass
+class PatternAccesses:
+    reads: dict = field(default_factory=dict)
+    moves: dict = field(default_factory=dict)
+    tests: dict = field(default_factory=dict)
+    borrows: dict = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class MoveState:
     missing: frozenset = frozenset()
@@ -5782,12 +5785,12 @@ class Ownership:
                 loan = Loan(Place(Local(source.token, annotation.mutable)), annotation.mutable)
                 return self.declare(source, types, scope, cursor, loan=loan)
             cursor, origin, loan = self.lower_pattern_input(value, scope, cursor, extend_to=scope)
-            reads, moves, tests = self.pattern_accesses(pattern, origin, value_type)
-            cursor = self.read_pattern(cursor, tests | reads, source.token)
+            access = self.pattern_accesses(pattern, origin, value_type)
+            cursor = self.read_pattern(cursor, access.tests | access.reads, source.token)
             if otherwise:
                 self.lower(otherwise, Scope(scope), cursor)
-            cursor = self.move_pattern(cursor, moves, source.token)
-            cursor = self.declare(source, types, scope, cursor, loan=loan)
+            cursor = self.move_pattern(cursor, access.moves, source.token)
+            cursor = self.declare(source, types, scope, cursor, loan=loan, borrows=access.borrows)
             if loan and isinstance(annotation, ReferenceType) and annotation.lifetime == "'static":
                 cursor = self.emit(cursor, "static_reference", origin, source.token)
             if loan and loan.expiring:
@@ -5925,13 +5928,13 @@ class Ownership:
                 target.in_condition = False
                 pattern, types = self.program.patterns[id(source)]
                 annotation = self.annotation(condition)
-                reads, moves, tests = self.pattern_accesses(pattern, origin, annotation)
-                body_entry = self.read_pattern(body_entry, tests | reads, source.token)
+                access = self.pattern_accesses(pattern, origin, annotation)
+                body_entry = self.read_pattern(body_entry, access.tests | access.reads, source.token)
                 if uncovered([(pattern,)], (annotation,), self.program) is not None:
                     self.connect(body_entry, finish)
-                body_entry = self.move_pattern(body_entry, moves, source.token)
+                body_entry = self.move_pattern(body_entry, access.moves, source.token)
                 scope = Scope(scope)
-                body_entry = self.declare(source, types, scope, body_entry, loan=loan)
+                body_entry = self.declare(source, types, scope, body_entry, loan=loan, borrows=access.borrows)
             if kind == "for":
                 self.connect(restart, finish)
                 local = Local(name, mutable)
@@ -5951,17 +5954,17 @@ class Ownership:
         protected = {}
         for source, guard, body in arms:
             pattern, types = self.program.patterns[id(source)]
-            reads, moves, tests = self.pattern_accesses(pattern, origin, self.annotation(scrutinee))
-            protected.update(tests)
-            prepared.append((source, guard, body, types, reads, moves, tests))
-        for source, guard, body, types, reads, moves, tests in prepared:
-            tested = self.read_pattern(cursor, tests | reads, source.token)
+            access = self.pattern_accesses(pattern, origin, self.annotation(scrutinee))
+            protected.update(access.tests)
+            prepared.append((source, guard, body, types, access))
+        for source, guard, body, types, access in prepared:
+            tested = self.read_pattern(cursor, access.tests | access.reads, source.token)
             inner = Scope(scope)
-            ready = self.declare(source, types, inner, tested, loan=scrutinee_loan)
+            ready = self.declare(source, types, inner, tested, loan=scrutinee_loan, borrows=access.borrows)
             if guard:
                 earlier = self.guarded, self.guard_borrows, self.guard_tests
                 self.guarded = self.guarded | set(inner.bindings.values())
-                self.guard_borrows = (*self.guard_borrows, *reads, *moves)
+                self.guard_borrows = (*self.guard_borrows, *access.reads, *access.moves)
                 self.guard_tests = (*self.guard_tests, *protected)
                 try:
                     ready = self.lower(guard, inner, ready)
@@ -5970,7 +5973,7 @@ class Ownership:
                 cursor = self.join(tested, ready)
             else:
                 cursor = tested
-            ready = self.move_pattern(ready, moves, source.token)
+            ready = self.move_pattern(ready, access.moves, source.token)
             if result_type:
                 end, loan = self.lower_reference(body, inner, ready, extend_to=extend_to)
                 finishes.append(self.leave_reference_scope(end, loan, inner, body.token))
@@ -5994,51 +5997,65 @@ class Ownership:
             cursor = self.lower(expr, scope, cursor)
         return cursor, origin, None
 
-    def declare(self, source, types, scope, cursor, *, initialized=True, loan=None):
+    def declare(self, source, types, scope, cursor, *, initialized=True, loan=None, borrows=None):
         action = "declare" if initialized else "uninitialized"
+        borrows = borrows or {}
         for name, (annotation, mutable) in types.items():
             carries_loan = isinstance(annotation, ReferenceType) or (isinstance(annotation, FunctionType) and annotation.closure)
-            local = Local(source.token.binding(name), mutable, loan if carries_loan else None)
+            binding_loan = loan if carries_loan else None
+            locations = borrows.get(name, ())
+            if locations and isinstance(annotation, ReferenceType) and annotation.mutable:
+                paths = [self.start_loan(cursor, place, True, source.token) for place in locations]
+                branches, loans = zip(*paths)
+                cursor = branches[0] if len(branches) == 1 else self.join(*branches)
+                binding_loan = self.merge_loans(loans, True)
+            local = Local(source.token.binding(name), mutable, binding_loan)
             scope.bindings[name] = local
             scope.owned.add(local)
             cursor = self.emit(cursor, action, Place(local), source.token)
         return cursor
 
     def pattern_accesses(self, pattern, origin, annotation):
-        reads = {}
-        moves = {}
-        tests = {}
+        access = PatternAccesses()
         if origin is not None:
-            self.collect_pattern(pattern, origin, reads, moves, tests, annotation)
-        return reads, moves, tests
+            self.collect_pattern(pattern, origin, access, annotation)
+        return access
 
-    def collect_pattern(self, pattern, place, reads, moves, tests, annotation, *, opaque=False):
+    def collect_pattern(self, pattern, place, access, annotation, *, opaque=False):
         if pattern.alternatives:
             for option in pattern.alternatives:
-                self.collect_pattern(option, place, reads, moves, tests, annotation, opaque=opaque)
+                self.collect_pattern(option, place, access, annotation, opaque=opaque)
         elif pattern.binding:
-            if pattern.by_reference or self.program.is_copy(annotation):
-                reads[place] = None
+            if pattern.by_reference:
+                access.reads[place] = None
+                access.borrows.setdefault(pattern.binding, {})[place] = None
+            elif self.program.is_copy(annotation):
+                access.reads[place] = None
             else:
-                moves[place] = annotation
+                access.moves[place] = annotation
         elif isinstance(pattern.tag, Constructor):
             ctor = pattern.tag
             if ctor.style == "reference":
-                self.collect_pattern(pattern.children[0], self.referent(place.local), reads, moves, tests, annotation.inner)
+                self.collect_pattern(pattern.children[0], self.referent(place.local), access, annotation.inner)
                 return
             variant = "::" in ctor.path
             if variant and len(self.program.layout(ctor.annotation)[1]) > 1:
-                tests[place] = None
+                access.tests[place] = None
+            opaque = opaque or (variant and place.holder is None)
             for child, (field, kind) in zip(pattern.children, ctor.fields):
-                projected = place if opaque or variant else place.child(field)
-                self.collect_pattern(child, projected, reads, moves, tests, kind, opaque=opaque or variant)
+                projected = place if opaque else place.child(field)
+                self.collect_pattern(child, projected, access, kind, opaque=opaque)
         elif isinstance(pattern.tag, SlicePattern):
-            projected = replace(place, indexed=True)
-            tests[projected] = None
-            for child in pattern.children:
-                self.collect_pattern(child, projected, reads, moves, tests, annotation.element, opaque=True)
+            access.tests[place] = None
+            for index, child in enumerate(pattern.children):
+                if place.holder:
+                    offset = index if index < pattern.tag.prefix else index - len(pattern.children)
+                    projected = place.child(str(offset))
+                else:
+                    projected = replace(place, indexed=True)
+                self.collect_pattern(child, projected, access, annotation.element, opaque=not place.holder)
         elif pattern.tag is not None:
-            tests[place] = None
+            access.tests[place] = None
 
     def read_pattern(self, cursor, reads, token):
         for place in reads:

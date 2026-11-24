@@ -36,7 +36,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Tuples with positional fields, annotations, destructuring, and partial moves
 - Field access and mutation, destructuring, `if let`, `while let`, and `let-else`
 - Exhaustive `match` with nested patterns, alternatives, integer ranges, and guards
-- Implicit shared reference bindings in structural patterns
+- Implicit shared and mutable reference bindings in structural patterns
 - Move and initialization checks across branches and loop iterations
 - Partial moves, assignment after a move, and selected `Clone`, `Copy`, and `Debug` derives
 - Shared and mutable references to locals, fields, and temporaries
