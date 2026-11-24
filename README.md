@@ -64,6 +64,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
 - Unicode and raw identifiers, NFC normalization, and edition-aware raw lifetimes
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
+- Program termination with `Result`, `ExitCode`, custom `Termination` implementations, and `process::exit`
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
 - Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
 - Owned `String` values with concatenation and UTF-8-aware lengths and mutation

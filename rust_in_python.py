@@ -43,6 +43,11 @@ class RustPanic(Exception):
     pass
 
 
+class ProcessExit(Exception):
+    def __init__(self, status):
+        self.status = status
+
+
 @dataclass(frozen=True)
 class Token:
     text: str
@@ -729,6 +734,9 @@ RESULT = MODULE_SEPARATOR.join(("core", "result", "Result"))
 VEC = MODULE_SEPARATOR.join(("alloc", "vec", "Vec"))
 BOX = MODULE_SEPARATOR.join(("alloc", "boxed", "Box"))
 STRING = MODULE_SEPARATOR.join(("alloc", "string", "String"))
+EXIT_CODE = MODULE_SEPARATOR.join(("std", "process", "ExitCode"))
+TERMINATION = MODULE_SEPARATOR.join(("std", "process", "Termination"))
+PROCESS_EXIT = MODULE_SEPARATOR.join(("std", "process", "exit"))
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -1082,6 +1090,15 @@ class Modules:
     @staticmethod
     def prelude(path, token):
         head, *tail = path
+        if tuple(path[:2]) == ("std", "process") and len(path) in {3, 4}:
+            name = path[2]
+            if name == "exit" and len(path) == 3:
+                return ModuleSymbol(tuple(path), "fn", (), token)
+            if name in {"ExitCode", "Termination"}:
+                if len(path) == 4:
+                    return ModuleSymbol(("std", "process", f"{name}::{path[3]}"), "associated", (), token)
+                kind = "struct" if name == "ExitCode" else "trait"
+                return ModuleSymbol(tuple(path), kind, (), token)
         if head in {"std", "core"} and len(tail) >= 2:
             crate = head
             module, head, *tail = tail
@@ -1483,6 +1500,11 @@ class ConstValue:
 
 
 @dataclass(frozen=True)
+class ExitCodeValue:
+    status: int
+
+
+@dataclass(frozen=True)
 class ConstExpression:
     operator: str
     operands: tuple
@@ -1850,6 +1872,11 @@ class Program:
         self.default_variants[OPTION] = f"{OPTION}::None"
         self.type_parameters[VEC] = (TypeParameter("T"),)
         self.type_parameters[BOX] = (TypeParameter("T"),)
+        token = Token(TERMINATION, 1, 1)
+        self_type = TypeParameter("Self", {TERMINATION})
+        report = Function(replace(token, text="@termination_report"), [(replace(token, text="self"), False, self_type)],
+                          EXIT_CODE, None, type_parameters=(self_type,))
+        self.traits[TERMINATION] = Trait(token, self_type, set(), {"report": report}, {})
 
     def projection_trait(self, annotation):
         if annotation.trait:
@@ -2005,6 +2032,15 @@ class Program:
             return False
         if trait == "Sized":
             return not isinstance(annotation, SliceType)
+        if trait == TERMINATION:
+            if annotation in {"()", NEVER, EXIT_CODE}:
+                return True
+            if isinstance(annotation, AppliedType) and annotation.name == RESULT:
+                result, error = annotation.arguments
+                return (self.implements(result, TERMINATION, assumed, seen=seen)
+                        and self.implements(error, "Debug", assumed, seen=seen))
+        if annotation == EXIT_CODE and trait in {"Copy", "Clone", "Debug", "PartialEq"}:
+            return True
         if is_box(annotation):
             if trait in {"Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord"}:
                 return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
@@ -3187,6 +3223,9 @@ class Parser:
             path, type_arguments = self.expression_path(token, allow_record=allow_record)
             if path.text in SCALAR_CONSTANTS:
                 return Expr("literal", path, SCALAR_CONSTANTS[path.text])
+            if path.text in {f"{EXIT_CODE}::SUCCESS", f"{EXIT_CODE}::FAILURE"}:
+                status = int(path.text.endswith("::FAILURE"))
+                return Expr("literal", path, (EXIT_CODE, ExitCodeValue(status)))
             if path.text in self.constants:
                 constant = self.constants[path.text]
                 return Expr("literal", path, (constant.kind, constant.value))
@@ -4417,8 +4456,9 @@ class Checker:
         main = self.functions.get("main")
         if main is None:
             raise RustError("missing fn main()")
-        if main.params or main.result != "()" or main.type_parameters:
-            raise main.name.error("main must take no arguments and return ()")
+        if main.params or main.type_parameters:
+            raise main.name.error("main must take no arguments and cannot be generic")
+        self.obligation(main.result, TERMINATION, main.name)
         for function in tuple(self.functions.values()):
             self.check_bounds(function.type_parameters, function.name)
             self.parameters = {parameter.name: parameter for parameter in function.type_parameters}
@@ -4516,6 +4556,13 @@ class Checker:
         for index, impl in enumerate(self.program.impls):
             self.check_bounds(impl.parameters, impl.token)
             self.check_type(impl.target, impl.token)
+            if impl.trait == TERMINATION:
+                owner = impl.target
+                while isinstance(owner, ReferenceType) or is_box(owner):
+                    owner = owner.inner if isinstance(owner, ReferenceType) else owner.arguments[0]
+                name = owner.name if isinstance(owner, AppliedType) else owner
+                if name in {OPTION, RESULT} or name not in self.program.types:
+                    raise impl.token.error("Termination can only be implemented for a type defined in this crate")
             target_parameters = set(self.type_parts(impl.target))
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
@@ -5086,7 +5133,7 @@ class Checker:
         if self.program.type_parameters.get(annotation):
             count = len(self.program.type_parameters[annotation])
             raise token.error(f"{annotation} expects {count} type arguments")
-        if annotation in PRIMITIVES or annotation == STRING or annotation in self.program.types:
+        if annotation in PRIMITIVES or annotation in {STRING, EXIT_CODE} or annotation in self.program.types:
             return
         if annotation != NEVER or not allow_never:
             raise token.error(f"unsupported type {annotation!r}")
@@ -6158,6 +6205,20 @@ class Checker:
             return self.vector_constructor(expr, scope, owner or expected)
         if token.text == f"{BOX}::new":
             return self.box_constructor(expr, scope, expected)
+        if token.text == f"{EXIT_CODE}::from":
+            if len(args) != 1 or expr.type_arguments is not None:
+                raise token.error("ExitCode::from takes one u8")
+            value = self.type_of(args[0], scope, "u8")
+            self.require(value, "u8", token)
+            expr.kind = "exit_code"
+            return NEVER if value == NEVER else EXIT_CODE
+        if token.text == PROCESS_EXIT:
+            if len(args) != 1 or expr.type_arguments is not None:
+                raise token.error("process::exit takes one i32")
+            value = self.type_of(args[0], scope, "i32")
+            self.require(value, "i32", token)
+            expr.kind = "process_exit"
+            return NEVER
         if token.text in {f"{STRING}::new", f"{STRING}::from"}:
             return self.string_constructor(expr, scope, token.text.rsplit("::", 1)[-1])
         ctor = self.program.constructors.get(token.text)
@@ -7404,8 +7465,11 @@ class Ownership:
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
             return cursor
-        if kind in {"group", "field", "unary", "deref", "scalar_cast", "box", "box_deref"}:
+        if kind in {"group", "field", "unary", "deref", "scalar_cast", "box", "box_deref", "exit_code"}:
             return self.lower(args[0], scope, cursor)
+        if kind == "process_exit":
+            self.lower(args[0], scope, cursor)
+            return None
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
         if kind in {"length", "is_empty", "to_string", "float_method"}:
@@ -8064,6 +8128,9 @@ def display(value, debug):
         return display(value.read(), debug)
     if isinstance(value, ArrayValue):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
+    if isinstance(value, ExitCodeValue):
+        code = f"unix_exit_status({value.status})" if os.name == "posix" else str(value.status)
+        return f"ExitCode({code})"
     if isinstance(value, Value):
         ctor = value.constructor
         name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
@@ -8236,6 +8303,8 @@ class Interpreter:
             left = left.read()
         while isinstance(right, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
             right = right.read()
+        if isinstance(left, ExitCodeValue):
+            return left.status - right.status
         if isinstance(left, ArrayValue):
             for a, b in zip(left.items, right.items):
                 result = self.compare(a, b)
@@ -8328,6 +8397,10 @@ class Interpreter:
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "exit_code":
+            return ExitCodeValue(self.eval(args[0], scope))
+        if kind == "process_exit":
+            raise ProcessExit(self.eval(args[0], scope))
         if kind == "box":
             value = self.eval(args[0], scope)
             concrete = self.program.normalize(substitute(self.program.expr_types[id(args[0])], self.type_arguments))
@@ -8658,7 +8731,10 @@ class Interpreter:
                     if isinstance(values[0], DynAddress):
                         values = (values[0].address, *values[1:])
                 receiver = self.program.concrete_type(receiver)
-                impl, specialized = self.program.implementation(receiver, trait)
+                implementation = self.program.implementation(receiver, trait)
+                if implementation is None and trait == TERMINATION:
+                    return ExitCodeValue(self.exit_status(values[0], receiver))
+                impl, specialized = implementation
                 if name in impl.methods:
                     prototype = function
                     function = impl.methods[name]
@@ -8696,6 +8772,21 @@ class Interpreter:
             print(rendered, end="\n" if token.text in {"println", "eprintln"} else "", file=destination)
             return None
         raise AssertionError(kind)
+
+    def exit_status(self, value, annotation):
+        annotation = self.program.concrete_type(self.program.normalize(annotation))
+        if annotation == "()":
+            return 0
+        if annotation == EXIT_CODE:
+            return value.status
+        if isinstance(annotation, AppliedType) and annotation.name == RESULT:
+            if value.constructor.path.endswith("::Err"):
+                print(f"Error: {display(value.fields[0], True)}", file=sys.stderr)
+                return 1
+            return self.exit_status(value.fields[0], annotation.arguments[0])
+        impl, arguments = self.program.implementation(annotation, TERMINATION)
+        result = self.call(impl.methods["report"].name.text, (value,), arguments)
+        return result.status
 
 
 DEMO = """\
@@ -8918,7 +9009,13 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
 
 def run(source, stdout=None, *, proc_extern=(), source_path=None, edition="2021"):
     program = compile_program(source, proc_extern=proc_extern, source_path=source_path, edition=edition)
-    Interpreter(program, sys.stdout if stdout is None else stdout).call("main", ())
+    interpreter = Interpreter(program, sys.stdout if stdout is None else stdout)
+    try:
+        value = interpreter.call("main", ())
+        status = interpreter.exit_status(value, program.functions["main"].result)
+    except ProcessExit as stop:
+        status = stop.status & 255 if os.name == "posix" else stop.status
+    return status or None
 
 
 def main():
@@ -8926,7 +9023,7 @@ def main():
     parser.add_argument("source", nargs="?", help="Rust source file, or - for stdin")
     parser.add_argument("--demo", action="store_true", help="run a built-in Rust program")
     parser.add_argument("--check", action="store_true", help="check the source without running it")
-    parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for macro matching")
+    parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for syntax")
     parser.add_argument("--proc-extern", action="append", default=[], metavar="NAME=PATH",
                         help="load a compiled Rust procedural macro crate through rustc")
     args = parser.parse_args()
@@ -8942,7 +9039,9 @@ def main():
             source = Path(args.source).read_text(encoding="utf-8")
         source_path = None if args.demo or args.source == "-" else args.source
         operation = compile_program if args.check else run
-        operation(source, proc_extern=args.proc_extern, source_path=source_path, edition=args.edition)
+        result = operation(source, proc_extern=args.proc_extern, source_path=source_path, edition=args.edition)
+        if not args.check and result is not None:
+            return result
     except (RustError, OSError, UnicodeError) as error:
         print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
         return 1

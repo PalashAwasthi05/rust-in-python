@@ -15,6 +15,16 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("main can propagate a result and terminate successfully", """
+        #[derive(Debug)]
+        struct Failure(u8);
+        fn lookup() -> Result<u8, Failure> { Ok(7) }
+        fn main() -> Result<Result<(), Failure>, Failure> {
+            let number = lookup()?;
+            println!("{number}");
+            Ok(Ok(()))
+        }
+    """, "7\n"),
     ("Unicode names normalize across source positions and format arguments", """
         fn 量(数量: i32) -> i32 { 数量 + 1 }
         fn main() {
@@ -2069,6 +2079,20 @@ VALID = [
 ]
 
 INVALID = [
+    ("main requires the termination trait", """
+        fn main() -> i32 { 1 }
+    """, "does not implement .*Termination"),
+    ("result-returning main requires a debug error type", """
+        struct Failure;
+        fn main() -> Result<(), Failure> { Ok(()) }
+    """, "does not implement .*Termination"),
+    ("foreign termination implementations require local types", """
+        use std::process::{ExitCode, Termination};
+        impl Termination for i32 {
+            fn report(self) -> ExitCode { ExitCode::SUCCESS }
+        }
+        fn main() {}
+    """, "Termination can only be implemented for a type defined in this crate"),
     ("raw identifiers still reject special path keywords", """
         fn main() { let r#self = 1; }
     """, "is reserved"),
@@ -3344,6 +3368,54 @@ class InterpreterTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(RustError, message):
                     run(source, StringIO())
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_main_termination(self):
+        cases = [
+            ("result failure", """
+                #[derive(Debug)]
+                struct Failure { reason: u8 }
+                fn lookup() -> Result<u8, Failure> { Err(Failure { reason: 3 }) }
+                fn main() -> Result<(), Failure> {
+                    println!("before");
+                    lookup()?;
+                    Ok(())
+                }
+            """, 1),
+            ("custom report", """
+                use std::process::{ExitCode, Termination};
+                struct Status(u8);
+                impl Termination for Status {
+                    fn report(self) -> ExitCode {
+                        println!("report {}", self.0);
+                        ExitCode::from(self.0)
+                    }
+                }
+                fn main() -> impl Termination { Status(13) }
+            """, 13),
+            ("result exit code", """
+                use std::process::ExitCode;
+                fn main() -> Result<ExitCode, ()> { Ok(ExitCode::from(7)) }
+            """, 7),
+            ("explicit process exit", """
+                use std::process::exit;
+                fn main() -> ! { eprintln!("stopping"); exit(9) }
+            """, 9),
+        ]
+        with TemporaryDirectory() as folder:
+            source_file = Path(folder) / "termination.rs"
+            binary = Path(folder) / "native"
+            interpreter = Path(__file__).with_name("rust_in_python.py")
+            for name, source, status in cases:
+                with self.subTest(name=name):
+                    compiled = self.compile(source_file, binary, source)
+                    self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                    native = subprocess.run([binary], text=True, capture_output=True, timeout=10)
+                    python = subprocess.run([sys.executable, interpreter, source_file],
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(native.returncode, status)
+                    self.assertEqual((python.returncode, python.stdout, python.stderr),
+                                     (native.returncode, native.stdout, native.stderr))
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_rustc_agrees(self):
