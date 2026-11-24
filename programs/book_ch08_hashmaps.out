@@ -1,0 +1,19 @@
+0
+Blue: 10
+Red: 0
+Blue: 10
+Yellow: 50
+{"Favorite color": "Blue"}
+Blue overwritten: 25
+[("Yellow", 50), ("Blue", 25), ("Green", 5)]
+[("world", 2), ("hello", 1), ("wonderful", 1)]
+["Blue", "Yellow"] total 60
+mean 4.667 median 4 mode 7
+mean 2.5 median 2.5 mode 1
+Engineering: Ann, Sally
+Marketing: Carl
+Sales: Amir, Zoe
+everyone: ["Amir", "Ann", "Carl", "Sally", "Zoe"]
+[('i', 4), ('m', 1), ('p', 2), ('s', 4)]
+apples 5 pears 2 has plums false
+removed Some(5) len 1

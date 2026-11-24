@@ -1,0 +1,46 @@
+0
+The user with preference Some(Red) gets Red
+The user with preference None gets Blue
+expensive_closure(21) = 42
+2 3 4
+hello
+Before defining closure: [1, 2, 3]
+Before calling closure: [1, 2, 3]
+From closure: [1, 2, 3]
+After calling closure: [1, 2, 3]
+Before defining closure: [1, 2, 3]
+After calling closure: [1, 2, 3, 7]
+Before defining closure: [1, 2, 3]
+From thread: [1, 2, 3]
+[
+    Rectangle {
+        width: 3,
+        height: 5,
+    },
+    Rectangle {
+        width: 7,
+        height: 12,
+    },
+    Rectangle {
+        width: 10,
+        height: 1,
+    },
+], sorted with key calls > 0: true
+calculating slowly for 3...
+value(3) = 10
+calculating slowly for 4...
+value(4) = 17
+value(3) = 10
+value(3) = 10
+value(4) = 17
+calculating slowly for 10...
+value(10) = 101
+calls = 3
+hello, Ferris
+total = 10
+8
+[12, 6, 49]
+1 2 3 | 1
+["bob", "kayak"]
+["APPLE", "KAYAK", "RUST"]
+[4, 30]

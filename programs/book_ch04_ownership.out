@@ -1,0 +1,27 @@
+0
+hello is valid in this scope
+hello, world!
+x = 5, y = 5
+s1 = hello, s2 = hello
+took ownership of hello
+copied 5
+x is still 5
+yours hello
+The length of 'hello' is 5.
+The length of 'hello' is 5.
+hello, world
+hello!?
+hello and hello
+HELLO
+first word ends at 5
+[hello] [world]
+he lo world hello world
+hello
+hello
+hello
+hello
+hello
+Some("two") None
+slice = [2, 3], sum = 5, whole sum = 15
+vec slice sum = 50
+moved "a", left ["", "b"]

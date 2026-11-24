@@ -1,0 +1,30 @@
+0
+Got: 1
+Got: 2
+Got: 3
+total = 6
+[2, 3, 4]
+[Shoe { size: 10, style: "sneaker" }, Shoe { size: 10, style: "boot" }]
+1 2 3 4 5 
+zip/skip/map/filter sum = 18
+[1, 2, 3] max Some(5) last Some(5) count 5
+["safe, fast, productive."]
+["Rust:", "Trust me."]
+query=the file=poem.txt ignore_case=false
+Problem parsing arguments: Didn't get a query string
+even fibs [0, 2, 8, 34, 144, 610]
+first fib over 10000: Some(10946)
+144 at Some(12)
+0:ann,1:bo,2:cyd
+[1, 2, 3] [4, 5, 6, 7, 8, 9, 10]
+1-2-3-4-5
+24
+[1, 7, 13, 19]
+[1, 2, 3]
+["a", "b", "c", "d", "e"]
+true false
+-+-++-+
+[("c", 7), ("a", 3), ("b", 3)]
+Some("a")
+[8, 7, 2, 1]
+[(3, 'l'), (4, 'l'), (5, 'o')]

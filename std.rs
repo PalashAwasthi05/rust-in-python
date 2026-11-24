@@ -2357,8 +2357,19 @@ pub mod thread {
 
 pub mod any {
     pub trait Any {}
+    impl<T: ?Sized> Any for T {}
     pub fn type_name<T: ?Sized>() -> &'static str;
     pub fn type_name_of_val<T: ?Sized>(value: &T) -> &'static str { type_name::<T>() }
+    impl crate::fmt::Debug for dyn Any {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_str("Any { .. }") }
+    }
+    fn any_downcast<'a, T>(value: &'a dyn Any) -> Option<&'a T>;
+    fn any_downcast_mut<'a, T>(value: &'a mut dyn Any) -> Option<&'a mut T>;
+    impl dyn Any {
+        pub fn is<T>(&self) -> bool { any_downcast::<T>(self).is_some() }
+        pub fn downcast_ref<T>(&self) -> Option<&T> { any_downcast::<T>(self) }
+        pub fn downcast_mut<T>(&mut self) -> Option<&mut T> { any_downcast_mut::<T>(self) }
+    }
 }
 
 pub mod time {

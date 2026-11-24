@@ -1,0 +1,32 @@
+0
+good: port 8080
+good: retries 3
+bad: error: key `port` is not a number: invalid digit found in string
+bad: retries 3
+range: error: 70000 is out of range
+range: retries error: key `?` is not a number: invalid digit found in string / BadNumber("?", ParseIntError { kind: InvalidDigit })
+empty: error: missing key `port`
+empty: retries 3
+port via unwrap_or_else: 8080
+fallback: 0
+Ok("FERRIS")
+Err("username file was empty")
+Err("no username file")
+Some('d')
+None
+None
+sum = 6
+sum failed: invalid digit found in string
+sum failed: -4 is out of range
+sum failed: total too large
+Guess value must be between 1 and 100, got 0.
+accepted guess 1
+accepted guess 50
+accepted guess 100
+Guess value must be between 1 and 100, got 101.
+Ok([1, 2, 3])
+Err(ParseIntError { kind: InvalidDigit })
+total of valid = 15
+true -1 Some("boom")
+u8 parse error: number too large to fit in target type
+expect gave 12

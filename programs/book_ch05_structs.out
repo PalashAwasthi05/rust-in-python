@@ -1,0 +1,34 @@
+0
+someusername123 <anotheremail@example.com> active=true count=1
+user2: someusername123 another@example.com
+user1 still has email anotheremail@example.com
+User { active: true, username: "ferris", email: "ferris@example.com", sign_in_count: 1 }
+User {
+    active: true,
+    username: "ferris",
+    email: "ferris@example.com",
+    sign_in_count: 1,
+}
+black = (0, 0, 0), origin = (1, 2, 3)
+AlwaysEqual true
+The area of the rectangle is 1500 square pixels.
+The area of the rectangle is 1500 square pixels.
+The area of the rectangle is 1500 square pixels.
+rect1 is Rectangle { width: 30, height: 50 }
+rect1 is Rectangle {
+    width: 30,
+    height: 50,
+}
+rect2 area 3000
+The rectangle has a nonzero width; it is 30
+Can rect1 hold rect2? true
+Can rect1 hold rect3? false
+Can rect1 hold rect3 (explicit)? false
+square Rectangle { width: 3, height: 3 } area 9
+scaled Rectangle { width: 12, height: 12 } area 144
+copy == sq: true
+tuple (12, 12)
+10x1 -> 10
+3x5 -> 15
+7x12 -> 84
+biggest Rectangle { width: 7, height: 12 }

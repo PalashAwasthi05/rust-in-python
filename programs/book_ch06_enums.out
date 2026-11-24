@@ -1,0 +1,31 @@
+0
+V4 V6
+routing v4 / routing v6
+V4(127, 0, 0, 1) V6("::1")
+127.0.0.1
+Write "hello"
+Move to 3,-4
+Color #ff8000
+Quit
+Move { x: 3, y: -4 }
+Some(5) Some('e') None
+sum = 10
+Some(6) None
+Lucky penny!
+State quarter from Alaska!
+State quarter from Alabama!
+total = 66 cents
+State quarter from Alaska!
+State quarter from Alabama!
+non-quarters: 3
+Delaware is pretty old, for America!
+Alaska is relatively new.
+not a quarter
+add fancy hat
+remove fancy hat
+move player 9 spaces
+add fancy hat
+The maximum is configured to be 3
+no maximum configured
+50
+true

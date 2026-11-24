@@ -1,0 +1,131 @@
+0
+(secret is 3)
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too big!
+Please input your guess.
+You guessed: 25
+Too big!
+Please input your guess.
+(ignoring "abc")
+Please input your guess.
+(ignoring "")
+Please input your guess.
+You guessed: 75
+Too big!
+Please input your guess.
+You guessed: 62
+Too big!
+Please input your guess.
+You guessed: 56
+Too big!
+ran out of input
+--- round 0: secret 27, 7 guesses
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too big!
+Please input your guess.
+You guessed: 25
+Too small!
+Please input your guess.
+You guessed: 37
+Too big!
+Please input your guess.
+You guessed: 31
+Too big!
+Please input your guess.
+You guessed: 28
+Too big!
+Please input your guess.
+You guessed: 26
+Too small!
+Please input your guess.
+You guessed: 27
+You win!
+--- round 1: secret 35, 6 guesses
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too big!
+Please input your guess.
+You guessed: 25
+Too small!
+Please input your guess.
+You guessed: 37
+Too big!
+Please input your guess.
+You guessed: 31
+Too small!
+Please input your guess.
+You guessed: 34
+Too small!
+Please input your guess.
+You guessed: 35
+You win!
+--- round 2: secret 96, 7 guesses
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too small!
+Please input your guess.
+You guessed: 75
+Too small!
+Please input your guess.
+You guessed: 88
+Too small!
+Please input your guess.
+You guessed: 94
+Too small!
+Please input your guess.
+You guessed: 97
+Too big!
+Please input your guess.
+You guessed: 95
+Too small!
+Please input your guess.
+You guessed: 96
+You win!
+--- round 3: secret 99, 6 guesses
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too small!
+Please input your guess.
+You guessed: 75
+Too small!
+Please input your guess.
+You guessed: 88
+Too small!
+Please input your guess.
+You guessed: 94
+Too small!
+Please input your guess.
+You guessed: 97
+Too small!
+Please input your guess.
+You guessed: 99
+You win!
+--- round 4: secret 13, 6 guesses
+Guess the number!
+Please input your guess.
+You guessed: 50
+Too big!
+Please input your guess.
+You guessed: 25
+Too big!
+Please input your guess.
+You guessed: 12
+Too small!
+Please input your guess.
+You guessed: 18
+Too big!
+Please input your guess.
+You guessed: 15
+Too big!
+Please input your guess.
+You guessed: 13
+You win!
+wins: 5
+dice: [3, 2, 2, 2, 2, 4, 1, 6, 6, 4]

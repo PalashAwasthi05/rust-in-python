@@ -1,0 +1,13 @@
+0
+average 18.000
+removed Some(42), average now 13.2
+empty remove None average 0
+<SelectBox 75x10 options=Yes|Maybe|No>
+[Button 50x10: OK]
+generic screen drew 31 chars
+[draft] content: ""
+[pending review] content: ""
+[draft] content: ""
+[pending review] content: ""
+[published] content: "I ate a salad for lunch today"
+typed post: I ate a salad for lunch today, and soup

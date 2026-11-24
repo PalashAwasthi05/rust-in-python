@@ -1,0 +1,18 @@
+0
+added to waitlist
+added to waitlist
+seated (order soon)
+served
+I'd like Wheat toast please, with peaches
+Breakfast { toast: "Wheat", seasonal_fruit: "peaches" }
+Soup and Salad
+cooked, then delivered
+oven at 220 via helpers
+oven const 220
+map {1: 2}
+set {1, 2, 3} cmp true
+written: 1-2
+Some(Orange)
+Some(Green)
+None
+true

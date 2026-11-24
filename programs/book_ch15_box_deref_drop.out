@@ -1,0 +1,28 @@
+0
+b = 5
+doubled = 10
+Cons(1, Cons(2, Cons(3, Nil)))
+sum 6 vec [1, 2, 3]
+[4, 5, 6, 7] sum 22
+deref checks passed: 6
+Hello, Rust!
+Hello, Rust!
+len through deref = 4
+[1, 2, 3, 4] first Some(1)
+CustomSmartPointers created.
+CustomSmartPointer created.
+Dropping CustomSmartPointer with data `some data`!
+CustomSmartPointer dropped before the end of main.
+leaving inner scope
+Dropping CustomSmartPointer with data `inner scope`!
+moved box holds boxed
+Dropping CustomSmartPointer with data `wildcard temporary`!
+vec has 2 pointers; c=my stuff d=other stuff
+depth 3 labels ["root", "a", "a1", "b"]
+total area 7
+end of main
+Dropping CustomSmartPointer with data `vec 0`!
+Dropping CustomSmartPointer with data `vec 1`!
+Dropping CustomSmartPointer with data `boxed`!
+Dropping CustomSmartPointer with data `other stuff`!
+Dropping CustomSmartPointer with data `my stuff`!

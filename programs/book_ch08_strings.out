@@ -1,0 +1,40 @@
+0
+initial
+true true 16
+السلام عليكم: 23 bytes, 12 chars
+Dobrý den: 10 bytes, 9 chars
+Hello: 5 bytes, 5 chars
+שלום: 8 bytes, 4 chars
+नमस्ते: 18 bytes, 6 chars
+こんにちは: 15 bytes, 5 chars
+안녕하세요: 15 bytes, 5 chars
+你好: 6 bytes, 2 chars
+Olá: 4 bytes, 3 chars
+Здравствуйте: 24 bytes, 12 chars
+Hola: 4 bytes, 4 chars
+s1 is foobar, s2 is bar
+lol
+Hello, world! (world! still usable)
+tic-tac-toe
+tic-tac-toe and s1 is still tic
+first 4 bytes: Зд
+З
+д
+208
+151
+208
+180
+['न', 'म', 'स', '\u{94d}', 'त', '\u{947}']
+[0, 3, 6, 9, 12, 15]
+is_char_boundary(1)? false
+irst-fay apple-hay ust-ray orange-hay tring-say
+[The quick brown fox jumps over the lazy dog]
+THE QUICK BROWN FOX JUMPS OVER THE LAZY DOG
+The quick brown fox jumps over a lazy dog
+["dog", "lazy", "the", "over", "jumps", "fox", "brown", "quick", "The"]
+starts true ends true find Some(16)
+The Quick Brown Fox Jumps Over The Lazy Dog
+T_q_b_f_j_o_t_l_d
+desserts
+">> hello" popped Some('d')
+empty? true

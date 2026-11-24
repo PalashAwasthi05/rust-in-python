@@ -1,0 +1,22 @@
+0
+The largest number is 100
+The largest number is 6000
+The largest char is y
+The largest float is 9.25
+The largest word is zucchini
+The largest pair is (3, 'c')
+Point { x: 5, y: 10 } Point { x: 1.0, y: 4.0 }
+p.x = 5
+distance = 5
+p3.x = 5, p3.y = c
+Mixed { x: "Hello", y: 10.4 }
+left 1
+right "two"
+left 3
+sum of lefts = 4
+Some(5) Ok(2.5) Err("bad")
+[a | b | c] peek Some("c")
+popped Some("c") now [a | b]
+[1.5 | 2.25]
+left [1, 2]
+3 0
