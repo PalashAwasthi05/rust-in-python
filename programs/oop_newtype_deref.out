@@ -1,0 +1,17 @@
+0
+w = [hello, world]
+len = 3, first = Some("hello")
+total = 15
+sorted = [again, hello, world]
+[>again!, >hello, >world]
+contains >world: true
+Meters(1.25) < Meters(3.5): true
+sum = 4.75
+user#0007 user#0012 user#0030
+user#0099 UserId(99)
+email alice@example.com len 17 domain Some("example.com")
+shout ALICE@EXAMPLE.COM
+as_ref true
+invalid email: nope
+stack [1, 4, 9, 16, 25] last=Some(25) sum=55
+contains 16: true, slice [4, 9]

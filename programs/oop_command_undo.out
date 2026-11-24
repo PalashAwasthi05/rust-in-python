@@ -1,0 +1,27 @@
+0
+run  Insert { pos: 0, text: "hello" } -> "hello"
+run  Insert { pos: 5, text: " world" } -> "hello world"
+run  Delete 6 chars at 0          -> "world"
+run  Upper { before: "world" }    -> "WORLD"
+undo Upper { before: "" }         -> "world"
+undo Delete 6 chars at 0          -> "hello world"
+redo Delete 6 chars at 0          -> "world"
+run  Insert { pos: 5, text: "!" } -> "world!"
+undo Insert { pos: 5, text: "!" } -> "world"
+undo Delete 6 chars at 0          -> "hello world"
+undo Insert { pos: 5, text: " world" } -> "hello"
+undo Insert { pos: 0, text: "hello" } -> ""
+nothing to undo
+history: undo=0 redo=4
+  pending Insert { pos: 0, text: "hello" }
+  pending Insert { pos: 5, text: " world" }
+  pending Delete 6 chars at 0
+  pending Insert { pos: 5, text: "!" }
+  double: 3 -> 6
+  add offset: 6 -> 13
+  square: 13 -> 169
+replay = 169
+  double: -4 -> -8
+  add offset: -8 -> -1
+  square: -1 -> 1
+replay = 1

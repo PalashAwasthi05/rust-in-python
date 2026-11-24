@@ -1,0 +1,18 @@
+0
+log: Click { x: 10, y: 20 }
+  handler 0 for click: clicked at (10, 20)
+  handler 1 for click: left half: true
+log: Key('q')
+  handler 0 for key: Key('q') pressed
+log: Resize(800, 600)
+log: Click { x: 70, y: 1 }
+  handler 0 for click: clicked at (70, 1)
+  handler 1 for click: left half: false
+log: Quit
+seen kinds: ["click", "key", "resize", "click", "quit"]
+rc count: 2
+total=10 history=[10, 20, 30, 40]
+temp set to 21, 2 live observers
+observer 2 alive
+temp set to 25, 1 live observers
+observer 1 saw value 25

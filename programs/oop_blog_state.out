@@ -1,0 +1,11 @@
+0
+[draft] ""
+[pending] ""
+[draft] ""
+[pending] "" approvals=1
+[published] "I ate a salad for lunch today!" approvals=2
+[published] "I ate a salad for lunch today!"
+typed: typed states
+draft -> ""
+pending -> ""
+published -> "post 2"

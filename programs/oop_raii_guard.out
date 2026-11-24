@@ -1,0 +1,34 @@
+0
+> outer
+  > inner
+    > deeper
+      working
+    < deeper
+  < inner
+  > early
+  < early
+depth now 1
+< outer
+transaction committed
+Ok(())
+transaction rolled back (2 pending writes dropped)
+Err("failed midway")
+log = ["a", "b", "c"]
+locked
+second lock: true
+inside: [1, 2, 3, 4] len 4
+unlocked
+locked
+unlocked
+relock ok: 4
+drop temporary
+drop v0
+drop v1
+took opt
+drop opt
+end of main boxed
+drop pair.first
+drop pair.second
+drop boxed
+drop b
+drop a

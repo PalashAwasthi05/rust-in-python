@@ -1,0 +1,17 @@
+0
+POSITION
+<health(3)>
+position => Position { x: 2.0, y: 0.0, vx: 2.0 }
+health(1) => Health(1)
+health(0) => Health(0)
+found position at x=2
+first health: Some(1)
+is string? true
+healths: [101, 100]
+i32 5
+String "hi"
+&str "static"
+some f64
+unknown
+got back owned with len 5
+not a string; u8? true

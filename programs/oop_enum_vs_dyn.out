@@ -1,0 +1,13 @@
+0
+Rex the 4-legged says woof         | Rex the 4-legged says woof
+Tweety the 2-legged says tweet     | Tweety the 2-legged says tweet
+...hiss...                         | ...hiss...
+Pingu the 2-legged says squawk     | Pingu the 2-legged says squawk
+Dog(Rex) FlyingBird(Tweety) Snake(snake) Bird(Pingu) 
+legs (dyn): 8
+legs (enum): 8
+dogs only: ["Rex the 4-legged says woof", "Fido the 4-legged says woof"]
+loudest: Tweety
+loudest: Pingu
+fliers: 1
+size_of AnyAnimal > 0: true

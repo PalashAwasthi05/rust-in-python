@@ -1279,7 +1279,7 @@ pub mod ops {
     pub trait ShrAssign<Rhs = Self> { fn shr_assign(&mut self, rhs: Rhs); }
     pub trait Index<Idx> { type Output; fn index(&self, index: Idx) -> &Self::Output; }
     pub trait IndexMut<Idx>: Index<Idx> { fn index_mut(&mut self, index: Idx) -> &mut Self::Output; }
-    pub trait Deref { type Target; fn deref(&self) -> &Self::Target; }
+    pub trait Deref { type Target: ?Sized; fn deref(&self) -> &Self::Target; }
     pub trait DerefMut: Deref { fn deref_mut(&mut self) -> &mut Self::Target; }
     pub trait Drop { fn drop(&mut self); }
 
@@ -2356,7 +2356,23 @@ pub mod thread {
 }
 
 pub mod any {
-    pub trait Any {}
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+    pub struct TypeId { name: &'static str }
+    impl TypeId {
+        pub fn of<T: ?Sized + 'static>() -> TypeId { TypeId { name: type_name::<T>() } }
+    }
+    pub trait Any { fn type_id(&self) -> TypeId; }
+    impl<T: ?Sized + 'static> Any for T {
+        fn type_id(&self) -> TypeId { TypeId::of::<T>() }
+    }
+    impl dyn Any {
+        pub fn is<T: Any>(&self) -> bool { self.downcast_ref::<T>().is_some() }
+        pub fn downcast_ref<T: Any>(&self) -> Option<&T>;
+        pub fn downcast_mut<T: Any>(&mut self) -> Option<&mut T>;
+    }
+    impl Box<dyn Any> {
+        pub fn downcast<T: Any>(self) -> Result<Box<T>, Box<dyn Any>>;
+    }
     pub fn type_name<T: ?Sized>() -> &'static str;
     pub fn type_name_of_val<T: ?Sized>(value: &T) -> &'static str { type_name::<T>() }
 }

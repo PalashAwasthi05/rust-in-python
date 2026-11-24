@@ -1,0 +1,19 @@
+0
+door front is closed (opened 0 times)
+front: opening
+door front is open (opened 1 times)
+front: closing
+front: opening
+front: closing
+door front is closed (opened 2 times)
+front: locking
+door front is locked (opened 2 times)
+front: wrong key 7
+front: unlocked
+door front is closed (opened 2 times)
+12.5 ft = 3.810 m
+4.810
+size of Length<Feet> = 8
+size of PhantomData<String> = 0
+disconnect from 10.0.0.1:80 after ["HELLO", "WORLD"]
+still has 2 messages
