@@ -1,0 +1,5 @@
+0
+part 1: 64
+part 2: 58
+min P3 { x: 1, y: 2, z: 2 } max P3 { x: 3, y: 2, z: 5 }
+bounds 0..=7, outside cells 498

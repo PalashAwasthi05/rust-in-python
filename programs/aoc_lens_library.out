@@ -1,0 +1,7 @@
+0
+HASH = 52
+part 1: 1320
+Box 0: [rn 1] [cm 2]
+Box 3: [ot 7] [ab 5] [pc 6]
+part 2: 145
+Insert("ab", 5)

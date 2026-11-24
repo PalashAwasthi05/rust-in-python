@@ -2501,3 +2501,68 @@ pub mod env {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
     }
 }
+
+pub mod ascii_u8 {
+    impl u8 {
+        pub fn is_ascii(&self) -> bool { *self < 128 }
+        pub fn is_ascii_digit(&self) -> bool { (*self as char).is_ascii_digit() }
+        pub fn is_ascii_hexdigit(&self) -> bool { (*self as char).is_ascii_hexdigit() }
+        pub fn is_ascii_alphabetic(&self) -> bool { (*self as char).is_ascii_alphabetic() }
+        pub fn is_ascii_alphanumeric(&self) -> bool { (*self as char).is_ascii_alphanumeric() }
+        pub fn is_ascii_uppercase(&self) -> bool { (*self as char).is_ascii_uppercase() }
+        pub fn is_ascii_lowercase(&self) -> bool { (*self as char).is_ascii_lowercase() }
+        pub fn is_ascii_punctuation(&self) -> bool { (*self as char).is_ascii_punctuation() }
+        pub fn is_ascii_whitespace(&self) -> bool { (*self as char).is_ascii_whitespace() }
+        pub fn is_ascii_graphic(&self) -> bool { (*self as char).is_ascii_graphic() }
+        pub fn is_ascii_control(&self) -> bool { (*self as char).is_ascii_control() }
+        pub fn to_ascii_uppercase(&self) -> u8 { (*self as char).to_ascii_uppercase() as u8 }
+        pub fn to_ascii_lowercase(&self) -> u8 { (*self as char).to_ascii_lowercase() as u8 }
+        pub fn make_ascii_uppercase(&mut self) { *self = self.to_ascii_uppercase(); }
+        pub fn make_ascii_lowercase(&mut self) { *self = self.to_ascii_lowercase(); }
+        pub fn eq_ignore_ascii_case(&self, other: &u8) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
+    }
+}
+
+pub mod collections_from_array {
+    use crate::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+    impl<T, const N: usize> From<[T; N]> for HashSet<T> {
+        fn from(items: [T; N]) -> HashSet<T> { items.into_iter().collect() }
+    }
+    impl<T, const N: usize> From<[T; N]> for BTreeSet<T> {
+        fn from(items: [T; N]) -> BTreeSet<T> { items.into_iter().collect() }
+    }
+    impl<K, V, const N: usize> From<[(K, V); N]> for HashMap<K, V> {
+        fn from(items: [(K, V); N]) -> HashMap<K, V> { items.into_iter().collect() }
+    }
+    impl<K, V, const N: usize> From<[(K, V); N]> for BTreeMap<K, V> {
+        fn from(items: [(K, V); N]) -> BTreeMap<K, V> { items.into_iter().collect() }
+    }
+    impl<T: Ord, const N: usize> From<[T; N]> for BinaryHeap<T> {
+        fn from(items: [T; N]) -> BinaryHeap<T> { BinaryHeap::from(Vec::from(items)) }
+    }
+}
+
+pub mod unsigned_signed_ops {
+    macro_rules! add_signed {
+        ($u:ident, $i:ident) => {
+            impl $u {
+                pub fn checked_add_signed(self, rhs: $i) -> Option<$u> {
+                    if rhs >= 0 { self.checked_add(rhs as $u) } else { self.checked_sub(rhs.unsigned_abs()) }
+                }
+                pub fn wrapping_add_signed(self, rhs: $i) -> $u { self.wrapping_add(rhs as $u) }
+                pub fn saturating_add_signed(self, rhs: $i) -> $u {
+                    if rhs >= 0 { self.saturating_add(rhs as $u) } else { self.saturating_sub(rhs.unsigned_abs()) }
+                }
+                pub fn checked_sub_signed(self, rhs: $i) -> Option<$u> {
+                    if rhs >= 0 { self.checked_sub(rhs as $u) } else { self.checked_add(rhs.unsigned_abs()) }
+                }
+            }
+        };
+    }
+    add_signed!(u8, i8);
+    add_signed!(u16, i16);
+    add_signed!(u32, i32);
+    add_signed!(u64, i64);
+    add_signed!(u128, i128);
+    add_signed!(usize, isize);
+}

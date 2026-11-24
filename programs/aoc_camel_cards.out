@@ -1,0 +1,21 @@
+0
+  HighCard [2, 3, 4, 5, 11] 77
+  OnePair [3, 2, 10, 3, 13] 765
+  TwoPair [13, 10, 11, 11, 10] 220
+  TwoPair [13, 13, 6, 7, 7] 28
+  TwoPair [14, 14, 13, 13, 12] 12
+  ThreeOfAKind [10, 5, 5, 11, 5] 684
+  ThreeOfAKind [12, 12, 12, 11, 14] 483
+  FiveOfAKind [11, 11, 11, 11, 11] 1
+part 1: 9932
+  OnePair [2, 3, 4, 5, 1] 77
+  OnePair [3, 2, 10, 3, 13] 765
+  TwoPair [13, 13, 6, 7, 7] 28
+  TwoPair [14, 14, 13, 13, 12] 12
+  FourOfAKind [10, 5, 5, 1, 5] 684
+  FourOfAKind [12, 12, 12, 1, 14] 483
+  FourOfAKind [13, 10, 1, 1, 10] 220
+  FiveOfAKind [1, 1, 1, 1, 1] 1
+part 2: 9605
+[FiveOfAKind, FullHouse, TwoPair, HighCard]
+true

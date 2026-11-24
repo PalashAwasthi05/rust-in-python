@@ -7874,6 +7874,13 @@ class Checker:
             actual = self.type_of(operand, scope, hint)
             if actual == NEVER:
                 return NEVER
+            # `-r` and `!r` on `&i32` / `&bool` use the std impls for references to primitives.
+            while isinstance(self.resolve(actual), ReferenceType) and self.numeric_like(self.resolve(actual).inner):
+                inner = self.resolve(actual).inner
+                operand = Expr("deref", operand.token, (operand, False))
+                self.program.expr_types[id(operand)] = inner
+                expr.args = (operand,) + tuple(args[1:])
+                actual = self.resolve(inner)
             if self.overloadable(actual):
                 trait, method = UNARY_TRAITS[token.text]
                 return self.operator_call(expr, scope, expected, trait, method, (operand,), actual)
@@ -11332,6 +11339,8 @@ class Interpreter:
         function = self.functions[name]
         if function.body is None:
             previous = self.type_arguments
+            # Intrinsics may run Rust code (closures, user iterators) that calls other intrinsics.
+            previous_intrinsic = (getattr(self, "intrinsic_types", None), getattr(self, "intrinsic_receiver", None))
             self.type_arguments = {p: self.program.normalize(substitute(t, previous))
                                    for p, t in (arguments or {}).items()}
             try:
@@ -11350,6 +11359,7 @@ class Interpreter:
                 return INTRINSICS[key](self, result, *values)
             finally:
                 self.type_arguments = previous
+                self.intrinsic_types, self.intrinsic_receiver = previous_intrinsic
         own = {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
@@ -13506,18 +13516,22 @@ def method_trailing_ones(interpreter, result, value):
     return ((bits ^ (bits + 1)).bit_length() - 1) if bits != (1 << width) - 1 else width
 
 
-@intrinsic
-def method_rotate_left(interpreter, result, value, amount):
+def integer_rotate_left(interpreter, result, value, amount):
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits << amount) | (bits >> (width - amount))) & ((1 << width) - 1), result)
 
 
-@intrinsic
-def method_rotate_right(interpreter, result, value, amount):
+def integer_rotate_right(interpreter, result, value, amount):
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits >> amount) | (bits << (width - amount))) & ((1 << width) - 1), result)
+
+
+# Integer and slice rotations share method names, so the integer bodies are keyed by type.
+for _kind in INTEGER_WIDTHS:
+    INTRINSICS[f"{_kind}.rotate_left"] = integer_rotate_left
+    INTRINSICS[f"{_kind}.rotate_right"] = integer_rotate_right
 
 
 @intrinsic

@@ -1,0 +1,6 @@
+0
+part 1: Some(102)
+part 2: Some(94)
+State { cost: 2, pos: (3, 3), heading: Horizontal }
+State { cost: 2, pos: (1, 0), heading: Vertical }
+State { cost: 5, pos: (0, 1), heading: Vertical }
