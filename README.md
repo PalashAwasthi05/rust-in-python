@@ -40,6 +40,8 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
+- Generic functions, structs, and enums with inferred and explicit type arguments
+- Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -118,8 +120,37 @@ fn main() {
 
 The returned reference keeps the argument borrowed until its last use. The program prints `4`.
 
+## Generalize something
+
+```rust
+use std::fmt::Debug;
+
+#[derive(Default)]
+enum Maybe<T> {
+    Present(T),
+    #[default]
+    Absent,
+}
+
+fn inspect<T: Debug>(item: Maybe<T>) {
+    match item {
+        Maybe::Present(value) => println!("Found {value:?}"),
+        Maybe::Absent => println!("Still looking"),
+    }
+}
+
+fn main() {
+    inspect(Maybe::Present(7));
+    inspect(Maybe::<bool>::default());
+}
+```
+
+The first call infers the type argument from `7`. The second specifies `bool` explicitly. The program prints `Found 7` and `Still looking`.
+
 ## Scope
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
-Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. The reference implementation still needs reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures. Generics, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are also incomplete.
+Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures remain incomplete.
+
+Generic bodies are checked against their declared trait bounds. Const generics, general reference types as type arguments, associated types, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are still open.

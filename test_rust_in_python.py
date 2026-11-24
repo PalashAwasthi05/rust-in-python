@@ -456,6 +456,133 @@ VALID = [
         }
         fn main() { choose(true); choose(false); }
     """, "2\n1\n"),
+    ("generic calls infer, explicitly name, and split type arguments", """
+        fn identity<T>(value: T) -> T { value }
+        fn second<A, B>(_: A, b: B) -> B { b }
+        fn main() {
+            println!("{} {} {}", identity(7), identity::<bool>(true), second::<bool, _>(false, 5));
+        }
+    """, "7 true 5\n"),
+    ("expected type flows through generic default calls", """
+        fn blank<T: Default>() -> T { T::default() }
+        fn nested<T: Default>() -> T { blank() }
+        fn identity<T>(x: T) -> T { x }
+        fn main() {
+            let answer: bool = identity(nested());
+            println!("{answer} {}", 3 + blank::<i32>());
+        }
+    """, "false 3\n"),
+    ("generic recursion preserves concrete default type", """
+        fn recurse<T: Default>(depth: i32) -> T {
+            if depth == 0 { T::default() } else { recurse(depth - 1) }
+        }
+        fn main() {
+            let value: bool = recurse(4);
+            println!("{value}");
+        }
+    """, "false\n"),
+    ("generic trait bounds make cloning and debug available", """
+        use std::fmt::Debug as Inspect;
+        #[derive(Clone, Debug)]
+        struct Data(i32);
+        fn duplicate<T>(value: &T) -> T where T: Clone + Inspect {
+            println!("{value:?}");
+            value.clone()
+        }
+        fn main() { let x = Data(5); println!("{:?}", duplicate(&x)); }
+    """, "Data(5)\nData(5)\n"),
+    ("Copy bound implies Clone and prevents a move", """
+        #[derive(Clone, Copy)]
+        struct Data<T>(T);
+        fn preserve<T: Copy>(x: T) -> T { let _copy = x; x.clone() }
+        fn main() { let original = Data(3); println!("{} {}", preserve(original).0, original.0); }
+    """, "3 3\n"),
+    ("generic comparison borrows both operands", """
+        #[derive(PartialEq)]
+        struct Data(i32);
+        fn select<T: PartialEq>(first: T, other: T) -> T {
+            let _equal = first == other;
+            first
+        }
+        fn main() { println!("{}", select(Data(1), Data(2)).0); }
+    """, "1\n"),
+    ("scalar comparison snapshots the left value", """
+        fn main() {
+            let mut n = 2;
+            let answer = n == { n = 3; n };
+            println!("{answer}");
+        }
+    """, "false\n"),
+    ("derived generic ordering follows declaration order", """
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Event<T> { Zebra(T), Ant }
+        fn before<T: Ord>(a: T, b: T) -> bool { a < b }
+        fn main() {
+            println!("{} {}", before(Event::Zebra(2), Event::Ant), before(Event::Ant, Event::Zebra(2)));
+        }
+    """, "true false\n"),
+    ("generic records and nested type placeholders", """
+        struct Wrap<T> { value: T }
+        fn main() {
+            let wrapped: Wrap<Wrap<_>>=Wrap { value: Wrap::<i32> { value: 9 } };
+            let Wrap { value: Wrap { value: n } } = wrapped;
+            println!("{n}");
+        }
+    """, "9\n"),
+    ("generic enum constructor inference uses return contexts", """
+        #[derive(Debug)]
+        enum Maybe<T> { Absent, Present(T) }
+        fn make<T>(value: T, present: bool) -> Maybe<T> {
+            if present { Maybe::Present(value) } else { Maybe::Absent }
+        }
+        fn main() {
+            let none = Maybe::<i32>::Absent;
+            let some = make(7, true);
+            println!("{none:?} {some:?}");
+            let Maybe::Present(n) = some else { return; };
+            println!("{n}");
+        }
+    """, "Absent Present(7)\n7\n"),
+    ("variant type argument inferred from later branch", """
+        #[derive(Debug)]
+        enum Maybe<T> { Absent, Present(T) }
+        fn main() {
+            let absent = Maybe::Absent;
+            let result = if false { absent } else { Maybe::Present(2) };
+            println!("{result:?}");
+        }
+    """, "Present(2)\n"),
+    ("generic fields borrow and return input lifetimes", """
+        struct Wrapper<T>(T);
+        fn value<'a, T>(input: &'a mut Wrapper<T>) -> &'a mut T { &mut input.0 }
+        fn main() {
+            let mut owner = Wrapper(2);
+            *value(&mut owner) += 3;
+            println!("{}", owner.0);
+        }
+    """, "5\n"),
+    ("generic static references", """
+        fn keep<T>(value: &'static T) -> &'static T { value }
+        fn main() { let result = keep(&3); println!("{result}"); }
+    """, "3\n"),
+    ("generic enum Default does not require an unused field to implement Default", """
+        struct Item(i32);
+        #[derive(Default)]
+        enum Maybe<T> { Present(T), #[default] Absent }
+        fn main() {
+            let data: Maybe<Item> = Default::default();
+            match data { Maybe::Present(x) => println!("{}", x.0), Maybe::Absent => println!("absent") }
+        }
+    """, "absent\n"),
+    ("generic record default specializes nested fields", """
+        #[derive(Default, Debug)]
+        struct Wrapped<T>(T);
+        fn blank<T: Default>() -> Wrapped<T> { Wrapped::default() }
+        fn main() {
+            let result = blank::<Wrapped<bool>>();
+            println!("{result:?}");
+        }
+    """, "Wrapped(Wrapped(false))\n"),
 ]
 
 INVALID = [
@@ -711,6 +838,62 @@ INVALID = [
             let _: &'static i32 = borrowed;
         }
     """, "does not live for 'static"),
+    ("abstract generic body cannot assume Copy", """
+        fn reuse<T>(value: T) -> T { let _taken = value; value }
+        fn main() {}
+    """, "use of moved value"),
+    ("abstract generic body cannot assume Clone", """
+        fn duplicate<T>(value: T) -> T { value.clone() }
+        fn main() {}
+    """, "T does not implement Clone"),
+    ("generic obligations apply to inferred concrete type arguments", """
+        struct Item(i32);
+        #[derive(Clone, Copy)]
+        struct Wrapper<T>(T);
+        fn keep<T: Copy>(value: T) -> T { value }
+        fn main() { let _result = keep(Wrapper(Item(1))); }
+    """, "Wrapper<Item> does not implement Copy"),
+    ("generic constraints apply to named type uses", """
+        struct Wrapper<T: Copy>(T);
+        fn wrap<T>(value: T) -> Wrapper<T> { Wrapper(value) }
+        fn main() {}
+    """, "T does not implement Copy"),
+    ("generic type mismatch across arguments", """
+        fn choose<T>(first: T, _: T) -> T { first }
+        fn main() { let _result = choose(1, false); }
+    """, "expected i32, found bool"),
+    ("generic default without context needs an annotation", """
+        fn blank<T: Default>() -> T { T::default() }
+        fn main() { println!("{}", blank()); }
+    """, "type annotations needed for T"),
+    ("overloaded arithmetic alone cannot infer a generic operand", """
+        fn blank<T: Default>() -> T { T::default() }
+        fn main() { let _answer: i32 = 3 + blank(); }
+    """, "type annotations needed for T"),
+    ("missing enum type argument needs an annotation", """
+        enum Maybe<T> { Absent, Present(T) }
+        fn main() { let _value = Maybe::Absent; }
+    """, "type annotations needed for T"),
+    ("generic enum exhaustiveness specializes payload type", """
+        enum Maybe<T> { Absent, Present(T) }
+        fn describe(value: Maybe<bool>) -> i32 {
+            match value { Maybe::Absent => 0, Maybe::Present(true) => 1 }
+        }
+        fn main() {}
+    """, "Maybe::Present\\(false\\)"),
+    ("recursive generic layout is diagnosed", """
+        struct Wrapper<T>(T);
+        struct Recursive<T>(Wrapper<Recursive<Wrapper<T>>>);
+        fn main() {}
+    """, "infinite size"),
+    ("comparison by trait cannot overwrite a borrowed operand", """
+        #[derive(PartialEq)]
+        struct Item(i32);
+        fn main() {
+            let mut value = Item(1);
+            let _answer = value == { value = Item(2); Item(3) };
+        }
+    """, "immutably borrowed"),
 ]
 
 
