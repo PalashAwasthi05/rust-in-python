@@ -1,0 +1,36 @@
+0
+[18, 52, 86, 120]
+[120, 86, 52, 18]
+[120, 86, 52, 18]
+[255, 254]
+[1, 0, 0, 0, 0, 0, 0, 0]
+305419896
+2018915346
+-2
+256
+cafebabe
+[232, 3, 255, 255, 255, 255]
+1000
+Ok(-255)
+Ok(255)
+true
+Ok(1295)
+Ok(511)
+Ok(42)
+true
+Ok(7)
+Err("number too large to fit in target type")
+Err("number too small to fit in target type")
+Err("cannot parse integer from empty string")
+Err("invalid digit found in string")
+true
+Ok(3.25)
+Ok(1000.0)
+Ok(inf)
+Ok(-0.0)
+Err("invalid float literal")
+Ok(0.1)
+Ok(340282366920938463463374607431768211455)
+18446744073709551615
+6699
+1a2b

@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field, fields as dataclass_fields
 from dataclasses import replace as dataclass_replace
 from decimal import Decimal
+from fractions import Fraction
 import functools
 import itertools
 import json
@@ -1008,6 +1009,33 @@ impl {T} {
     pub fn from_le_bytes(bytes: [u8; {N}]) -> {T};
     pub fn from_ne_bytes(bytes: [u8; {N}]) -> {T} { {T}::from_le_bytes(bytes) }
     pub fn from_str_radix(src: &str, radix: u32) -> Result<{T}, crate::num::ParseIntError>;
+    pub fn overflowing_div(self, rhs: {T}) -> ({T}, bool);
+    pub fn overflowing_rem(self, rhs: {T}) -> ({T}, bool);
+    pub fn overflowing_neg(self) -> ({T}, bool);
+    pub fn overflowing_abs(self) -> ({T}, bool);
+    pub fn overflowing_pow(self, exp: u32) -> ({T}, bool);
+    pub fn overflowing_shl(self, rhs: u32) -> ({T}, bool);
+    pub fn overflowing_shr(self, rhs: u32) -> ({T}, bool);
+    pub fn saturating_div(self, rhs: {T}) -> {T};
+    pub fn saturating_neg(self) -> {T};
+    pub fn saturating_abs(self) -> {T};
+    pub fn checked_rem_euclid(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_div_euclid(self, rhs: {T}) -> Option<{T}>;
+    pub fn wrapping_rem_euclid(self, rhs: {T}) -> {T};
+    pub fn wrapping_div_euclid(self, rhs: {T}) -> {T};
+    pub fn checked_next_power_of_two(self) -> Option<{T}>;
+    pub fn checked_ilog2(self) -> Option<u32>;
+    pub fn checked_ilog10(self) -> Option<u32>;
+    pub fn checked_ilog(self, base: {T}) -> Option<u32>;
+    pub fn checked_isqrt(self) -> Option<{T}>;
+    pub fn div_ceil(self, rhs: {T}) -> {T};
+    pub fn next_multiple_of(self, rhs: {T}) -> {T};
+    pub fn checked_add_signed(self, rhs: {S}) -> Option<{T}>;
+    pub fn wrapping_add_signed(self, rhs: {S}) -> {T};
+    pub fn saturating_add_signed(self, rhs: {S}) -> {T};
+    pub fn checked_sub_unsigned(self, rhs: {U}) -> Option<{T}>;
+    pub fn checked_add_unsigned(self, rhs: {U}) -> Option<{T}>;
+    pub fn is_multiple_of(self, rhs: {T}) -> bool;
 }
 impl crate::str::FromStr for {T} {
     type Err = crate::num::ParseIntError;
@@ -1069,7 +1097,8 @@ impl crate::str::FromStr for {T} {
     fn from_str(s: &str) -> Result<{T}, crate::num::ParseFloatError> { crate::intrinsics::parse_float(s) }
 }
 """
-SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
+SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n    pub use crate::num_nonzero::NonZero;\n" + "".join(
+    f"    pub type NonZero{kind.capitalize()} = NonZero<{kind}>;\n" for kind in sorted(INTEGER_TYPES)) + """
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct ParseIntError { kind: IntErrorKind }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1134,8 +1163,9 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         type Err = crate::convert::Infallible;
         fn from_str(s: &str) -> Result<String, crate::convert::Infallible> { Ok(s.to_string()) }
     }
-""" + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:])
-              .replace("{N}", str(INTEGER_WIDTHS[kind] // 8)) for kind in sorted(INTEGER_TYPES)) + "".join(
+""" + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:]).replace("{S}", "i" + kind[1:])
+              .replace("{N}", str(INTEGER_WIDTHS[kind] // 8))
+              for kind in sorted(INTEGER_TYPES)) + "".join(
     FLOAT_METHODS.replace("{T}", kind).replace("{B}", "u" + kind[1:]) for kind in sorted(FLOAT_TYPES)) + "}\n"
 def integer_conversions():
     """From impls for lossless integer conversions and TryFrom for the rest, as Rust's std provides."""
@@ -4841,11 +4871,17 @@ class Parser:
             return self.closure(token, self.advance().text if word == "move" else word)
         if word == "<":
             owner = self.type_name()
-            # `<T>::member` names an inherent or trait member of T without naming the trait.
-            trait = self.trait_path() if self.accept("as") else None
-            self.expect(">")
+            if self.accept(">"):
+                trait = None
+            else:
+                self.expect("as")
+                trait = self.trait_path()
+                self.expect(">")
             self.expect("::")
             member = self.identifier()
+            if trait is None and isinstance(owner, str) and f"{owner}::{member.text}" in SCALAR_CONSTANTS:
+                path = replace(member, text=f"{owner}::{member.text}")
+                return Expr("literal", path, SCALAR_CONSTANTS[path.text])
             if self.current.text == "(":
                 return Expr("call", member, self.arguments(), qualified=(owner, trait))
             return Expr("name", member, qualified=(owner, trait))
@@ -6384,7 +6420,7 @@ FORMAT_SPECIFICATION = re.compile(
     r"(?:(?P<fill>[^{}])(?P<filled_alignment>[<^>])|(?P<alignment>[<^>]))?"
     r"(?P<sign>[+-])?(?P<alternate>#)?(?P<zero>0(?!\$))?"
     r"(?P<width>[^\s$.:]+\$|[0-9]+)?"
-    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<kind>[?boxXeE])?"
+    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<hex>[xX](?=\?$))?(?P<kind>[?boxXeE])?"
 )
 
 
@@ -6403,6 +6439,7 @@ class FormatSpec:
     zero: bool
     width: int | FormatCount
     precision: int | FormatCount | None
+    hex: str = ""
 
 
 @dataclass(frozen=True)
@@ -6428,7 +6465,8 @@ def parse_format_field(text, token):
     except ValueError:
         raise token.error("format argument is out of range") from None
     spec = FormatSpec(fields["kind"] or "", fields["fill"] or " ", fields["filled_alignment"] or fields["alignment"],
-                      fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision)
+                      fields["sign"], bool(fields["alternate"]), bool(fields["zero"]), width, precision,
+                      fields["hex"] or "")
     return FormatField(argument, spec)
 
 
@@ -8758,6 +8796,12 @@ class Checker:
             hint = self.resolve(expected)
             if token.text in SHIFTS:
                 left, right = args
+                if not self.unsuffixed_number(left):
+                    left_type = self.type_of(left, scope)
+                    if self.overloadable(left_type):
+                        trait, method = OPERATOR_TRAITS[token.text]
+                        return self.operator_call(expr, scope, expected, trait, method, args, left_type)
+                    self.pretyped[id(left)] = left_type
                 left_hint = hint if hint in INTEGER_TYPES and self.unsuffixed_number(left) else None
                 operands = [left, right]
                 types = [self.type_of(left, scope, left_hint), self.type_of(right, scope)]
@@ -11550,6 +11594,14 @@ def truncate_integer(value, annotation):
 
 
 def rounded_float(value, annotation):
+    if annotation != "f64" and isinstance(value, int) and not isinstance(value, bool) and abs(value) >= 1 << 24:
+        # Round an integer straight to binary32: going through binary64 first can round twice.
+        shift = abs(value).bit_length() - 24
+        mantissa, rest = divmod(abs(value), 1 << shift)
+        half = 1 << (shift - 1)
+        if rest > half or rest == half and mantissa & 1:
+            mantissa += 1
+        value = math.copysign(float(mantissa << shift), value)
     value = float(value)
     if annotation == "f64":
         return value
@@ -11673,6 +11725,8 @@ def format_exponent(value, kind, precision):
     if isinstance(value, float) and not math.isfinite(value):
         return format_float(value, False)
     decimal = decimal_float(value) if isinstance(value, float) else Decimal(value)
+    if decimal.is_zero():
+        decimal = Decimal(0).copy_sign(decimal)
     if precision is None:
         text = format(decimal, "e")
     elif isinstance(value, float):
@@ -11731,6 +11785,7 @@ def pretty_debug(value, indent=0):
 
 
 def format_value(value, annotation, spec):
+    global DEBUG_SPEC
     while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         value = value.read()
     if USER_FORMAT is not None and isinstance(value, Value) and spec.kind in {"", "?"}:
@@ -11739,6 +11794,8 @@ def format_value(value, annotation, spec):
         if text is not None:
             return text
     kind = spec.kind
+    if kind == "?" and isinstance(value, str):
+        return display(value, True)
     if (kind == "?" and isinstance(value, ArrayValue) and not spec.alternate
             and (spec.width or spec.precision is not None or spec.sign or spec.zero)):
         # Debug for slices hands the formatter to each element, so width and precision apply per element.
@@ -11762,6 +11819,17 @@ def format_value(value, annotation, spec):
         text = format_exponent(value, kind, spec.precision)
     elif isinstance(value, float) and spec.precision is not None and math.isfinite(value):
         text = format(value, f".{spec.precision}f")
+    elif kind == "?" and spec.hex and isinstance(value, int) and not isinstance(value, bool):
+        return format_value(value, annotation, dataclass_replace(spec, kind=spec.hex, hex=""))
+    elif kind == "?" and not numeric and DEBUG_SPEC is None and (
+            spec.width or spec.precision is not None or spec.hex or spec.sign or spec.zero) and not isinstance(
+            value, (str, bool, int, float)):
+        # Debug options reach every scalar inside a collection or tuple, as `{:5.2?}` and `{:02x?}` do in Rust.
+        DEBUG_SPEC = spec
+        try:
+            return pretty_debug(value) if spec.alternate else display(value, True)
+        finally:
+            DEBUG_SPEC = None
     elif kind == "?" and spec.alternate:
         text = pretty_debug(value)
     else:
@@ -11788,16 +11856,27 @@ def text_of_plain(value):
 
 
 USER_FORMAT = None
+DEBUG_SPEC = None
 MAP_ORDER = None
 MAP_MEMBER = object()
 FORMATTER = MODULE_SEPARATOR.join(("std", "fmt", "Formatter"))
 
 
 def display(value, debug):
+    global DEBUG_SPEC
     if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         return display(value.read(), debug)
     if isinstance(value, WeakValue):
         return "(Weak)"
+    if debug and DEBUG_SPEC is not None and isinstance(value, (int, float)):
+        # str and char Debug ignore width and precision; numbers and bools honour them.
+        spec, DEBUG_SPEC = DEBUG_SPEC, None
+        try:
+            annotation = (None if isinstance(value, bool) else "f64" if isinstance(value, float)
+                          else "i128" if value < 0 else "u128")
+            return format_value(value, annotation, spec)
+        finally:
+            DEBUG_SPEC = spec
     if USER_FORMAT is not None and isinstance(value, Value):
         text = USER_FORMAT(value, debug)
         if text is not None:
@@ -14901,6 +14980,154 @@ for _name, _operation in {
     ))(_operation)
 
 
+def rust_div_euclid(left, right):
+    if right == 0:
+        raise ZeroDivisionError
+    return (left - left % abs(right)) // right
+
+
+def rust_rem_euclid(left, right):
+    if right == 0:
+        raise ZeroDivisionError
+    return left % abs(right)
+
+
+for _name, _operation in {"div_euclid": rust_div_euclid, "rem_euclid": rust_rem_euclid}.items():
+    INTRINSICS[f".checked_{_name}"] = checked_operation(_operation)
+    INTRINSICS[f".wrapping_{_name}"] = (lambda operation: lambda interpreter, result, left, right=None:
+                                        wrap(operation(left, right), result))(_operation)
+for _name in ("div", "rem", "div_euclid", "rem_euclid"):
+    INTRINSICS[f".wrapping_{_name}"] = (lambda body, name: lambda interpreter, result, left, right=None:
+                                        zero_divisor_panic(body, name, interpreter, result, left, right))(
+        INTRINSICS[f".wrapping_{_name}"], _name)
+for _name in ("div", "rem"):
+    INTRINSICS[f".overflowing_{_name}"] = (lambda body, name: lambda interpreter, result, left, right=None:
+                                           zero_divisor_panic(body, name, interpreter, result, left, right))(
+        INTRINSICS[f".overflowing_{_name}"], _name)
+    INTRINSICS[f".saturating_{_name}"] = (lambda body, name: lambda interpreter, result, left, right=None:
+                                          zero_divisor_panic(body, name, interpreter, result, left, right))(
+        INTRINSICS[f".saturating_{_name}"], _name)
+
+
+def remainder_operations(remainder, quotient):
+    """checked_ and overflowing_ remainders overflow exactly when the matching quotient does (MIN % -1)."""
+    def checked(interpreter, result, left, right):
+        if right == 0:
+            return option(interpreter, result)
+        low, high = INTEGER_BOUNDS[element_type(result)]
+        if not low <= quotient(left, right) < high:
+            return option(interpreter, result)
+        return option(interpreter, result, remainder(left, right))
+
+    def overflowing(interpreter, result, left, right):
+        if right == 0:
+            raise RustPanic("attempt to calculate the remainder with a divisor of zero")
+        low, high = INTEGER_BOUNDS[result.elements[0]]
+        return make_tuple(interpreter, result, remainder(left, right), not low <= quotient(left, right) < high)
+    return checked, overflowing
+
+
+INTRINSICS[".checked_rem"], INTRINSICS[".overflowing_rem"] = remainder_operations(rust_rem, rust_div)
+INTRINSICS[".checked_rem_euclid"], INTRINSICS[".overflowing_rem_euclid"] = remainder_operations(
+    rust_rem_euclid, rust_div_euclid)
+
+
+def zero_divisor_panic(body, name, interpreter, result, left, right):
+    try:
+        return body(interpreter, result, left, right)
+    except ZeroDivisionError:
+        raise RustPanic("attempt to calculate the remainder with a divisor of zero" if name.startswith("rem")
+                        else "attempt to divide by zero") from None
+
+
+@intrinsic
+def method_overflowing_shl(interpreter, result, value, amount):
+    kind = result.elements[0]
+    width = INTEGER_WIDTHS[kind]
+    return make_tuple(interpreter, result, wrap(value << (amount % width), kind), amount >= width)
+
+
+@intrinsic
+def method_overflowing_shr(interpreter, result, value, amount):
+    width = INTEGER_WIDTHS[result.elements[0]]
+    return make_tuple(interpreter, result, value >> (amount % width), amount >= width)
+
+
+@intrinsic
+def method_checked_next_power_of_two(interpreter, result, value):
+    power = 1 if value <= 1 else 1 << (value - 1).bit_length()
+    return option(interpreter, result, power) if power < INTEGER_BOUNDS[element_type(result)][1] \
+        else option(interpreter, result)
+
+
+@intrinsic
+def method_checked_ilog2(interpreter, result, value):
+    return option(interpreter, result, value.bit_length() - 1) if value > 0 else option(interpreter, result)
+
+
+@intrinsic
+def method_checked_ilog10(interpreter, result, value):
+    return option(interpreter, result, len(str(value)) - 1) if value > 0 else option(interpreter, result)
+
+
+@intrinsic
+def method_checked_ilog(interpreter, result, value, base):
+    if value <= 0 or base < 2:
+        return option(interpreter, result)
+    count = 0
+    while value >= base:
+        value //= base
+        count += 1
+    return option(interpreter, result, count)
+
+
+@intrinsic
+def method_checked_isqrt(interpreter, result, value):
+    return option(interpreter, result, math.isqrt(value)) if value >= 0 else option(interpreter, result)
+
+
+@intrinsic
+def method_div_ceil(interpreter, result, left, right):
+    if right == 0:
+        raise RustPanic("attempt to divide by zero")
+    quotient = rust_div(left, right)
+    if left - quotient * right != 0 and (left > 0) == (right > 0):
+        quotient += 1
+    return integer_result(quotient, result, "divide")
+
+
+@intrinsic
+def method_next_multiple_of(interpreter, result, left, right):
+    if right == 0:
+        raise RustPanic("attempt to calculate the remainder with a divisor of zero")
+    remainder = left % right
+    return integer_result(left if remainder == 0 else left + (right - remainder), result, "add")
+
+
+@intrinsic
+def method_is_multiple_of(interpreter, result, left, right):
+    return left == 0 if right == 0 else left % right == 0
+
+
+for _name, _function in {"checked_add_signed": checked_operation(lambda a, b: a + b),
+                         "checked_add_unsigned": checked_operation(lambda a, b: a + b),
+                         "checked_sub_unsigned": checked_operation(lambda a, b: a - b)}.items():
+    INTRINSICS["." + _name] = _function
+INTRINSICS[".wrapping_add_signed"] = lambda interpreter, result, left, right: wrap(left + right, result)
+INTRINSICS[".saturating_add_signed"] = lambda interpreter, result, left, right: min(
+    max(left + right, INTEGER_BOUNDS[result][0]), INTEGER_BOUNDS[result][1] - 1)
+
+
+@intrinsic
+def method_from_be_bytes(interpreter, result, data):
+    return wrap(int.from_bytes(bytes(items_of(data)), "big"), result)
+
+
+@intrinsic
+def method_from_le_bytes(interpreter, result, data):
+    return wrap(int.from_bytes(bytes(items_of(data)), "little"), result)
+
+
 @intrinsic
 def method_checked_shl(interpreter, result, value, amount):
     kind = element_type(result)
@@ -15199,6 +15426,19 @@ def safe(function):
     return body
 
 
+def fused_multiply_add(x, a, b):
+    """x * a + b rounded once, as the hardware fma instruction behind Rust's mul_add does."""
+    if hasattr(math, "fma"):
+        return math.fma(x, a, b)
+    if not all(map(math.isfinite, (x, a, b))):
+        return x * a + b
+    exact = Fraction(x) * Fraction(a) + Fraction(b)
+    try:
+        return float(exact) if exact else x * a + b
+    except OverflowError:
+        return math.copysign(math.inf, exact)
+
+
 def float_extreme(pick):
     def body(left, right):
         if math.isnan(left):
@@ -15229,7 +15469,7 @@ for _name, _function in {
     "hypot": math.hypot, "to_degrees": math.degrees, "to_radians": math.radians,
     "max": float_extreme(max), "min": float_extreme(min),
     "clamp": lambda x, low, high: min(max(x, low), high) if not math.isnan(x) else x,
-    "mul_add": lambda x, a, b: x * a + b, "recip": lambda x: 1 / x if x else math.copysign(math.inf, x),
+    "mul_add": lambda x, a, b: fused_multiply_add(x, a, b), "recip": lambda x: 1 / x if x else math.copysign(math.inf, x),
     "copysign": math.copysign, "abs_sub": lambda x, y: max(x - y, 0.0),
     "is_sign_positive": lambda x: math.copysign(1, x) > 0, "is_sign_negative": lambda x: math.copysign(1, x) < 0,
     "is_normal": lambda x: math.isfinite(x) and x != 0 and abs(x) >= 2.2250738585072014e-308,
@@ -16032,8 +16272,19 @@ def rust_range_length(interpreter, result, bounds):
 
 @intrinsic
 def rust_wrapping_op(interpreter, result, left, right, operator):
-    value = (left + right, left - right, left * right)[operator]
+    if operator in (3, 4) and right == 0:
+        raise RustPanic("attempt to divide by zero" if operator == 3
+                        else "attempt to calculate the remainder with a divisor of zero")
+    value = (lambda: left + right, lambda: left - right, lambda: left * right, lambda: rust_div(left, right),
+             lambda: rust_rem(left, right), lambda: -left, lambda: left & right, lambda: left | right,
+             lambda: left ^ right, lambda: ~left)[operator]()
     return wrap(value, result)
+
+
+@intrinsic
+def rust_wrapping_shift(interpreter, result, value, amount, left):
+    amount %= INTEGER_WIDTHS[result]
+    return wrap(value << amount, result) if left else value >> amount
 
 
 @intrinsic
