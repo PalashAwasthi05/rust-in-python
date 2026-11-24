@@ -1,0 +1,14 @@
+0
+hello -> olleh
+日本語 -> 語本日
+🦀ab -> ba🦀
+noël -> lëon
+"A man, a plan, a canal: Panama" palindrome=true
+"été" palindrome=true
+"Ésope reste ici et se repose" palindrome=false
+"abc" palindrome=false
+Khoor, Zöuog! abc
+Hello, Wörld! xyz
+3a1b2c4d1é2🦀
+aaabccddddé🦀🦀
+xxxxxxxxxxxx

@@ -1,0 +1,28 @@
+0
+["ünï,", " cödé;  wörld\r\nnext→line"]
+["b", "a"]
+"c"
+Some("clair")
+true Some(7)
+"ünï, X;  wörld\r\nnext→line"
+["ünï,", "cödé;", " wörld\r\nnext→line"]
+["next→line", "wörld", "cödé;", "ünï,"]
+Some(5)
+false true Greater
+Some('→') Some('c')
+Ok('é')
+err too many characters in string
+err cannot parse char from empty string
+[28, 4]
+[17, 9]
+α·β·γ 10
+日本
+["ünï", "wörld", "next", "line", "cödé"]
+     é|日本    |  🦀   |
+6
+"é"
+true
+15
+"SS"
+→txe
+a-bb-ccc

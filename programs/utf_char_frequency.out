@@ -1,0 +1,13 @@
+0
+G:1 a:4 b:1 c:1 e:3 i:2 m:1 n:1 r:3 s:1 t:1 v:2 Ç:2 ß:1 è:1 ö:1 日:2 本:2 🦀:3 
+[('a', 4), ('e', 3), ('r', 3), ('🦀', 3)]
+1 byte(s): a v?trsb
+2 byte(s): Çèöß
+3 byte(s): 日本
+4 byte(s): 🦀
+vowels 10
+true
+false
+true
+9 words, longest "Größe"
+ÇvÇvtbmG日

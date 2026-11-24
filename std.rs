@@ -764,6 +764,10 @@ pub mod slice {
         pub fn join<S: crate::intrinsics::Separator>(&self, separator: S) -> <T as crate::intrinsics::Join>::Output where T: crate::intrinsics::Join;
         pub fn max_len(&self) -> usize { self.len() }
     }
+
+    impl<T> [T] {
+        pub fn to_owned(&self) -> Vec<T> where T: Clone { self.to_vec() }
+    }
 }
 
 pub mod vec {
@@ -1439,13 +1443,17 @@ pub mod str {
     impl<F: FnMut(char) -> bool> Pattern for F {}
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Utf8Error { valid_up_to: usize }
+    pub struct Utf8Error { valid_up_to: usize, error_len: Option<u8> }
     impl Utf8Error {
         pub fn valid_up_to(&self) -> usize { self.valid_up_to }
+        pub fn error_len(&self) -> Option<usize> { self.error_len.map(|n| n as usize) }
     }
     impl crate::fmt::Display for Utf8Error {
         fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
-            write!(f, "invalid utf-8 sequence of 1 bytes from index {}", self.valid_up_to)
+            match self.error_len {
+                Some(n) => write!(f, "invalid utf-8 sequence of {} bytes from index {}", n, self.valid_up_to),
+                None => write!(f, "incomplete utf-8 byte sequence from index {}", self.valid_up_to),
+            }
         }
     }
     pub fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error>;
@@ -1487,6 +1495,7 @@ pub mod str {
         pub fn matches<P: Pattern>(&self, pat: P) -> Lazy<&str>;
         pub fn rmatches<P: Pattern>(&self, pat: P) -> Lazy<&str>;
         pub fn match_indices<P: Pattern>(&self, pat: P) -> Lazy<(usize, &str)>;
+        pub fn rmatch_indices<P: Pattern>(&self, pat: P) -> Lazy<(usize, &str)>;
         pub fn replace<P: Pattern>(&self, from: P, to: &str) -> String;
         pub fn replacen<P: Pattern>(&self, from: P, to: &str, count: usize) -> String;
         pub fn to_uppercase(&self) -> String;
@@ -1502,6 +1511,9 @@ pub mod str {
         pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> { F::from_str(self) }
         pub fn escape_default(&self) -> String;
         pub fn escape_debug(&self) -> String;
+        pub fn escape_unicode(&self) -> String;
+        pub fn encode_utf16(&self) -> Lazy<u16>;
+        pub fn rsplit_terminator<P: Pattern>(&self, pat: P) -> Lazy<&str>;
     }
 }
 
@@ -1509,12 +1521,14 @@ pub mod string {
     use crate::iter::Lazy;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct FromUtf8Error { bytes: Vec<u8> }
+    pub struct FromUtf8Error { bytes: Vec<u8>, error: crate::str::Utf8Error }
     impl FromUtf8Error {
         pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+        pub fn as_bytes(&self) -> &[u8] { &self.bytes }
+        pub fn utf8_error(&self) -> crate::str::Utf8Error { self.error }
     }
     impl crate::fmt::Display for FromUtf8Error {
-        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid utf-8 sequence") }
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { crate::fmt::Display::fmt(&self.error, f) }
     }
 
     pub trait ToString {
@@ -1541,6 +1555,25 @@ pub mod string {
         pub fn from_utf8_lossy(v: &[u8]) -> String;
         pub fn replace_range<R: crate::ops::RangeBounds>(&mut self, range: R, replace_with: &str);
         pub fn into_boxed_str(self) -> String { self }
+    }
+
+    #[derive(Debug)]
+    pub struct FromUtf16Error(());
+    impl crate::fmt::Display for FromUtf16Error {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid utf-16: lone surrogate found") }
+    }
+    impl String {
+        pub fn from_utf16(v: &[u16]) -> Result<String, FromUtf16Error> {
+            match String::utf16_decode(v, false) { Some(s) => Ok(s), None => Err(FromUtf16Error(())) }
+        }
+        pub fn from_utf16_lossy(v: &[u16]) -> String { String::utf16_decode(v, true).unwrap() }
+        fn utf16_decode(v: &[u16], lossy: bool) -> Option<String>;
+        pub fn into_owned(self) -> String { self }
+        pub fn from_iter<I: IntoIterator>(iter: I) -> String {
+            let mut text = String::new();
+            text.extend(iter);
+            text
+        }
     }
 }
 
@@ -1576,6 +1609,75 @@ pub mod char {
         pub fn len_utf8(self) -> usize;
         pub fn from_u32(i: u32) -> Option<char>;
         pub fn from_digit(num: u32, radix: u32) -> Option<char>;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CharTryFromError(pub(crate) ());
+    impl crate::fmt::Display for CharTryFromError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "converted integer out of range for `char`") }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TryFromCharError(pub(crate) ());
+    impl crate::fmt::Display for TryFromCharError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "unicode code point out of range") }
+    }
+    impl crate::convert::TryFrom<char> for u8 {
+        type Error = TryFromCharError;
+        fn try_from(c: char) -> Result<u8, TryFromCharError> {
+            if (c as u32) < 0x100 { Ok(c as u8) } else { Err(TryFromCharError(())) }
+        }
+    }
+    impl crate::convert::TryFrom<char> for u16 {
+        type Error = TryFromCharError;
+        fn try_from(c: char) -> Result<u16, TryFromCharError> {
+            if (c as u32) < 0x10000 { Ok(c as u16) } else { Err(TryFromCharError(())) }
+        }
+    }
+
+    pub const MAX: char = '\u{10FFFF}';
+    pub const REPLACEMENT_CHARACTER: char = '\u{FFFD}';
+    pub fn from_u32(i: u32) -> Option<char> { char::from_u32(i) }
+    pub fn from_digit(num: u32, radix: u32) -> Option<char> { char::from_digit(num, radix) }
+    impl char {
+        pub const MAX: char = '\u{10FFFF}';
+        pub const MIN: char = '\0';
+        pub const REPLACEMENT_CHARACTER: char = '\u{FFFD}';
+        pub fn len_utf16(self) -> usize { if (self as u32) < 0x10000 { 1 } else { 2 } }
+        pub fn is_ascii_octdigit(&self) -> bool { *self >= '0' && *self <= '7' }
+        pub fn escape_default(self) -> String;
+        pub fn escape_debug(self) -> String;
+        pub fn escape_unicode(self) -> String;
+        pub fn encode_utf8(self, dst: &mut [u8]) -> &mut str;
+    }
+
+    impl u8 {
+        pub fn is_ascii(&self) -> bool { *self < 128 }
+        pub fn is_ascii_digit(&self) -> bool { *self >= b'0' && *self <= b'9' }
+        pub fn is_ascii_hexdigit(&self) -> bool { (*self as char).is_ascii_hexdigit() }
+        pub fn is_ascii_alphabetic(&self) -> bool { self.is_ascii_uppercase() || self.is_ascii_lowercase() }
+        pub fn is_ascii_alphanumeric(&self) -> bool { self.is_ascii_alphabetic() || self.is_ascii_digit() }
+        pub fn is_ascii_uppercase(&self) -> bool { *self >= b'A' && *self <= b'Z' }
+        pub fn is_ascii_lowercase(&self) -> bool { *self >= b'a' && *self <= b'z' }
+        pub fn is_ascii_punctuation(&self) -> bool { (*self as char).is_ascii_punctuation() }
+        pub fn is_ascii_whitespace(&self) -> bool { (*self as char).is_ascii_whitespace() }
+        pub fn is_ascii_graphic(&self) -> bool { *self >= b'!' && *self <= b'~' }
+        pub fn is_ascii_control(&self) -> bool { *self < 32 || *self == 127 }
+        pub fn to_ascii_uppercase(&self) -> u8 { if self.is_ascii_lowercase() { *self - 32 } else { *self } }
+        pub fn to_ascii_lowercase(&self) -> u8 { if self.is_ascii_uppercase() { *self + 32 } else { *self } }
+        pub fn make_ascii_uppercase(&mut self) { *self = self.to_ascii_uppercase(); }
+        pub fn make_ascii_lowercase(&mut self) { *self = self.to_ascii_lowercase(); }
+        pub fn eq_ignore_ascii_case(&self, other: &u8) -> bool { self.to_ascii_lowercase() == other.to_ascii_lowercase() }
+    }
+
+    impl [u8] {
+        pub fn is_ascii(&self) -> bool { self.iter().all(|b| b.is_ascii()) }
+        pub fn to_ascii_uppercase(&self) -> Vec<u8> { self.iter().map(|b| b.to_ascii_uppercase()).collect() }
+        pub fn to_ascii_lowercase(&self) -> Vec<u8> { self.iter().map(|b| b.to_ascii_lowercase()).collect() }
+        pub fn make_ascii_uppercase(&mut self) { for b in self.iter_mut() { b.make_ascii_uppercase(); } }
+        pub fn make_ascii_lowercase(&mut self) { for b in self.iter_mut() { b.make_ascii_lowercase(); } }
+        pub fn eq_ignore_ascii_case(&self, other: &[u8]) -> bool {
+            self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }
     }
 }
 
@@ -1657,9 +1759,9 @@ pub mod convert {
     impl From<bool> for u64 { fn from(value: bool) -> u64 { value as u64 } }
     impl From<f32> for f64 { fn from(value: f32) -> f64 { value as f64 } }
     impl TryFrom<u32> for char {
-        type Error = crate::num::TryFromIntError;
-        fn try_from(value: u32) -> Result<char, crate::num::TryFromIntError> {
-            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::num::TryFromIntError) }
+        type Error = crate::char::CharTryFromError;
+        fn try_from(value: u32) -> Result<char, crate::char::CharTryFromError> {
+            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::char::CharTryFromError(())) }
         }
     }
 
@@ -1705,6 +1807,10 @@ pub mod error {
     impl Error for crate::num::TryFromIntError {}
     impl Error for crate::fmt::Error {}
     impl Error for crate::string::FromUtf8Error {}
+    impl Error for crate::string::FromUtf16Error {}
+    impl Error for crate::str::Utf8Error {}
+    impl Error for crate::char::CharTryFromError {}
+    impl Error for crate::char::TryFromCharError {}
 }
 
 pub mod collections {

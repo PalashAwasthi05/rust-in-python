@@ -1,0 +1,43 @@
+0
+Some('é')
+[195, 169]
+é
+Some(195)
+2
+true
+i̇ 3
+0d 1l 2r 
+Some(5)
+a�
+plain 5
+plain
+true
+true
+true
+true
+Some('z')
+{
+Some(8)
+3
+Ok(233)
+Ok(101)
+Ok('é')
+true
+edcba
+boxed
+éx
+[195, 169]
+13
+éllo wörld
+["c", "", "b", "a"]
+["a", "b", "", "c"]
+Some(1)
+"0ü2b3e4r"
+true
+true
+Some(2)
+Some(4)
+[104, 105]
+2
+Some((2, 'd'))
+6

@@ -1,0 +1,15 @@
+0
+["Banana", "Zoo", "apple", "banana", "zebra", "Äpfel", "éclair"]
+["apple", "Banana", "banana", "zebra", "Zoo", "Äpfel", "éclair"]
+["éclair", "Banana", "banana", "Äpfel", "apple", "zebra", "Zoo"]
+true
+true
+true
+Less
+Less
+Some(Greater)
+["Banana", "Zoo", "apple", "banana", "zebra", "Äpfel", "éclair"]
+éclair
+ dehlorwö
+true
+true

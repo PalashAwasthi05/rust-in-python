@@ -1,0 +1,12 @@
+0
+ok: héllo (6 bytes)
+err: invalid utf-8 sequence of 1 bytes from index 1
+true
+h�i
+héllo
+str ok héllo
+str err: incomplete utf-8 byte sequence from index 0
+valid up to 1
+round trip ✓
+[98, 121, 116, 101, 115]
+abcde
