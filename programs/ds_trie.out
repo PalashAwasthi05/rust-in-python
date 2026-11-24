@@ -1,0 +1,20 @@
+0
+duplicate: card
+words 9 nodes 15
+car      contains=true  prefix=true  complete=["car", "card", "care", "careful", "cart"]
+ca       contains=false prefix=true  complete=["car", "card", "care", "careful", "cart", "cat"]
+careful  contains=true  prefix=true  complete=["careful"]
+cards    contains=false prefix=false complete=[]
+do       contains=true  prefix=true  complete=["do", "dog", "dot"]
+d        contains=false prefix=true  complete=["do", "dog", "dot"]
+x        contains=false prefix=false complete=[]
+passing through 'car': 6
+remove care     -> true (words 8, nodes 15)
+remove ca       -> false (words 8, nodes 15)
+remove careful  -> true (words 7, nodes 11)
+remove dog      -> true (words 6, nodes 10)
+remove dog      -> false (words 6, nodes 10)
+all: ["car", "card", "cart", "cat", "do", "dot"]
+lcp = "inter"
+hé* ["hélium", "héllo"]
+日* ["日本", "日本語"]

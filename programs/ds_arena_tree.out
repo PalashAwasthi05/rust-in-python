@@ -1,0 +1,38 @@
+0
+root/
+|-- src/
+|   |-- main.rs (1200b)
+|   `-- lib/
+|       |-- parse.rs (3400b)
+|       `-- eval.rs (5100b)
+|-- docs/
+|   `-- README.md (800b)
+`-- Cargo.toml (150b)
+total size 10650
+height 4
+depth(eval.rs) = 3
+path root/src/lib/parse.rs
+lca(parse, eval) = lib/
+lca(main.rs, eval) = src/
+lca(readme, parse) = root/
+after moving lib under docs:
+root/
+|-- src/
+|   `-- main.rs (1500b)
+|-- docs/
+|   |-- README.md (800b)
+|   `-- lib/
+|       |-- parse.rs (3400b)
+|       `-- eval.rs (5100b)
+`-- Cargo.toml (150b)
+descendants of docs: ["docs", "README.md", "lib", "parse.rs", "eval.rs"]
+docs size 9300
+largest: [(NodeId(6), "eval.rs"), (NodeId(5), "parse.rs"), (NodeId(3), "main.rs")]
+1
+|-- 2
+|   |-- 4
+|   `-- 5
+`-- 3
+    |-- 6
+    `-- 7
+product 5040

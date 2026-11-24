@@ -1,0 +1,21 @@
+0
+order ["c", "b", "a"]
+get a -> Some(1)
+order ["a", "c", "b"]
+put d evicted Some(("b", 2)); order ["d", "a", "c"]
+get b -> None
+after get_mut c: order ["c", "d", "a"]
+c = Some(30)
+update a: None
+order ["a", "c", "d"]
+put e evicted Some(("d", 4))
+put f evicted Some(("c", 30))
+final order ["f", "e", "a"] len 3 hits 2 misses 1
+fib(60) = 1548008755920
+memo order [60, 58, 59, 57] hits 57 misses 59
+evicted one with positions [0]
+evicted three with positions [2]
+evicted two with positions [1, 3]
+evicted one with positions [4]
+two -> Some([6])
+four -> Some([5])

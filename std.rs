@@ -13,6 +13,7 @@ pub mod prelude {
     pub use crate::default::Default;
     pub use crate::marker::Copy;
     pub use crate::string::ToString;
+    pub use crate::iter::FromIterator;
 }
 
 pub mod intrinsics {
@@ -47,6 +48,7 @@ pub mod intrinsics {
     pub fn wrapping_op<T>(left: T, right: T, operator: u8) -> T;
     pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
+    pub fn range_nth<A>(range: &mut crate::ops::Range<A>, n: usize) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
     pub fn parse_int<T>(text: &str) -> Result<T, crate::num::ParseIntError>;
     pub fn try_integer<S, T>(value: S) -> Result<T, crate::num::TryFromIntError>;
@@ -326,20 +328,23 @@ pub mod iter {
         fn sum_by<B>(self) -> B where Self: Sized { crate::intrinsics::iter_collect_into(self) }
         fn cycle(self) -> Lazy<Self::Item> where Self: Sized { crate::intrinsics::iter_cycle(self) }
         fn array_chunks_vec(self, size: usize) -> Lazy<Vec<Self::Item>> where Self: Sized { crate::intrinsics::iter_chunks(self, size) }
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, None) }
     }
 
-    // Extend carries no methods here; its impls let inference find a collection's element type.
-    pub trait Extend<A> {}
-    impl<T> Extend<T> for Vec<T> {}
-    impl<'a, T: Copy> Extend<&'a T> for Vec<T> {}
-    impl Extend<char> for String {}
-    impl<'a> Extend<&'a str> for String {}
-    impl Extend<String> for String {}
-    impl<T> Extend<T> for crate::collections::VecDeque<T> {}
-    impl<T> Extend<T> for crate::collections::HashSet<T> {}
-    impl<T> Extend<T> for crate::collections::BTreeSet<T> {}
-    impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> {}
-    impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> {}
+    // The built-in collections' impls forward to their inherent extend methods.
+    pub trait Extend<A> {
+        fn extend<I: IntoIterator<Item = A>>(&mut self, iter: I);
+    }
+    impl<T> Extend<T> for Vec<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { Vec::extend(self, iter) } }
+    impl<'a, T: Copy> Extend<&'a T> for Vec<T> { fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) { Vec::extend(self, iter) } }
+    impl Extend<char> for String { fn extend<I: IntoIterator<Item = char>>(&mut self, iter: I) { String::extend(self, iter) } }
+    impl<'a> Extend<&'a str> for String { fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) { String::extend(self, iter) } }
+    impl Extend<String> for String { fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) { String::extend(self, iter) } }
+    impl<T> Extend<T> for crate::collections::VecDeque<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::VecDeque::extend(self, iter) } }
+    impl<T> Extend<T> for crate::collections::HashSet<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::HashSet::extend(self, iter) } }
+    impl<T> Extend<T> for crate::collections::BTreeSet<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::BTreeSet::extend(self, iter) } }
+    impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> { fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) { crate::collections::HashMap::extend(self, iter) } }
+    impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> { fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) { crate::collections::BTreeMap::extend(self, iter) } }
 
     pub trait IntoIterator {
         type Item;
@@ -632,6 +637,11 @@ pub mod iter {
     }
     pub fn successors<T, F: FnMut(&T) -> Option<T>>(first: Option<T>, succ: F) -> Successors<T, F> {
         Successors { next: first, f: succ }
+    }
+
+    // collect() into a type outside the built-in collections calls its FromIterator impl.
+    pub trait FromIterator<A>: Sized {
+        fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
     }
 }
 
@@ -941,6 +951,21 @@ pub mod option {
     impl<T> Option<Vec<T>> {
         pub fn as_deref(&self) -> Option<&[T]> {
             match self { Some(value) => Some(value.as_slice()), None => None }
+        }
+    }
+    impl Option<String> {
+        pub fn as_deref_mut(&mut self) -> Option<&mut str> {
+            match self { Some(value) => Some(value.as_mut_str()), None => None }
+        }
+    }
+    impl<T> Option<Box<T>> {
+        pub fn as_deref_mut(&mut self) -> Option<&mut T> {
+            match self { Some(value) => Some(&mut **value), None => None }
+        }
+    }
+    impl<T> Option<Vec<T>> {
+        pub fn as_deref_mut(&mut self) -> Option<&mut [T]> {
+            match self { Some(value) => Some(value.as_mut_slice()), None => None }
         }
     }
 
@@ -1325,6 +1350,7 @@ pub mod ops {
     impl<A: Copy> Iterator for Range<A> {
         type Item = A;
         fn next(&mut self) -> Option<A> { crate::intrinsics::range_next(self) }
+        fn nth(&mut self, n: usize) -> Option<A> { crate::intrinsics::range_nth(self, n) }
     }
     impl<A: Copy> Iterator for RangeInclusive<A> {
         type Item = A;
@@ -1394,12 +1420,19 @@ pub mod hash {
     pub trait Hasher {
         fn finish(&self) -> u64;
         fn write(&mut self, bytes: &[u8]);
-        fn write_u8(&mut self, i: u8) { self.write_u64(i as u64) }
-        fn write_u32(&mut self, i: u32) { self.write_u64(i as u64) }
-        fn write_u64(&mut self, i: u64);
-        fn write_usize(&mut self, i: usize) { self.write_u64(i as u64) }
-        fn write_i32(&mut self, i: i32) { self.write_u64(i as u64) }
+        // As in std, each integer writes its native-endian (here little-endian) bytes.
+        fn write_u8(&mut self, i: u8) { self.write(&[i]) }
+        fn write_u16(&mut self, i: u16) { self.write(&i.to_le_bytes()) }
+        fn write_u32(&mut self, i: u32) { self.write(&i.to_le_bytes()) }
+        fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()) }
+        fn write_u128(&mut self, i: u128) { self.write(&i.to_le_bytes()) }
+        fn write_usize(&mut self, i: usize) { self.write(&i.to_le_bytes()) }
+        fn write_i8(&mut self, i: i8) { self.write_u8(i as u8) }
+        fn write_i16(&mut self, i: i16) { self.write_u16(i as u16) }
+        fn write_i32(&mut self, i: i32) { self.write_u32(i as u32) }
         fn write_i64(&mut self, i: i64) { self.write_u64(i as u64) }
+        fn write_i128(&mut self, i: i128) { self.write_u128(i as u128) }
+        fn write_isize(&mut self, i: isize) { self.write_usize(i as usize) }
     }
     pub trait Hash {
         fn hash<H: Hasher>(&self, state: &mut H);
@@ -1417,6 +1450,15 @@ pub mod hash {
         fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()) }
     }
     pub fn hash_of<T: Hash>(value: &T) -> u64 { crate::intrinsics::hash_value(value) }
+    pub trait BuildHasher {
+        type Hasher: Hasher;
+        fn build_hasher(&self) -> Self::Hasher;
+        fn hash_one<T: Hash>(&self, x: T) -> u64 {
+            let mut state = self.build_hasher();
+            x.hash(&mut state);
+            state.finish()
+        }
+    }
 }
 
 pub mod str {
@@ -2500,4 +2542,14 @@ pub mod env {
     pub fn var(key: &str) -> Result<String, VarError> {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
     }
+}
+
+pub mod borrow {
+    pub trait Borrow<Borrowed: ?Sized> {
+        fn borrow(&self) -> &Borrowed;
+    }
+    impl<T: ?Sized> Borrow<T> for T { fn borrow(&self) -> &T { self } }
+    impl<'a, T: ?Sized> Borrow<T> for &'a T { fn borrow(&self) -> &T { &**self } }
+    impl Borrow<str> for String { fn borrow(&self) -> &str { self.as_str() } }
+    impl<T> Borrow<[T]> for Vec<T> { fn borrow(&self) -> &[T] { self.as_slice() } }
 }

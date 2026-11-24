@@ -1,0 +1,16 @@
+0
+nodes: ["core", "std", "alloc", "serde", "app", "log", "tests"]
+build order: core -> alloc -> std -> log -> serde -> app -> tests
+dfs order: ["core", "alloc", "std", "log", "serde", "app", "tests"]
+  core   at depth 0
+  alloc  at depth 1
+  std    at depth 1
+  log    at depth 2
+  serde  at depth 2
+  app    at depth 3
+  tests  at depth 4
+missing start: []
+cycle? None
+cycle detected: std => serde => app => alloc => std
+courses: ["c4", "c5", "c0", "c2", "c3", "c1"]
+6 nodes, 6 edges

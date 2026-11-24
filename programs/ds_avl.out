@@ -1,0 +1,17 @@
+0
+after  5: height 3 balanced true shape 2[1,4[3,5]]
+after 10: height 4 balanced true shape 4[2[1,3],8[6[5,7],9[-,10]]]
+after 15: height 4 balanced true shape 8[4[2[1,3],6[5,7]],12[10[9,11],14[13,15]]]
+size 15 keys [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+get 7 = Some(49), get 99 = None
+overwrite 7: Some(49) -> Some(-1)
+remove  8 -> Some(64); height 4 balanced true size 14
+remove  1 -> Some(1); height 4 balanced true size 13
+remove  2 -> Some(4); height 4 balanced true size 12
+remove  3 -> Some(9); height 4 balanced true size 11
+remove 15 -> Some(225); height 4 balanced true size 10
+remove 42 -> None; height 4 balanced true size 10
+shape 9[6[4[-,5],7],12[10[-,11],14[13,-]]]
+best=1 it=2 of=2 the=2 times=2 was=2 worst=1 
+words height 3 balanced true
+big: 217 keys, removed 73, now 144, height 9, balanced true

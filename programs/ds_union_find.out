@@ -1,0 +1,23 @@
+0
+union(0, 1) -> true  sets=9
+union(2, 3) -> true  sets=8
+union(1, 3) -> true  sets=7
+union(4, 5) -> true  sets=6
+union(6, 7) -> true  sets=5
+union(5, 7) -> true  sets=4
+union(0, 3) -> false sets=4
+union(8, 8) -> false sets=4
+connected(0,2)=true connected(0,4)=false connected(4,6)=true
+size of 3's set: 4, of 9's set: 1
+groups: [[0, 1, 2, 3], [4, 5, 6, 7], [8], [9]]
+max rank: 2
+before: [1, 2, 3, 4, 5, 6, 7, 7]
+after find(0): [7, 7, 7, 7, 7, 7, 7, 7]
+MST weight 39
+  0-3 (5)
+  2-4 (5)
+  3-5 (6)
+  0-1 (7)
+  1-4 (7)
+  4-6 (9)
+islands: 5

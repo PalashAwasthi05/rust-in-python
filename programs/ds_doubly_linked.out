@@ -1,0 +1,21 @@
+0
+forward:  [-1, 0, 1, 2, 3, 4]
+backward: [4, 3, 2, 1, 0, -1]
+len 6 front Some(-1) back Some(4)
+pop_back Some(4)
+pop_front Some(-1)
+forward:  [0, 1, 2, 3]
+backward: [3, 2, 1, 0]
+head strong=1 weak=1
+second strong=2 weak=1
+after edit: [0, 100, 2, 3]
+3 2 100 0 | len 0
+empty peeks: None None
+names ["a", "b", "c"] rev ["c", "b", "a"]
+probe alive: Some(1)
+probe after scope: None
+shared count 2
+after dropping a: 1
+drop first
+end of main
+drop second

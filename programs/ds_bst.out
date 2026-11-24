@@ -1,0 +1,18 @@
+0
+dup insert 40 -> false
+inorder [20, 30, 35, 40, 45, 50, 60, 65, 70, 80]
+preorder [50, 30, 20, 40, 35, 45, 70, 60, 65, 80]
+shape (50 (30 20 (40 35 45)) (70 (60 . 65) 80))
+len 10 height 4 min Some(20) max Some(80)
+contains 45? true contains 46? false
+in [33, 66]: 6
+remove 20 -> true  [30, 35, 40, 45, 50, 60, 65, 70, 80] shape (50 (30 . (40 35 45)) (70 (60 . 65) 80))
+remove 30 -> true  [35, 40, 45, 50, 60, 65, 70, 80] shape (50 (40 35 45) (70 (60 . 65) 80))
+remove 50 -> true  [35, 40, 45, 60, 65, 70, 80] shape (60 (40 35 45) (70 65 80))
+remove 99 -> false [35, 40, 45, 60, 65, 70, 80] shape (60 (40 35 45) (70 65 80))
+remove 70 -> true  [35, 40, 45, 60, 65, 80] shape (60 (40 35 45) (80 65 .))
+already had apple
+words ["apple", "banana", "cherry", "fig", "grape", "pear"]
+first Some("apple") last Some("pear")
+drained ["apple", "banana", "cherry", "fig", "grape", "pear"] now len 0
+degenerate height 30
