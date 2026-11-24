@@ -2833,7 +2833,7 @@ class Program:
             self.types[name] = (token, constructors)
             self.type_parameters[name] = tuple(parameters.values())
             self.derives[name] = {trait: token for trait in ("Clone", "Copy", "Debug", "PartialEq",
-                                                            "Eq", "PartialOrd", "Ord")}
+                                                            "Eq", "PartialOrd", "Ord", "Hash")}
             self.constructors.update({ctor.path: ctor for ctor in constructors})
         self.derives[OPTION]["Default"] = self.types[OPTION][0]
         self.default_variants[OPTION] = f"{OPTION}::None"
@@ -5517,6 +5517,26 @@ class MapValue:
     __hash__ = None
 
 
+class UserKey:
+    """A map key whose type has a hand-written PartialEq: hashes through its Hash impl, compares through eq."""
+
+    __slots__ = ("interpreter", "value", "digest")
+
+    def __init__(self, interpreter, value):
+        self.interpreter = interpreter
+        self.value = value
+        self.digest = interpreter.user_hash(value)
+
+    def __hash__(self):
+        return hash(self.digest)
+
+    def __eq__(self, other):
+        return isinstance(other, UserKey) and self.interpreter.equal(self.value, other.value)
+
+    def __repr__(self):
+        return f"#{self.digest}"
+
+
 class RcValue:
     """An Rc or Arc: clones share one cell and one pair of strong and weak counts."""
 
@@ -7935,6 +7955,12 @@ class Checker:
             return self.type_of(args[0], scope, expected)
         if kind == "name":
             ctor = self.program.constructors.get(token.text)
+            if ctor is None and "::" not in token.text and self.local_binding(scope, token) is None:
+                # An imported tuple struct used as a function value, as in `.map(Reverse)`.
+                imported = self.program.values_in_scope.get(token.module, {}).get(token.text)
+                if imported in self.program.constructors:
+                    token = expr.token = replace(token, text=imported)
+                    ctor = self.program.constructors[imported]
             if ctor and ctor.style == "unit":
                 return self.constructor(expr, "unit", expected).annotation
             arity = self.path_arity(expr, scope)
@@ -8298,13 +8324,15 @@ class Checker:
                     self.pretyped[id(args[1])] = right
                     return self.operator_call(expr, scope, expected, trait_name, method, args, left_type)
             if token.text in COMPARE and NEVER not in {left, right}:
+                self.literal_compare(left, right, "PartialEq" if token.text in {"==", "!="} else "PartialOrd", token)
                 peeled_left, peeled_right = self.resolve(left), self.resolve(right)
                 while isinstance(peeled_left, ReferenceType) and isinstance(peeled_right, ReferenceType):
                     peeled_left, peeled_right = self.resolve(peeled_left.inner), self.resolve(peeled_right.inner)
                 trait = "PartialEq" if token.text in {"==", "!="} else "PartialOrd"
                 if (peeled_left != peeled_right and not isinstance(peeled_left, TypeVariable)
                         and not isinstance(peeled_right, TypeVariable)
-                        and self.program.implementation(peeled_left, trait, arguments_wanted=(peeled_right,))):
+                        and (self.program.implementation(peeled_left, trait, arguments_wanted=(peeled_right,))
+                             or self.bounded_compare(peeled_left, peeled_right, trait))):
                     self.program.cross_compares[id(expr)] = (peeled_left, peeled_right, trait)
             return self.binary_type(token, left, right)
         if kind == "call":
@@ -8433,6 +8461,10 @@ class Checker:
             right_hint = left_type if left_type != NEVER else hint
             if right_literal and not same_type:
                 right_hint = self.peel_numeric_reference(right_hint)
+            elif right_literal and not isinstance(self.peel_numeric_reference(right_hint), TypeVariable) and (
+                    self.peel_numeric_reference(right_hint) not in NUMBER_TYPES):
+                # `price == 499` may compare through `impl PartialEq<i64> for Cents`.
+                right_hint = None
             if same_type and ungroup(right).kind in {"array", "array_repeat"} and not isinstance(
                     self.resolve(right_hint), (ArrayType, TypeVariable)):
                 right_hint = None
@@ -8856,6 +8888,18 @@ class Checker:
                       if name in trait.methods and self.has_receiver(trait.methods[name])
                       and self.implements(probe, trait.name.text)
                       and self.trait_available(probe, trait.name.text, expr.token)]
+        if not candidates and isinstance(base, AppliedType) and any(
+                isinstance(self.resolve(argument), TypeVariable) for argument in base.arguments):
+            # `None.cmp(&Some(0))`: a derived trait applies once the open arguments implement it too.
+            derived = self.program.derives.get(base.name, {})
+            candidates = [trait for trait in self.program.traits.values()
+                          if name in trait.methods and self.has_receiver(trait.methods[name])
+                          and trait.name.text in derived
+                          and self.trait_available(base, trait.name.text, expr.token)]
+            for trait in candidates[:1]:
+                for parameter, argument in zip(self.program.type_parameters[base.name], base.arguments):
+                    if not parameter.const_type:
+                        self.obligation(argument, trait.name.text, expr.token)
         receiver = base
         if not candidates and is_box(base):
             pointee = base.arguments[0]
@@ -9549,6 +9593,27 @@ class Checker:
                 and self.numeric_like(annotation.inner)
                 or isinstance(annotation, TypeVariable) and (annotation.integer_literal or annotation.float_literal))
 
+    def bounded_compare(self, left, right, trait):
+        """Whether a type parameter's bound, such as `T: PartialEq<&str>`, compares it with `right`."""
+        if not isinstance(left, TypeParameter):
+            return False
+        arguments = left.associated_bindings.get(AssociatedBinding(trait, ARGS_ITEM))
+        return bool(arguments and arguments.elements and self.resolve(arguments.elements[0]) == right)
+
+    def literal_compare(self, left, right, trait, token):
+        """`price == 499` with `impl PartialEq<i64> for Cents`: the literal takes the one numeric type compared with."""
+        left, right = self.resolve(left), self.resolve(right)
+        if (not isinstance(right, TypeVariable) or not (right.integer_literal or right.float_literal)
+                or isinstance(left, TypeVariable) or left in PRIMITIVES):
+            return
+        if not isinstance(left, (str, AppliedType)) or self.program.layout(left) is None:
+            return
+        numbers = FLOAT_TYPES if right.float_literal else INTEGER_TYPES
+        matches = [kind for kind in numbers
+                   if self.program.implementation(left, trait, arguments_wanted=(kind,)) is not None]
+        if len(matches) == 1:
+            self.require(right, matches[0], token)
+
     def binary_type(self, token, left, right):
         word = token.text
         if word == "+" and left == STRING:
@@ -9567,9 +9632,14 @@ class Checker:
                 trait = "PartialEq" if word in {"==", "!="} else "PartialOrd"
                 cross = (peeled_left != peeled_right and not isinstance(peeled_left, TypeVariable)
                          and not isinstance(peeled_right, TypeVariable)
-                         and self.program.implementation(peeled_left, trait, arguments_wanted=(peeled_right,)) is not None)
+                         and (self.program.implementation(peeled_left, trait, arguments_wanted=(peeled_right,)) is not None
+                              or self.bounded_compare(peeled_left, peeled_right, trait)))
+                # `vec == &[1, 2][..]` also compares a sequence with a reference to one.
+                sequence_sides = [self.resolve(kind.inner) if isinstance(kind, ReferenceType) and (
+                    is_vector(self.resolve(kind.inner)) or isinstance(self.resolve(kind.inner), (ArrayType, SliceType)))
+                    else kind for kind in (peeled_left, peeled_right)]
                 sequences = [kind.arguments[0] if is_vector(kind) else kind.element
-                             for kind in (peeled_left, peeled_right)
+                             for kind in sequence_sides
                              if is_vector(kind) or isinstance(kind, (ArrayType, SliceType))]
                 if len(sequences) == 2 and peeled_left != peeled_right and word in {"==", "!="}:
                     # Vec, arrays, and slices compare with each other element by element.
@@ -11353,6 +11423,10 @@ class Interpreter:
         while isinstance(value, (Address, StringAddress, SliceAddress, DynAddress, BoxValue, RcValue)):
             value = value.read()
         if isinstance(value, Value):
+            annotation = value.constructor.annotation
+            if value.constructor.path and self.cached_implementation(annotation, "PartialEq", annotation):
+                # A hand-written PartialEq (and Hash) decides which keys are the same, not the fields.
+                return UserKey(self, value)
             return (value.constructor.path, tuple(map(self.map_key, value.fields)))
         if isinstance(value, ArrayValue):
             return ("[", tuple(map(self.map_key, value.items)))
@@ -11363,6 +11437,21 @@ class Interpreter:
         if isinstance(value, str):
             return str(value)
         return value
+
+    def user_hash(self, value):
+        """Run a hand-written Hash impl with a fresh DefaultHasher and return its finished state."""
+        annotation = value.constructor.annotation
+        implementation = self.cached_implementation(annotation, "Hash")
+        if not implementation:
+            # No Hash impl (a BTreeMap key, say): one bucket per type keeps equal values together.
+            return hash(value.constructor.path.rsplit("::", 1)[0])
+        impl, arguments = implementation
+        method = impl.methods["hash"]
+        ctor = self.program.layout(DEFAULT_HASHER)[1][0]
+        state = Binding(Value(ctor, (14695981039346656037,)), True)
+        self.call(method.name.text, (shared(value), Address(state)),
+                  arguments | dict(zip(method.method_parameters, (DEFAULT_HASHER,))))
+        return state.value.fields[0]
 
     def map_order(self, value):
         entries = list(value.entries.values())
@@ -11738,7 +11827,8 @@ class Interpreter:
             if equality:
                 if left.entries.keys() != right.entries.keys():
                     return 1
-                return 0 if all(self.compare(left.entries[key][1], right.entries[key][1], True) == 0
+                return 0 if all(left.entries[key][1] is MAP_MEMBER
+                                or self.compare(left.entries[key][1], right.entries[key][1], True) == 0
                                 for key in left.entries) else 1
             mine, theirs = self.map_order(left), self.map_order(right)
             for (a_key, a_item), (b_key, b_item) in zip(mine, theirs):
@@ -11757,6 +11847,11 @@ class Interpreter:
         if isinstance(left, Value):
             if left.constructor.path != right.constructor.path:
                 variants = self.program.layout(left.constructor.annotation)[1]
+                explicit = {path.rsplit("::", 1)[0] for path in self.program.discriminants}
+                if left.constructor.path.rsplit("::", 1)[0] in explicit:
+                    # Derived orderings compare explicit discriminants, not declaration order.
+                    return (self.program.discriminant(left.constructor)
+                            - self.program.discriminant(right.constructor))
                 order = {ctor.path: index for index, ctor in enumerate(variants)}
                 return order[left.constructor.path] - order[right.constructor.path]
             for a, b in zip(left.fields, right.fields):
@@ -12390,6 +12485,10 @@ class Interpreter:
                         "eq", "partial_cmp", "cmp"}:
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
                     return self.builtin_compare(name, values[0], values[1], result)
+                if implementation is None and trait == "Hash" and name == "hash":
+                    helper = self.functions[HASH_BUILTIN]
+                    hasher = next(arguments[parameter] for parameter in function.method_parameters)
+                    return self.call(HASH_BUILTIN, values, dict(zip(helper.type_parameters, (receiver, hasher))))
                 if implementation is None and trait in {"Display", "Debug"} and name == "fmt":
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
                     return self.builtin_fmt(values[0], values[1], trait == "Debug", result)
@@ -12718,6 +12817,8 @@ def rust_vec_last(interpreter, result, vector):
 
 
 ORDERING = MODULE_SEPARATOR.join(("std", "cmp", "Ordering"))
+DEFAULT_HASHER = MODULE_SEPARATOR.join(("std", "hash", "DefaultHasher"))
+HASH_BUILTIN = MODULE_SEPARATOR.join(("std", "hash", "hash_builtin"))
 
 
 def items_of(value):
@@ -14902,9 +15003,9 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
         symbols = unit.glob_aliases | unit.aliases | unit.symbols
         program.traits_in_scope[unit.path] = unit.hidden_traits | prelude_traits | {
             symbol.name for symbol in symbols.values() if symbol and symbol.kind == "trait"
-        }
+        } | set(unit.trait_imports.values())
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
-                                              if symbol and symbol.kind == "fn"}
+                                              if symbol and symbol.kind in {"fn", "struct"}}
         program.constants_in_scope[unit.path] = {name: scalars[symbol.name] for name, symbol in symbols.items()
                                                  if symbol and symbol.kind in {"const", "static"}
                                                  and symbol.name in scalars}

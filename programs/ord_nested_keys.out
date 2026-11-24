@@ -1,0 +1,22 @@
+0
+a == b: true
+a == c: false
+digest a == b: true
+insert "Core": true
+insert "CORE": false
+insert "core": true
+seen: 2
+distinct symbols: 5
+x: Some(2)
+anon: Some(2)
+core/1: Some(2)
+anon x2
+global core/1 x2
+global core/2 x1
+local x x2
+local y x1
+pairs: 2
+opts: 2
+lists: 2
+{((0, 0), "aa"), ((1, 0), "bb"), ((2, 0), "cc")}
+removed Some(['b', 'b']), left 2

@@ -1,0 +1,27 @@
+0
+[-7.5, -1.25, 0.0, 2.75, 3.5, 10.0]
+[10.0, 3.5, 2.75, 0.0, -1.25, -7.5]
+[-inf, -1.0, -0.0, 0.0, 2.0, inf, NaN]
+[-inf, -1.0, -0.0, 0.0, 2.0, inf, NaN]
+1.0 < 2.0: true
+nan < 1: false
+nan > 1: false
+nan == nan: false
+partial nan: None
+partial: Some(Equal)
+-0 == 0: true
+total -0 vs 0: Less
+max: 3
+min: -2
+hottest: d 25.25
+coldest: e 18
+mean: 21.600
+c 25.25
+d 25.25
+a 20.50
+b 19.00
+e 18.00
+fold max: 25.25
+fold min: 18
+[-3.0, 0.25, 1.5]
+clamp: 5

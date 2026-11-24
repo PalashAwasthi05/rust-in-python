@@ -1,0 +1,20 @@
+0
+unique count: 4
+go 2
+python 2
+rust 1
+rust 3
+["rust3", "python2", "rust1", "go2"]
+["rust", "python", "go"]
+[Tag { name: "go", weight: 2 }, Tag { name: "python", weight: 2 }, Tag { name: "rust", weight: 1 }, Tag { name: "rust", weight: 3 }]
+[1, 2, 3, 4, 5, 6, 9]
+[Tag { name: "go", weight: 2 }, Tag { name: "python", weight: 2 }, Tag { name: "rust", weight: 3 }]
+[1, 4, 7, 9, 15]
+["N", "E", "S", "W"] 4
+both [(1, 1), (2, 2)]
+either [(0, 0), (1, 1), (2, 2), (3, 3)]
+sym [(0, 0), (3, 3)]
+subset: true
+set eq: true
+{"brown", "dog", "end", "fox", "jumps", "lazy", "over", "quick", "the"}
+has a: true, len 2

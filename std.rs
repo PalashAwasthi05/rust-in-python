@@ -637,7 +637,7 @@ pub mod iter {
 
 pub mod cmp {
     #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
-    pub enum Ordering { Less, Equal, Greater }
+    pub enum Ordering { Less = -1, Equal = 0, Greater = 1 }
 
     impl Ordering {
         pub fn is_eq(self) -> bool { self == Ordering::Equal }
@@ -698,6 +698,12 @@ pub mod cmp {
     pub fn min_by_key<T, K: Ord, F: FnMut(&T) -> K>(v1: T, v2: T, f: F) -> T {
         let mut f = f;
         if f(&v2).cmp(&f(&v1)) == Ordering::Less { v2 } else { v1 }
+    }
+    pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+        match compare(&v1, &v2) { Ordering::Greater => v1, _ => v2 }
+    }
+    pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+        match compare(&v1, &v2) { Ordering::Greater => v2, _ => v1 }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
@@ -1417,6 +1423,8 @@ pub mod hash {
         fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()) }
     }
     pub fn hash_of<T: Hash>(value: &T) -> u64 { crate::intrinsics::hash_value(value) }
+    // Hash::hash for primitives and derived impls: feeds one structural hash into the hasher.
+    pub fn hash_builtin<T, H: Hasher>(value: &T, state: &mut H) { state.write_u64(crate::intrinsics::hash_value(value)) }
 }
 
 pub mod str {
@@ -1715,6 +1723,7 @@ pub mod collections {
     pub mod hash_map {
         pub use super::HashMap;
         pub use super::Entry;
+        pub use crate::hash::DefaultHasher;
     }
     pub mod btree_map {
         pub use super::BTreeMap;

@@ -1,0 +1,21 @@
+0
+peek: Some("hotfix")
+len: 6
+run hotfix (p9 #5)
+run deploy (p5 #1)
+run test (p5 #3)
+run write (p2 #0)
+run review (p2 #4)
+run lint (p1 #2)
+empty: true
+ascending: [1, 1, 3, 4, 7, 9]
+sorted: [-2, 3, 5, 8, 8]
+[(3, "z"), (2, "b"), (2, "a"), (1, "y")]
+3 smallest: [1, 3, 4]
+[Some(0), Some(3), Some(1), Some(4), Some(7), None]
+Reverse cmp: Greater
+Reverse lt: false
+Reverse eq: true
+Reverse inner: 42
+[Reverse(10), Reverse(3), Reverse(1)]
+[(Reverse(5), "y"), (Reverse(2), "a"), (Reverse(2), "x")]
