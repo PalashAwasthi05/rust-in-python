@@ -3173,35 +3173,42 @@ class Pattern:
     children: tuple = ()
     binding: str | None = None
     alternatives: tuple = ()
+    by_reference: bool = False
 
-    def bindings(self, value):
+    def bindings(self, value, address=None):
         if self.alternatives:
             for alternative in self.alternatives:
-                yield from alternative.bindings(value)
+                yield from alternative.bindings(value, address)
             return
         if self.tag is None:
-            yield {self.binding: value} if self.binding else {}
+            yield {self.binding: address if self.by_reference else value} if self.binding else {}
         elif isinstance(self.tag, Constructor):
-            if isinstance(value, ArrayValue) and self.tag.style == "array":
-                yield from self.field_bindings(tuple(value.items[int(name)] for name, _ in self.tag.fields))
+            if self.tag.style == "reference":
+                yield from self.children[0].bindings(value.read(), value)
+            elif isinstance(value, ArrayValue) and self.tag.style == "array":
+                names = tuple(name for name, _ in self.tag.fields)
+                yield from self.field_bindings(tuple(value.items[int(name)] for name in names), address, names)
             elif isinstance(value, Value) and value.constructor.path == self.tag.path:
-                yield from self.field_bindings(value.fields)
+                names = tuple(name for name, _ in self.tag.fields)
+                yield from self.field_bindings(value.fields, address, names)
         elif isinstance(self.tag, SlicePattern):
             positions = self.tag.positions(len(value.items))
             if positions is not None:
-                yield from self.field_bindings(tuple(value.items[index] for index in positions))
+                yield from self.field_bindings(tuple(value.items[index] for index in positions),
+                                               address, tuple(map(str, positions)))
         elif isinstance(self.tag, IntegerRange):
             if self.tag.contains(value):
                 yield {}
         elif value == self.tag[1]:
             yield {}
 
-    def field_bindings(self, values, index=0):
+    def field_bindings(self, values, address, names, index=0):
         if index == len(self.children):
             yield {}
             return
-        for first in self.children[index].bindings(values[index]):
-            for rest in self.field_bindings(values, index + 1):
+        child = address.child(Token(names[index], 1, 1)) if address is not None else None
+        for first in self.children[index].bindings(values[index], child):
+            for rest in self.field_bindings(values, address, names, index + 1):
                 yield first | rest
 
 
@@ -3216,6 +3223,8 @@ def uncovered(matrix, types, program):
     if declaration is not None:
         constructors = declaration[1]
         signatures = [(ctor, tuple(kind for _, kind in ctor.fields)) for ctor in constructors]
+    elif isinstance(annotation, ReferenceType):
+        signatures = [(Constructor("&", annotation, "reference", (("0", annotation.inner),)), (annotation.inner,))]
     elif annotation == "bool":
         signatures = [(("bool", value), ()) for value in (False, True)]
     elif annotation == "()":
@@ -3322,6 +3331,8 @@ def show_missing(witness):
     if tag.style == "unit":
         return tag.path
     fields = [show_missing(child) for child in children]
+    if tag.style == "reference":
+        return f"&{fields[0]}"
     if tag.style == "array":
         if len(fields) == tag.annotation.length.value:
             return f"[{', '.join(fields)}]"
@@ -4087,8 +4098,17 @@ class Checker:
         suffix = index + 1
         return (*enumerate(items[:index]), *enumerate(items[suffix:], start=size - len(items) + suffix))
 
-    def prepare_pattern(self, expr, annotation):
+    def prepare_pattern(self, expr, annotation, *, borrowed=False):
         kind, token, args = expr.kind, expr.token, expr.args
+        annotation = self.resolve(annotation)
+        unit = self.program.constructors.get(token.text) if kind == "bind" else None
+        structural = kind not in {"bind", "wild", "or"} or (unit and unit.style == "unit")
+        if isinstance(annotation, ReferenceType) and structural:
+            if annotation.mutable:
+                raise token.error("matching a mutable reference requires explicit dereferencing")
+            inner, bindings = self.prepare_pattern(expr, annotation.inner, borrowed=True)
+            ctor = Constructor("&", annotation, "reference", (("0", annotation.inner),))
+            return Pattern(tag=ctor, children=(inner,)), bindings
         if kind == "wild":
             return Pattern(), {}
         if kind == "rest":
@@ -4122,10 +4142,10 @@ class Checker:
                 raise token.error("empty integer range pattern")
             return Pattern(tag=IntegerRange(start, stop)), {}
         if kind == "or":
-            pattern, bindings = self.prepare_pattern(args[0], annotation)
+            pattern, bindings = self.prepare_pattern(args[0], annotation, borrowed=borrowed)
             alternatives = list(pattern.alternatives or (pattern,))
             for alternative in args[1:]:
-                option, other = self.prepare_pattern(alternative, annotation)
+                option, other = self.prepare_pattern(alternative, annotation, borrowed=borrowed)
                 resolved = {key: (self.resolve(t), m) for key, (t, m) in bindings.items()}
                 incoming = {key: (self.resolve(t), m) for key, (t, m) in other.items()}
                 if resolved != incoming:
@@ -4133,10 +4153,12 @@ class Checker:
                 alternatives.extend(option.alternatives or (option,))
             return Pattern(alternatives=tuple(alternatives)), bindings
         if kind == "bind":
-            ctor = self.program.constructors.get(token.text)
-            if not ctor or ctor.style != "unit":
+            if not unit or unit.style != "unit":
                 if isinstance(self.resolve(annotation), SliceType):
                     raise token.error("cannot bind an unsized slice value")
+                if borrowed and not args[0]:
+                    return (Pattern(binding=token.key, by_reference=True),
+                            {token.key: (ReferenceType(annotation, False), False)})
                 return Pattern(binding=token.key), {token.key: (annotation, args[0])}
             if args[0]:
                 raise token.error(f"cannot shadow unit struct {token.text!r}")
@@ -4191,7 +4213,7 @@ class Checker:
         children = [Pattern()] * len(fields)
         bindings = {}
         for index, child in assignments:
-            child_pattern, added = self.prepare_pattern(child, fields[index][1])
+            child_pattern, added = self.prepare_pattern(child, fields[index][1], borrowed=borrowed)
             duplicate = bindings.keys() & added.keys()
             if duplicate:
                 raise child.token.error(f"duplicate pattern binding {sorted(duplicate, key=str)[0]!r}")
@@ -4205,8 +4227,8 @@ class Checker:
     def match_type(self, expr, scope, expected=None):
         scrutinee, arms = expr.args
         annotation = self.type_of(scrutinee, scope)
-        if isinstance(annotation, ReferenceType):
-            raise scrutinee.token.error("match on a reference requires explicit dereferencing")
+        if isinstance(annotation, ReferenceType) and annotation.mutable:
+            raise scrutinee.token.error("matching a mutable reference requires explicit dereferencing")
         coverage = []
         result = NEVER
         for source, guard, body in arms:
@@ -4256,8 +4278,8 @@ class Checker:
                     self.require(test, "bool", condition.token)
                 else:
                     source = args[1]
-                    if isinstance(test, ReferenceType):
-                        raise condition.token.error("matching a reference requires explicit dereferencing")
+                    if isinstance(test, ReferenceType) and test.mutable:
+                        raise condition.token.error("matching a mutable reference requires explicit dereferencing")
                     pattern, bindings = self.prepare_pattern(source, test)
                     self.program.patterns[id(source)] = (pattern, bindings)
                     scope = Scope(scope, {name: Binding(kind, mutable)
@@ -4535,7 +4557,7 @@ class Checker:
                 self.ascriptions.append(expr)
             annotation = self.resolve(annotation or actual)
             if isinstance(annotation, ReferenceType):
-                if value is None or source.kind not in {"bind", "wild"} or otherwise:
+                if value is None or (otherwise and source.kind in {"bind", "wild"}):
                     raise token.error("reference let requires a simple initialized binding")
             pattern, bindings = self.prepare_pattern(source, annotation)
             if value is None and not bindings:
@@ -5739,7 +5761,7 @@ class Ownership:
             if isinstance(value_type, FunctionType) and value_type.closure:
                 cursor, lease = self.lower_closure(value, scope, cursor)
                 return self.declare(source, types, scope, cursor, loan=lease)
-            if isinstance(self.annotation(value), ReferenceType):
+            if isinstance(value_type, ReferenceType) and source.kind in {"bind", "wild"}:
                 static = isinstance(annotation, ReferenceType) and annotation.lifetime == "'static"
                 if not types and not static and ungroup(value).kind == "name":
                     return cursor
@@ -5759,15 +5781,21 @@ class Ownership:
                 # Keep an address for type-checked expressions in the dead tail.
                 loan = Loan(Place(Local(source.token, annotation.mutable)), annotation.mutable)
                 return self.declare(source, types, scope, cursor, loan=loan)
-            cursor, origin = self.lower_address(value, scope, cursor)
-            if origin is None:
-                cursor = self.lower(value, scope, cursor)
-            reads, moves, tests = self.pattern_accesses(pattern, origin, self.annotation(value))
+            cursor, origin, loan = self.lower_pattern_input(value, scope, cursor, extend_to=scope)
+            reads, moves, tests = self.pattern_accesses(pattern, origin, value_type)
             cursor = self.read_pattern(cursor, tests | reads, source.token)
             if otherwise:
                 self.lower(otherwise, Scope(scope), cursor)
             cursor = self.move_pattern(cursor, moves, source.token)
-            return self.declare(source, types, scope, cursor)
+            cursor = self.declare(source, types, scope, cursor, loan=loan)
+            if loan and isinstance(annotation, ReferenceType) and annotation.lifetime == "'static":
+                cursor = self.emit(cursor, "static_reference", origin, source.token)
+            if loan and loan.expiring:
+                for name, (kind, _) in types.items():
+                    if isinstance(kind, ReferenceType):
+                        holder = Place(scope.find(source.token.binding(name)))
+                        cursor = self.emit(cursor, "end_temporaries", holder, source.token)
+            return cursor
         if kind == "match":
             end, _ = self.lower_match(expr, scope, cursor)
             return end
@@ -5893,9 +5921,7 @@ class Ownership:
             elif kind == "while_let":
                 condition, source, _ = args
                 target.in_condition = True
-                body_entry, origin = self.lower_address(condition, scope, restart)
-                if origin is None:
-                    body_entry = self.lower(condition, scope, body_entry)
+                body_entry, origin, loan = self.lower_pattern_input(condition, scope, restart)
                 target.in_condition = False
                 pattern, types = self.program.patterns[id(source)]
                 annotation = self.annotation(condition)
@@ -5905,7 +5931,7 @@ class Ownership:
                     self.connect(body_entry, finish)
                 body_entry = self.move_pattern(body_entry, moves, source.token)
                 scope = Scope(scope)
-                body_entry = self.declare(source, types, scope, body_entry)
+                body_entry = self.declare(source, types, scope, body_entry, loan=loan)
             if kind == "for":
                 self.connect(restart, finish)
                 local = Local(name, mutable)
@@ -5918,9 +5944,7 @@ class Ownership:
 
     def lower_match(self, expr, scope, cursor, *, result_type=None, extend_to=None):
         scrutinee, arms = expr.args
-        cursor, origin = self.lower_address(scrutinee, scope, cursor)
-        if origin is None:
-            cursor = self.lower(scrutinee, scope, cursor)
+        cursor, origin, scrutinee_loan = self.lower_pattern_input(scrutinee, scope, cursor)
         finishes = []
         results = []
         prepared = []
@@ -5933,7 +5957,7 @@ class Ownership:
         for source, guard, body, types, reads, moves, tests in prepared:
             tested = self.read_pattern(cursor, tests | reads, source.token)
             inner = Scope(scope)
-            ready = self.declare(source, types, inner, tested)
+            ready = self.declare(source, types, inner, tested, loan=scrutinee_loan)
             if guard:
                 earlier = self.guarded, self.guard_borrows, self.guard_tests
                 self.guarded = self.guarded | set(inner.bindings.values())
@@ -5957,10 +5981,24 @@ class Ownership:
         loan = self.merge_loans(tuple(results), result_type.mutable) if result_type else None
         return self.join(*finishes), loan
 
+    def lower_pattern_input(self, expr, scope, cursor, *, extend_to=None):
+        cursor, origin = self.lower_address(expr, scope, cursor)
+        if isinstance(self.annotation(expr), ReferenceType):
+            if origin is not None:
+                return cursor, origin, origin.local.loan
+            cursor, loan = self.lower_reference(expr, scope, cursor, extend_to=extend_to)
+            if loan:
+                cursor, origin = self.keep_loan(cursor, loan, expr.token)
+            return cursor, origin, loan
+        if origin is None:
+            cursor = self.lower(expr, scope, cursor)
+        return cursor, origin, None
+
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None):
         action = "declare" if initialized else "uninitialized"
-        for name, (_, mutable) in types.items():
-            local = Local(source.token.binding(name), mutable, loan)
+        for name, (annotation, mutable) in types.items():
+            carries_loan = isinstance(annotation, ReferenceType) or (isinstance(annotation, FunctionType) and annotation.closure)
+            local = Local(source.token.binding(name), mutable, loan if carries_loan else None)
             scope.bindings[name] = local
             scope.owned.add(local)
             cursor = self.emit(cursor, action, Place(local), source.token)
@@ -5979,12 +6017,15 @@ class Ownership:
             for option in pattern.alternatives:
                 self.collect_pattern(option, place, reads, moves, tests, annotation, opaque=opaque)
         elif pattern.binding:
-            if self.program.is_copy(annotation):
+            if pattern.by_reference or self.program.is_copy(annotation):
                 reads[place] = None
             else:
                 moves[place] = annotation
         elif isinstance(pattern.tag, Constructor):
             ctor = pattern.tag
+            if ctor.style == "reference":
+                self.collect_pattern(pattern.children[0], self.referent(place.local), reads, moves, tests, annotation.inner)
+                return
             variant = "::" in ctor.path
             if variant and len(self.program.layout(ctor.annotation)[1]) > 1:
                 tests[place] = None

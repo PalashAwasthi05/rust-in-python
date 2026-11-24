@@ -1327,6 +1327,43 @@ VALID = [
             println!("{}", packet.value.0.score());
         }
     """, "9\n"),
+    ("patterns borrow through shared references and carry their lifetime", """
+        struct Item(i32);
+        struct Holder { field: (Item, i32) }
+        fn select(holder: &Holder) -> &Item {
+            match holder { Holder { field: (one, _) } => one }
+        }
+        fn item(value: &Option<Item>) -> i32 {
+            match value { Some(x) => x.0, None => -1 }
+        }
+        fn main() {
+            let mut values = [1, 2, 3];
+            let view: &[i32] = &values[..];
+            let first = match view { [n, ..] => *n, _ => 0 };
+            let [left, .., right] = view else { return; };
+            println!("{first} {left} {right}");
+            values[0] = 9;
+            println!("{values:?}");
+            let record = Holder { field: (Item(5), 7) };
+            println!("{}", select(&record).0);
+            let maybe = Some(Item(8));
+            if let Some(value) = &maybe { println!("{}", value.0); }
+            println!("{}", item(&maybe));
+            while let Some(value) = &maybe { println!("{}", value.0); break; }
+        }
+    """, "1 1 3\n[9, 2, 3]\n5\n8\n8\n8\n"),
+    ("shared reference pattern alternatives retain projected storage", """
+        enum Choice { Left(i32), Right(i32) }
+        fn choice() -> Choice { Choice::Right(7) }
+        fn main() {
+            let (Choice::Left(n) | Choice::Right(n)) = &choice();
+            println!("{n}");
+            let pair = (1, 2);
+            let (mut first, second) = &pair;
+            first += 1;
+            println!("{first} {second}");
+        }
+    """, "7\n2 2\n"),
 ]
 
 INVALID = [
@@ -1932,6 +1969,20 @@ INVALID = [
         type Missing<T> = bool;
         fn main() {}
     """, "unused type parameter T"),
+    ("a pattern reference prevents mutation while it remains live", """
+        fn main() {
+            let mut values = [1, 2];
+            let [first, _] = &values;
+            values[0] = 4;
+            println!("{first}");
+        }
+    """, "immutably borrowed"),
+    ("a pattern reference cannot write through a shared loan", """
+        fn main() {
+            let [first, _] = &[1, 2];
+            *first = 4;
+        }
+    """, "cannot write through a shared reference"),
 ]
 
 
@@ -1963,12 +2014,20 @@ class InterpreterTests(unittest.TestCase):
             slice_pattern = folder / "slice_pattern.rs"
             slice_pattern.write_text('fn main() { let a = [1, 2]; assert!(matches!(a[..], [1, ..])); }',
                                      encoding="utf-8")
-            unsupported = folder / "pattern_ergonomics.rs"
-            unsupported.write_text('''
+            shared = folder / "shared_pattern.rs"
+            shared.write_text('''
                 fn main() {
                     let a: &[i32] = &[1, 2];
                     let first = match a { [n, ..] => *n, _ => 0 };
                     println!("{first}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "mutable_pattern.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let mut a = [1, 2];
+                    match &mut a[..] { [n, ..] => *n = 7, _ => () }
+                    println!("{a:?}");
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -1990,12 +2049,12 @@ class InterpreterTests(unittest.TestCase):
             ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, unsupported, panics, bounds, overflow, shift],
+                                     capture, slices, slice_pattern, shared, unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
-                             ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match",
+                             ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
