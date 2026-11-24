@@ -890,10 +890,194 @@ STD_BUILTIN_TRAITS = {MODULE_SEPARATOR.join(("std", TRAIT_MODULE_NAMES[name], na
                       for name in ("Display", "Debug", "PartialEq", "Eq", "PartialOrd", "Ord")}
 STD_PRELUDE = ("std", "prelude")
 STD_CRATES = {"std", "core", "alloc"}
-STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8")
+INTEGER_METHODS = """
+impl {T} {
+    pub fn pow(self, exp: u32) -> {T};
+    pub fn abs(self) -> {T};
+    pub fn signum(self) -> {T};
+    pub fn is_positive(self) -> bool { self > 0 }
+    pub fn is_negative(self) -> bool { self < 0 }
+    pub fn checked_add(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_sub(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_mul(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_div(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_rem(self, rhs: {T}) -> Option<{T}>;
+    pub fn checked_pow(self, exp: u32) -> Option<{T}>;
+    pub fn checked_neg(self) -> Option<{T}>;
+    pub fn checked_abs(self) -> Option<{T}>;
+    pub fn wrapping_add(self, rhs: {T}) -> {T};
+    pub fn wrapping_sub(self, rhs: {T}) -> {T};
+    pub fn wrapping_mul(self, rhs: {T}) -> {T};
+    pub fn wrapping_div(self, rhs: {T}) -> {T};
+    pub fn wrapping_rem(self, rhs: {T}) -> {T};
+    pub fn wrapping_neg(self) -> {T};
+    pub fn wrapping_pow(self, exp: u32) -> {T};
+    pub fn wrapping_abs(self) -> {T};
+    pub fn saturating_add(self, rhs: {T}) -> {T};
+    pub fn saturating_sub(self, rhs: {T}) -> {T};
+    pub fn saturating_mul(self, rhs: {T}) -> {T};
+    pub fn saturating_pow(self, exp: u32) -> {T};
+    pub fn overflowing_add(self, rhs: {T}) -> ({T}, bool);
+    pub fn overflowing_sub(self, rhs: {T}) -> ({T}, bool);
+    pub fn overflowing_mul(self, rhs: {T}) -> ({T}, bool);
+    pub fn rem_euclid(self, rhs: {T}) -> {T};
+    pub fn div_euclid(self, rhs: {T}) -> {T};
+    pub fn abs_diff(self, other: {T}) -> {U};
+    pub fn unsigned_abs(self) -> {U};
+    pub fn count_ones(self) -> u32;
+    pub fn count_zeros(self) -> u32;
+    pub fn leading_zeros(self) -> u32;
+    pub fn trailing_zeros(self) -> u32;
+    pub fn leading_ones(self) -> u32;
+    pub fn trailing_ones(self) -> u32;
+    pub fn rotate_left(self, n: u32) -> {T};
+    pub fn rotate_right(self, n: u32) -> {T};
+    pub fn swap_bytes(self) -> {T};
+    pub fn reverse_bits(self) -> {T};
+    pub fn is_power_of_two(self) -> bool;
+    pub fn next_power_of_two(self) -> {T};
+    pub fn isqrt(self) -> {T};
+    pub fn ilog2(self) -> u32;
+    pub fn ilog10(self) -> u32;
+    pub fn ilog(self, base: {T}) -> u32;
+    pub fn midpoint(self, rhs: {T}) -> {T};
+    pub fn to_be_bytes(self) -> Vec<u8>;
+    pub fn to_le_bytes(self) -> Vec<u8>;
+    pub fn from_str_radix(src: &str, radix: u32) -> Result<{T}, crate::num::ParseIntError>;
+}
+impl crate::str::FromStr for {T} {
+    type Err = crate::num::ParseIntError;
+    fn from_str(s: &str) -> Result<{T}, crate::num::ParseIntError> { crate::intrinsics::parse_int(s) }
+}
+"""
+FLOAT_METHODS = """
+impl {T} {
+    pub fn floor(self) -> {T};
+    pub fn ceil(self) -> {T};
+    pub fn round(self) -> {T};
+    pub fn round_ties_even(self) -> {T};
+    pub fn trunc(self) -> {T};
+    pub fn fract(self) -> {T};
+    pub fn signum(self) -> {T};
+    pub fn cbrt(self) -> {T};
+    pub fn powi(self, n: i32) -> {T};
+    pub fn powf(self, n: {T}) -> {T};
+    pub fn exp(self) -> {T};
+    pub fn exp2(self) -> {T};
+    pub fn exp_m1(self) -> {T};
+    pub fn ln(self) -> {T};
+    pub fn ln_1p(self) -> {T};
+    pub fn log(self, base: {T}) -> {T};
+    pub fn log10(self) -> {T};
+    pub fn log2(self) -> {T};
+    pub fn sin(self) -> {T};
+    pub fn cos(self) -> {T};
+    pub fn tan(self) -> {T};
+    pub fn asin(self) -> {T};
+    pub fn acos(self) -> {T};
+    pub fn atan(self) -> {T};
+    pub fn atan2(self, other: {T}) -> {T};
+    pub fn sinh(self) -> {T};
+    pub fn cosh(self) -> {T};
+    pub fn tanh(self) -> {T};
+    pub fn sin_cos(self) -> ({T}, {T});
+    pub fn hypot(self, other: {T}) -> {T};
+    pub fn to_degrees(self) -> {T};
+    pub fn to_radians(self) -> {T};
+    pub fn max(self, other: {T}) -> {T};
+    pub fn min(self, other: {T}) -> {T};
+    pub fn clamp(self, min: {T}, max: {T}) -> {T};
+    pub fn mul_add(self, a: {T}, b: {T}) -> {T};
+    pub fn recip(self) -> {T};
+    pub fn rem_euclid(self, rhs: {T}) -> {T};
+    pub fn div_euclid(self, rhs: {T}) -> {T};
+    pub fn copysign(self, sign: {T}) -> {T};
+    pub fn abs_sub(self, other: {T}) -> {T};
+    pub fn is_sign_positive(self) -> bool;
+    pub fn is_sign_negative(self) -> bool;
+    pub fn is_normal(self) -> bool;
+    pub fn total_cmp(&self, other: &{T}) -> crate::cmp::Ordering;
+    pub fn to_bits(self) -> {B};
+    pub fn from_bits(bits: {B}) -> {T};
+}
+impl crate::str::FromStr for {T} {
+    type Err = crate::num::ParseFloatError;
+    fn from_str(s: &str) -> Result<{T}, crate::num::ParseFloatError> { crate::intrinsics::parse_float(s) }
+}
+"""
+SCALAR_STD = "pub mod num {\n" + """
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ParseIntError { kind: IntErrorKind }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IntErrorKind { Empty, InvalidDigit, PosOverflow, NegOverflow, Zero }
+    impl ParseIntError {
+        pub fn kind(&self) -> &IntErrorKind { &self.kind }
+    }
+    impl crate::fmt::Display for ParseIntError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            match self.kind {
+                IntErrorKind::Empty => write!(f, "cannot parse integer from empty string"),
+                IntErrorKind::InvalidDigit => write!(f, "invalid digit found in string"),
+                IntErrorKind::PosOverflow => write!(f, "number too large to fit in target type"),
+                IntErrorKind::NegOverflow => write!(f, "number too small to fit in target type"),
+                IntErrorKind::Zero => write!(f, "number would be zero for non-zero type"),
+            }
+        }
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ParseFloatError { empty: bool }
+    impl crate::fmt::Display for ParseFloatError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            if self.empty { write!(f, "cannot parse float from empty string") } else { write!(f, "invalid float literal") }
+        }
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ParseBoolError;
+    impl crate::fmt::Display for ParseBoolError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "provided string was not `true` or `false`")
+        }
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ParseCharError;
+    impl crate::fmt::Display for ParseCharError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid character") }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TryFromIntError;
+    impl crate::fmt::Display for TryFromIntError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result {
+            write!(f, "out of range integral type conversion attempted")
+        }
+    }
+    impl crate::str::FromStr for bool {
+        type Err = ParseBoolError;
+        fn from_str(s: &str) -> Result<bool, ParseBoolError> {
+            if s == "true" { Ok(true) } else if s == "false" { Ok(false) } else { Err(ParseBoolError) }
+        }
+    }
+    impl crate::str::FromStr for char {
+        type Err = ParseCharError;
+        fn from_str(s: &str) -> Result<char, ParseCharError> {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Ok(c),
+                _ => Err(ParseCharError),
+            }
+        }
+    }
+    impl crate::str::FromStr for String {
+        type Err = crate::convert::Infallible;
+        fn from_str(s: &str) -> Result<String, crate::convert::Infallible> { Ok(s.to_string()) }
+    }
+""" + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:])
+              for kind in sorted(INTEGER_TYPES)) + "".join(
+    FLOAT_METHODS.replace("{T}", kind).replace("{B}", "u" + kind[1:]) for kind in sorted(FLOAT_TYPES)) + "}\n"
+STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8") + SCALAR_STD
 ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
 INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
+PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -2375,6 +2559,8 @@ class Program:
             if trait in {"Copy", "Default"}:
                 return False
         if isinstance(annotation, FunctionType):
+            if trait in self.traits and trait not in TRAIT_MODULES:
+                return self.implementation(annotation, trait, seen) is not None
             if trait in CALLABLE_TRAITS:
                 if not annotation.closure or trait == "FnOnce":
                     return True
@@ -2581,6 +2767,10 @@ class Parser:
         if signature is None and self.lifetime_scope:
             signature = self.lifetime_scope
         token = self.advance()
+        if token.text == "&&":
+            self.lookahead.appendleft(self.current)
+            self.current = replace(token, text="&", column=token.column + 1)
+            token = replace(token, text="&")
         if token.text == "_":
             return None
         if token.text == "fn":
@@ -5098,6 +5288,8 @@ class Checker:
                     isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
                 raise impl.token.error("inherent impl requires a declared struct or enum")
             for previous in self.program.impls[:index]:
+                if impl.token.module[:1] == STD_ROOT:
+                    break
                 if previous.trait == impl.trait and overlapping_types(previous.target, impl.target):
                     if impl.trait or previous.methods.keys() & impl.methods.keys():
                         raise impl.token.error("conflicting implementations")
@@ -6178,6 +6370,17 @@ class Checker:
                 or (expected.mutable and not actual.mutable)):
             return actual
         target = expected.inner
+        inner = self.resolve(actual.inner)
+        if isinstance(inner, ReferenceType) and not isinstance(self.resolve(target), (ReferenceType, TypeVariable)):
+            # Deref coercion: &&T becomes &T by reading through the outer reference.
+            original = replace(expr)
+            for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
+                if id(expr) in table:
+                    table[id(original)] = table.pop(id(expr))
+            self.program.expr_types[id(original)] = actual
+            expr.kind, expr.args, expr.label = "deref", (original, False), None
+            self.program.expr_types[id(expr)] = inner
+            return self.coerce_reference(expr, inner, expected)
         if target == "str" and actual.inner == STRING and not expected.mutable:
             conversion = "string_reference"
         elif isinstance(target, SliceType) and (isinstance(actual.inner, ArrayType) or is_vector(actual.inner)):
@@ -6716,6 +6919,12 @@ class Checker:
             if token.text == "=":
                 self.require(actual, annotation, token)
             else:
+                if operator != "+" or annotation != STRING:
+                    while isinstance(actual, ReferenceType) and self.numeric_like(actual.inner):
+                        right = Expr("deref", right.token, (right, False))
+                        self.program.expr_types[id(right)] = self.resolve(actual.inner)
+                        expr.args = (expr.args[0], right)
+                        actual = self.resolve(actual.inner)
                 self.binary_type(replace(token, text=operator), annotation, actual)
             return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
@@ -7043,6 +7252,8 @@ class Checker:
                 signature = callable_signature(parameter)
                 if signature is not None:
                     self.require_callable(owner, substitute(signature, arguments), token)
+                elif PATTERN in parameter.bounds and isinstance(self.resolve(owner), TypeVariable):
+                    self.callable_hints[self.resolve(owner)] = FunctionType(("char",), "bool")
         actual_types = []
         for index, (expr_arg, parameter) in enumerate(zip(args, params)):
             hint = self.resolve(parameter)
@@ -7542,9 +7753,13 @@ class Checker:
         return self.function_call(expr, scope, expected, method, arguments, actual)
 
     def associated_type(self, expr, scope, expected):
-        owner, separator, name = expr.token.text.partition("::")
+        owner, separator, name = expr.token.text.rpartition("::")
         if not separator:
-            raise expr.token.error(f"unknown function {owner!r}")
+            raise expr.token.error(f"unknown function {name!r}")
+        if owner in self.parameters and isinstance(self.parameters[owner], TypeParameter):
+            return self.call_on_type(expr, scope, expected, self.parameters[owner], name)
+        if owner in PRIMITIVES or owner == "str":
+            return self.call_on_type(expr, scope, expected, owner, name)
         trait = self.program.traits.get(owner)
         if trait and name in trait.methods:
             actual = None
@@ -9219,6 +9434,12 @@ class Interpreter:
             values = self.mapped_items(values, iterator.mappers)
         return values
 
+    def receiver_width(self):
+        receiver = self.intrinsic_receiver
+        if isinstance(receiver, ReferenceType):
+            receiver = receiver.inner
+        return INTEGER_WIDTHS[receiver]
+
     def builtin_compare(self, name, left, right, result):
         if name == "eq":
             return self.equal(left, right)
@@ -9437,6 +9658,7 @@ class Interpreter:
                 result = self.program.normalize(substitute(function.result, self.type_arguments))
                 self.intrinsic_types = [self.type_arguments.get(parameter) for parameter in function.type_parameters]
                 key = "." + name.rsplit(":", 1)[-1] if name.startswith("@") else name.rsplit(MODULE_SEPARATOR, 1)[-1]
+                self.intrinsic_receiver = function.params[0][2] if function.params else None
                 return INTRINSICS[key](self, result, *values)
             finally:
                 self.type_arguments = previous
@@ -10858,6 +11080,786 @@ def rust_iter_collect(interpreter, result, iterator):
 @intrinsic
 def rust_lazy_next(interpreter, result, address):
     return interpreter.iterator_next(address, result)
+
+
+def make_tuple(interpreter, annotation, *values):
+    return Value(interpreter.program.layout(annotation)[1][0], values)
+
+
+def byte_offset(text, index):
+    return len(text[:index].encode("utf-8"))
+
+
+def lines_of(text):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
+@intrinsic
+def method_char_indices(interpreter, result, text):
+    value = text_of(text)
+    pair = element_type(result)
+    return lazy(make_tuple(interpreter, pair, byte_offset(value, index), Character(char))
+                for index, char in enumerate(value))
+
+
+@intrinsic
+def method_rsplit(interpreter, result, text, pattern):
+    return lazy(map(shared, reversed(interpreter.split_text(text_of(text), pattern))))
+
+
+@intrinsic
+def method_splitn(interpreter, result, text, count, pattern):
+    if count == 0:
+        return lazy(())
+    return lazy(map(shared, interpreter.split_text(text_of(text), pattern, count)))
+
+
+@intrinsic
+def method_rsplitn(interpreter, result, text, count, pattern):
+    remaining = text_of(text)
+    if count == 0:
+        return lazy(())
+    pieces = []
+    while len(pieces) < count - 1:
+        found = interpreter.find_pattern(remaining, pattern, reverse=True)
+        if found is None:
+            break
+        pieces.append(remaining[found[1]:])
+        remaining = remaining[:found[0]]
+    pieces.append(remaining)
+    return lazy(map(shared, pieces))
+
+
+@intrinsic
+def method_split_terminator(interpreter, result, text, pattern):
+    parts = interpreter.split_text(text_of(text), pattern)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return lazy(map(shared, parts))
+
+
+@intrinsic
+def method_split_inclusive(interpreter, result, text, pattern):
+    value = text_of(text)
+    parts, start = [], 0
+    while start < len(value):
+        found = interpreter.pattern_matcher(pattern)(value, start)
+        if found is None:
+            break
+        stop = max(found[1], found[0] + 1)
+        parts.append(value[start:stop])
+        start = stop
+    if start < len(value):
+        parts.append(value[start:])
+    return lazy(map(shared, parts))
+
+
+@intrinsic
+def method_split_whitespace(interpreter, result, text):
+    return lazy(map(shared, text_of(text).split()))
+
+
+INTRINSICS[".split_ascii_whitespace"] = method_split_whitespace
+
+
+@intrinsic
+def method_lines(interpreter, result, text):
+    return lazy(map(shared, lines_of(text_of(text))))
+
+
+@intrinsic
+def method_split_once(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern)
+    if found is None:
+        return option(interpreter, result)
+    return option(interpreter, result, make_tuple(interpreter, element_type(result),
+                                                  shared(value[:found[0]]), shared(value[found[1]:])))
+
+
+@intrinsic
+def method_rsplit_once(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern, reverse=True)
+    if found is None:
+        return option(interpreter, result)
+    return option(interpreter, result, make_tuple(interpreter, element_type(result),
+                                                  shared(value[:found[0]]), shared(value[found[1]:])))
+
+
+@intrinsic
+def method_trim(interpreter, result, text):
+    return shared(text_of(text).strip())
+
+
+@intrinsic
+def method_trim_start(interpreter, result, text):
+    return shared(text_of(text).lstrip())
+
+
+@intrinsic
+def method_trim_end(interpreter, result, text):
+    return shared(text_of(text).rstrip())
+
+
+INTRINSICS[".trim_left"] = method_trim_start
+INTRINSICS[".trim_right"] = method_trim_end
+
+
+def trim_pattern(interpreter, value, pattern, start, end):
+    if start:
+        while value:
+            found = interpreter.find_pattern(value, pattern, anchored="start")
+            if found is None or found[1] == 0:
+                break
+            value = value[found[1]:]
+    if end:
+        while value:
+            found = interpreter.find_pattern(value, pattern, anchored="end")
+            if found is None or found[0] == len(value):
+                break
+            value = value[:found[0]]
+    return shared(value)
+
+
+@intrinsic
+def method_trim_matches(interpreter, result, text, pattern):
+    return trim_pattern(interpreter, text_of(text), pattern, True, True)
+
+
+@intrinsic
+def method_trim_start_matches(interpreter, result, text, pattern):
+    return trim_pattern(interpreter, text_of(text), pattern, True, False)
+
+
+@intrinsic
+def method_trim_end_matches(interpreter, result, text, pattern):
+    return trim_pattern(interpreter, text_of(text), pattern, False, True)
+
+
+@intrinsic
+def method_strip_prefix(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern, anchored="start")
+    return option(interpreter, result, shared(value[found[1]:])) if found else option(interpreter, result)
+
+
+@intrinsic
+def method_strip_suffix(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern, anchored="end")
+    return option(interpreter, result, shared(value[:found[0]])) if found else option(interpreter, result)
+
+
+@intrinsic
+def method_find(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern)
+    return option(interpreter, result, byte_offset(value, found[0])) if found else option(interpreter, result)
+
+
+@intrinsic
+def method_rfind(interpreter, result, text, pattern):
+    value = text_of(text)
+    found = interpreter.find_pattern(value, pattern, reverse=True)
+    return option(interpreter, result, byte_offset(value, found[0])) if found else option(interpreter, result)
+
+
+def all_matches(interpreter, value, pattern):
+    find = interpreter.pattern_matcher(pattern)
+    start = 0
+    while start <= len(value):
+        found = find(value, start)
+        if found is None:
+            return
+        yield found
+        start = found[1] if found[1] > found[0] else found[0] + 1
+
+
+@intrinsic
+def method_matches(interpreter, result, text, pattern):
+    value = text_of(text)
+    return lazy(shared(value[a:b]) for a, b in all_matches(interpreter, value, pattern))
+
+
+@intrinsic
+def method_rmatches(interpreter, result, text, pattern):
+    value = text_of(text)
+    return lazy(shared(value[a:b]) for a, b in reversed(list(all_matches(interpreter, value, pattern))))
+
+
+@intrinsic
+def method_match_indices(interpreter, result, text, pattern):
+    value = text_of(text)
+    pair = element_type(result)
+    return lazy(make_tuple(interpreter, pair, byte_offset(value, a), shared(value[a:b]))
+                for a, b in all_matches(interpreter, value, pattern))
+
+
+@intrinsic
+def method_replace(interpreter, result, text, pattern, replacement, count=None):
+    value = text_of(text)
+    output, start, done = [], 0, 0
+    for a, b in all_matches(interpreter, value, pattern):
+        if count is not None and done >= count:
+            break
+        output.append(value[start:a])
+        output.append(text_of(replacement))
+        start = b
+        done += 1
+    output.append(value[start:])
+    return "".join(output)
+
+
+@intrinsic
+def method_replacen(interpreter, result, text, pattern, replacement, count):
+    return method_replace(interpreter, result, text, pattern, replacement, count)
+
+
+ASCII_UPPER = str.maketrans(string.ascii_lowercase, string.ascii_uppercase)
+ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+@intrinsic
+def method_to_uppercase(interpreter, result, text):
+    value = text_of(text)
+    if isinstance(value, Character):
+        return lazy(map(Character, value.upper()))
+    return value.upper()
+
+
+@intrinsic
+def method_to_lowercase(interpreter, result, text):
+    value = text_of(text)
+    if isinstance(value, Character):
+        return lazy(map(Character, value.lower()))
+    return value.lower()
+
+
+@intrinsic
+def method_to_ascii_uppercase(interpreter, result, text):
+    value = text_of(text)
+    converted = value.translate(ASCII_UPPER)
+    return Character(converted) if isinstance(value, Character) else converted
+
+
+@intrinsic
+def method_to_ascii_lowercase(interpreter, result, text):
+    value = text_of(text)
+    converted = value.translate(ASCII_LOWER)
+    return Character(converted) if isinstance(value, Character) else converted
+
+
+@intrinsic
+def method_make_ascii_uppercase(interpreter, result, address):
+    address.write(Character(address.read().translate(ASCII_UPPER)))
+
+
+@intrinsic
+def method_make_ascii_lowercase(interpreter, result, address):
+    address.write(Character(address.read().translate(ASCII_LOWER)))
+
+
+@intrinsic
+def method_is_char_boundary(interpreter, result, text, index):
+    data = text_of(text).encode()
+    return index == len(data) or (index < len(data) and data[index] & 0xC0 != 0x80)
+
+
+@intrinsic
+def method_as_bytes(interpreter, result, text):
+    return shared(ArrayValue(tuple(text_of(text).encode())))
+
+
+@intrinsic
+def method_into_bytes(interpreter, result, text):
+    return ArrayValue(tuple(text_of(text).encode()))
+
+
+@intrinsic
+def method_eq_ignore_ascii_case(interpreter, result, text, other):
+    return text_of(text).translate(ASCII_LOWER) == text_of(other).translate(ASCII_LOWER)
+
+
+@intrinsic
+def method_is_ascii(interpreter, result, text):
+    return text_of(text).isascii()
+
+
+@intrinsic
+def method_escape_default(interpreter, result, text):
+    return display(text_of(text), True)[1:-1]
+
+
+INTRINSICS[".escape_debug"] = method_escape_default
+
+
+@intrinsic
+def method_from_utf8(interpreter, result, data):
+    raw = bytes(items_of(data))
+    try:
+        return interpreter.variant(result, "Ok", raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        error = result.arguments[1]
+        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (data,)))
+
+
+@intrinsic
+def method_from_utf8_lossy(interpreter, result, data):
+    return bytes(items_of(data)).decode("utf-8", errors="replace")
+
+
+@intrinsic
+def method_replace_range(interpreter, result, address, bounds, replacement):
+    data = address.read().encode()
+    start, stop = interpreter.range_bounds(bounds, len(data))
+    if start is None:
+        raise RustPanic("range out of bounds")
+    address.write((data[:start] + text_of(replacement).encode() + data[stop:]).decode())
+
+
+def char_predicate(test):
+    def body(interpreter, result, value):
+        return test(text_of(value))
+    return body
+
+
+RUST_WHITESPACE = set("\t\n\x0b\x0c\r \x85\xa0          "
+                      "      　")
+for _name, _test in {
+    "is_alphabetic": str.isalpha, "is_numeric": lambda c: unicodedata.category(c) in {"Nd", "Nl", "No"},
+    "is_alphanumeric": lambda c: c.isalpha() or unicodedata.category(c) in {"Nd", "Nl", "No"},
+    "is_whitespace": lambda c: c in RUST_WHITESPACE, "is_uppercase": str.isupper, "is_lowercase": str.islower,
+    "is_control": lambda c: unicodedata.category(c) == "Cc",
+    "is_ascii_digit": lambda c: "0" <= c <= "9", "is_ascii_hexdigit": lambda c: c in string.hexdigits,
+    "is_ascii_alphabetic": lambda c: c.isascii() and c.isalpha(),
+    "is_ascii_alphanumeric": lambda c: c.isascii() and c.isalnum(),
+    "is_ascii_uppercase": lambda c: "A" <= c <= "Z", "is_ascii_lowercase": lambda c: "a" <= c <= "z",
+    "is_ascii_punctuation": lambda c: c in string.punctuation,
+    "is_ascii_whitespace": lambda c: c in " \t\n\x0c\r", "is_ascii_graphic": lambda c: "!" <= c <= "~",
+    "is_ascii_control": lambda c: c.isascii() and unicodedata.category(c) == "Cc",
+}.items():
+    INTRINSICS["." + _name] = char_predicate(_test)
+
+
+@intrinsic
+def method_to_digit(interpreter, result, value, radix):
+    char = text_of(value)
+    digit = int(char, 36) if char.isascii() and char.isalnum() else None
+    if digit is None or digit >= radix:
+        return option(interpreter, result)
+    return option(interpreter, result, digit)
+
+
+@intrinsic
+def method_is_digit(interpreter, result, value, radix):
+    char = text_of(value)
+    return char.isascii() and char.isalnum() and int(char, 36) < radix
+
+
+@intrinsic
+def method_len_utf8(interpreter, result, value):
+    return len(text_of(value).encode())
+
+
+@intrinsic
+def method_from_u32(interpreter, result, code):
+    if code >= CHAR_LIMIT or code in SURROGATES:
+        return option(interpreter, result)
+    return option(interpreter, result, Character(chr(code)))
+
+
+@intrinsic
+def method_from_digit(interpreter, result, number, radix):
+    if radix > 36:
+        raise RustPanic("from_digit: radix is too high (maximum 36)")
+    if number >= radix:
+        return option(interpreter, result)
+    return option(interpreter, result, Character("0123456789abcdefghijklmnopqrstuvwxyz"[number]))
+
+
+def integer_result(value, annotation, operation="multiply"):
+    low, high = INTEGER_BOUNDS[annotation]
+    if not low <= value < high:
+        raise RustPanic(f"attempt to {operation} with overflow")
+    return value
+
+
+def wrap(value, annotation):
+    return truncate_integer(value, annotation)
+
+
+@intrinsic
+def method_pow(interpreter, result, base, exponent):
+    return integer_result(base ** exponent, result)
+
+
+@intrinsic
+def method_abs(interpreter, result, value):
+    if isinstance(value, float):
+        return rounded_float(abs(value), result)
+    return integer_result(abs(value), result, "negate")
+
+
+@intrinsic
+def method_signum(interpreter, result, value):
+    if isinstance(value, float):
+        return value if math.isnan(value) else rounded_float(math.copysign(1.0, value), result)
+    return (value > 0) - (value < 0)
+
+
+def checked_operation(operation):
+    def body(interpreter, result, left, right=None):
+        kind = element_type(result)
+        try:
+            value = operation(left, right)
+        except ZeroDivisionError:
+            return option(interpreter, result)
+        low, high = INTEGER_BOUNDS[kind]
+        return option(interpreter, result, value) if value is not None and low <= value < high else option(interpreter, result)
+    return body
+
+
+def rust_div(left, right):
+    if right == 0:
+        raise ZeroDivisionError
+    quotient = abs(left) // abs(right)
+    return quotient if (left >= 0) == (right >= 0) else -quotient
+
+
+def rust_rem(left, right):
+    return left - right * rust_div(left, right)
+
+
+for _name, _operation in {
+    "add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b,
+    "div": rust_div, "rem": rust_rem, "pow": lambda a, b: a ** b, "neg": lambda a, b: -a, "abs": lambda a, b: abs(a),
+}.items():
+    INTRINSICS[f".checked_{_name}"] = checked_operation(_operation)
+    INTRINSICS[f".wrapping_{_name}"] = (lambda operation: lambda interpreter, result, left, right=None:
+                                        wrap(operation(left, right), result))(_operation)
+    INTRINSICS[f".saturating_{_name}"] = (lambda operation: lambda interpreter, result, left, right=None:
+                                          min(max(operation(left, right), INTEGER_BOUNDS[result][0]),
+                                              INTEGER_BOUNDS[result][1] - 1))(_operation)
+    INTRINSICS[f".overflowing_{_name}"] = (lambda operation: lambda interpreter, result, left, right=None: make_tuple(
+        interpreter, result, wrap(operation(left, right), result.elements[0]),
+        not INTEGER_BOUNDS[result.elements[0]][0] <= operation(left, right) < INTEGER_BOUNDS[result.elements[0]][1]
+    ))(_operation)
+
+
+@intrinsic
+def method_rem_euclid(interpreter, result, left, right):
+    if isinstance(left, float):
+        value = math.fmod(left, right)
+        return rounded_float(value + abs(right) if value < 0 else value, result)
+    if right == 0:
+        raise RustPanic("attempt to calculate the remainder with a divisor of zero")
+    return left % abs(right)
+
+
+@intrinsic
+def method_div_euclid(interpreter, result, left, right):
+    if isinstance(left, float):
+        quotient = math.trunc(left / right)
+        if math.fmod(left, right) < 0:
+            quotient = quotient - 1 if right > 0 else quotient + 1
+        return rounded_float(float(quotient), result)
+    if right == 0:
+        raise RustPanic("attempt to divide by zero")
+    remainder = left % abs(right)
+    return integer_result((left - remainder) // right, result, "divide")
+
+
+@intrinsic
+def method_abs_diff(interpreter, result, left, right):
+    return abs(left - right)
+
+
+@intrinsic
+def method_unsigned_abs(interpreter, result, value):
+    return abs(value)
+
+
+def unsigned_bits(value, width):
+    return value % (1 << width)
+
+
+@intrinsic
+def method_count_ones(interpreter, result, value):
+    return bin(unsigned_bits(value, interpreter.receiver_width())).count("1")
+
+
+@intrinsic
+def method_count_zeros(interpreter, result, value):
+    width = interpreter.receiver_width()
+    return width - bin(unsigned_bits(value, width)).count("1")
+
+
+@intrinsic
+def method_leading_zeros(interpreter, result, value):
+    width = interpreter.receiver_width()
+    return width - unsigned_bits(value, width).bit_length()
+
+
+@intrinsic
+def method_trailing_zeros(interpreter, result, value):
+    width = interpreter.receiver_width()
+    bits = unsigned_bits(value, width)
+    return width if bits == 0 else (bits & -bits).bit_length() - 1
+
+
+@intrinsic
+def method_leading_ones(interpreter, result, value):
+    width = interpreter.receiver_width()
+    bits = unsigned_bits(value, width)
+    return width - unsigned_bits(~bits, width).bit_length()
+
+
+@intrinsic
+def method_trailing_ones(interpreter, result, value):
+    width = interpreter.receiver_width()
+    bits = unsigned_bits(value, width)
+    return ((bits ^ (bits + 1)).bit_length() - 1) if bits != (1 << width) - 1 else width
+
+
+@intrinsic
+def method_rotate_left(interpreter, result, value, amount):
+    width = INTEGER_WIDTHS[result]
+    bits, amount = unsigned_bits(value, width), amount % width
+    return wrap(((bits << amount) | (bits >> (width - amount))) & ((1 << width) - 1), result)
+
+
+@intrinsic
+def method_rotate_right(interpreter, result, value, amount):
+    width = INTEGER_WIDTHS[result]
+    bits, amount = unsigned_bits(value, width), amount % width
+    return wrap(((bits >> amount) | (bits << (width - amount))) & ((1 << width) - 1), result)
+
+
+@intrinsic
+def method_swap_bytes(interpreter, result, value):
+    width = INTEGER_WIDTHS[result]
+    return wrap(int.from_bytes(unsigned_bits(value, width).to_bytes(width // 8, "big"), "little"), result)
+
+
+@intrinsic
+def method_reverse_bits(interpreter, result, value):
+    width = INTEGER_WIDTHS[result]
+    return wrap(int(format(unsigned_bits(value, width), f"0{width}b")[::-1], 2), result)
+
+
+@intrinsic
+def method_is_power_of_two(interpreter, result, value):
+    return value > 0 and value & (value - 1) == 0
+
+
+@intrinsic
+def method_next_power_of_two(interpreter, result, value):
+    return integer_result(1 if value <= 1 else 1 << (value - 1).bit_length(), result)
+
+
+@intrinsic
+def method_isqrt(interpreter, result, value):
+    if value < 0:
+        raise RustPanic("argument of integer square root cannot be negative")
+    return math.isqrt(value)
+
+
+@intrinsic
+def method_ilog2(interpreter, result, value):
+    if value <= 0:
+        raise RustPanic("argument of integer logarithm must be positive")
+    return value.bit_length() - 1
+
+
+@intrinsic
+def method_ilog10(interpreter, result, value):
+    if value <= 0:
+        raise RustPanic("argument of integer logarithm must be positive")
+    return len(str(value)) - 1
+
+
+@intrinsic
+def method_ilog(interpreter, result, value, base):
+    if value <= 0 or base < 2:
+        raise RustPanic("argument of integer logarithm must be positive")
+    count = 0
+    while value >= base:
+        value //= base
+        count += 1
+    return count
+
+
+@intrinsic
+def method_midpoint(interpreter, result, left, right):
+    if isinstance(left, float):
+        return rounded_float((left + right) / 2, result)
+    return (left + right) // 2
+
+
+@intrinsic
+def method_to_be_bytes(interpreter, result, value):
+    width = interpreter.receiver_width()
+    return ArrayValue(tuple(unsigned_bits(value, width).to_bytes(width // 8, "big")))
+
+
+@intrinsic
+def method_to_le_bytes(interpreter, result, value):
+    width = interpreter.receiver_width()
+    return ArrayValue(tuple(unsigned_bits(value, width).to_bytes(width // 8, "little")))
+
+
+def parse_error(interpreter, result, kind):
+    error = result.arguments[1]
+    kinds = MODULE_SEPARATOR.join(("std", "num", "IntErrorKind"))
+    variant = next(ctor for ctor in interpreter.program.layout(kinds)[1] if ctor.path.endswith(f"::{kind}"))
+    return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (Value(variant, ()),)))
+
+
+def parse_integer(interpreter, result, text, radix=10):
+    kind = result.arguments[0]
+    value = text_of(text)
+    if not value:
+        return parse_error(interpreter, result, "Empty")
+    sign = 1
+    digits = value
+    if value[0] in "+-":
+        if value[0] == "-":
+            if INTEGER_BOUNDS[kind][0] == 0:
+                return parse_error(interpreter, result, "InvalidDigit")
+            sign = -1
+        digits = value[1:]
+        if not digits:
+            return parse_error(interpreter, result, "InvalidDigit")
+    number = 0
+    for char in digits:
+        if not (char.isascii() and char.isalnum()) or int(char, 36) >= radix:
+            return parse_error(interpreter, result, "InvalidDigit")
+        number = number * radix + int(char, 36)
+    number *= sign
+    low, high = INTEGER_BOUNDS[kind]
+    if number >= high:
+        return parse_error(interpreter, result, "PosOverflow")
+    if number < low:
+        return parse_error(interpreter, result, "NegOverflow")
+    return interpreter.variant(result, "Ok", number)
+
+
+@intrinsic
+def rust_parse_int(interpreter, result, text):
+    return parse_integer(interpreter, result, text)
+
+
+@intrinsic
+def method_from_str_radix(interpreter, result, text, radix):
+    return parse_integer(interpreter, result, text, radix)
+
+
+FLOAT_SYNTAX = re.compile(r"[+-]?(?:inf|infinity|nan|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)",
+                          re.IGNORECASE)
+
+
+@intrinsic
+def rust_parse_float(interpreter, result, text):
+    kind = result.arguments[0]
+    value = text_of(text)
+    if not FLOAT_SYNTAX.fullmatch(value):
+        error = result.arguments[1]
+        return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], (not value,)))
+    return interpreter.variant(result, "Ok", rounded_float(float(value), kind))
+
+
+def float_function(function):
+    def body(interpreter, result, value, *rest):
+        output = function(value, *rest)
+        if isinstance(output, tuple):
+            return make_tuple(interpreter, result, *(rounded_float(item, result.elements[0]) for item in output))
+        return rounded_float(output, result) if isinstance(output, float) else output
+    return body
+
+
+def rust_round(value):
+    if not math.isfinite(value):
+        return value
+    whole = math.floor(abs(value))
+    if abs(value) - whole >= 0.5:
+        whole += 1
+    return math.copysign(float(whole), value)
+
+
+def safe(function):
+    def body(*arguments):
+        try:
+            return function(*arguments)
+        except (ValueError, OverflowError):
+            return math.nan
+    return body
+
+
+def float_extreme(pick):
+    def body(left, right):
+        if math.isnan(left):
+            return right
+        if math.isnan(right):
+            return left
+        return pick(left, right)
+    return body
+
+
+for _name, _function in {
+    "floor": lambda x: float(math.floor(x)) if math.isfinite(x) else x,
+    "ceil": lambda x: float(math.ceil(x)) if math.isfinite(x) else x,
+    "round": rust_round, "round_ties_even": lambda x: float(round(x)) if math.isfinite(x) else x,
+    "trunc": lambda x: float(math.trunc(x)) if math.isfinite(x) else x,
+    "fract": lambda x: x - math.trunc(x) if math.isfinite(x) else math.nan,
+    "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x) if math.isfinite(x) else x,
+    "powi": safe(lambda x, n: math.pow(x, n)), "powf": safe(math.pow), "exp": safe(math.exp),
+    "exp2": safe(lambda x: math.pow(2.0, x)), "exp_m1": safe(math.expm1),
+    "ln": lambda x: -math.inf if x == 0 else math.nan if x < 0 else math.log(x),
+    "ln_1p": safe(math.log1p),
+    "log": lambda x, b: math.nan if x < 0 else -math.inf if x == 0 else math.log(x) / math.log(b),
+    "log10": lambda x: -math.inf if x == 0 else math.nan if x < 0 else math.log10(x),
+    "log2": lambda x: -math.inf if x == 0 else math.nan if x < 0 else math.log2(x),
+    "sin": safe(math.sin), "cos": safe(math.cos), "tan": safe(math.tan), "asin": safe(math.asin),
+    "acos": safe(math.acos), "atan": math.atan, "atan2": math.atan2, "sinh": safe(math.sinh),
+    "cosh": safe(math.cosh), "tanh": math.tanh, "sin_cos": lambda x: (math.sin(x), math.cos(x)),
+    "hypot": math.hypot, "to_degrees": math.degrees, "to_radians": math.radians,
+    "max": float_extreme(max), "min": float_extreme(min),
+    "clamp": lambda x, low, high: min(max(x, low), high) if not math.isnan(x) else x,
+    "mul_add": lambda x, a, b: x * a + b, "recip": lambda x: 1 / x if x else math.copysign(math.inf, x),
+    "copysign": math.copysign, "abs_sub": lambda x, y: max(x - y, 0.0),
+    "is_sign_positive": lambda x: math.copysign(1, x) > 0, "is_sign_negative": lambda x: math.copysign(1, x) < 0,
+    "is_normal": lambda x: math.isfinite(x) and x != 0 and abs(x) >= 2.2250738585072014e-308,
+}.items():
+    INTRINSICS["." + _name] = float_function(_function)
+
+
+@intrinsic
+def method_total_cmp(interpreter, result, left, right):
+    def key(value):
+        bits = struct.unpack("<q", struct.pack("<d", value))[0]
+        return bits ^ ((1 << 63) - 1) if bits < 0 else bits
+    a, b = key(text_of(left)), key(text_of(right))
+    order = (a > b) - (a < b)
+    name = "Less" if order < 0 else "Greater" if order > 0 else "Equal"
+    return Value(next(ctor for ctor in interpreter.program.layout(ORDERING)[1] if ctor.path.endswith(f"::{name}")), ())
+
+
+@intrinsic
+def method_to_bits(interpreter, result, value):
+    if result == "u32":
+        return struct.unpack("<I", struct.pack("<f", value))[0]
+    return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+@intrinsic
+def method_from_bits(interpreter, result, bits):
+    if result == "f32":
+        return Float32(struct.unpack("<f", struct.pack("<I", bits))[0])
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):

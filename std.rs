@@ -30,6 +30,8 @@ pub mod intrinsics {
     pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
+    pub fn parse_int<T>(text: &str) -> Result<T, crate::num::ParseIntError>;
+    pub fn parse_float<T>(text: &str) -> Result<T, crate::num::ParseFloatError>;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
 }
 
@@ -1024,4 +1026,179 @@ pub mod ops {
 }
 
 pub mod hash {
+}
+
+pub mod str {
+    use crate::iter::Lazy;
+
+    pub trait Pattern {}
+    impl Pattern for char {}
+    impl Pattern for &str {}
+    impl Pattern for &&str {}
+    impl Pattern for &String {}
+    impl Pattern for &[char] {}
+    impl<const N: usize> Pattern for [char; N] {}
+    impl<const N: usize> Pattern for &[char; N] {}
+    impl<F: FnMut(char) -> bool> Pattern for F {}
+
+    pub trait FromStr: Sized {
+        type Err;
+        fn from_str(s: &str) -> Result<Self, Self::Err>;
+    }
+
+    impl str {
+        pub fn char_indices(&self) -> Lazy<(usize, char)>;
+        pub fn split<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn rsplit<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn splitn<P: Pattern>(&self, n: usize, pat: P) -> Lazy<&str>;
+        pub fn rsplitn<P: Pattern>(&self, n: usize, pat: P) -> Lazy<&str>;
+        pub fn split_terminator<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn split_inclusive<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn split_whitespace(&self) -> Lazy<&str>;
+        pub fn split_ascii_whitespace(&self) -> Lazy<&str>;
+        pub fn lines(&self) -> Lazy<&str>;
+        pub fn split_once<P: Pattern>(&self, delimiter: P) -> Option<(&str, &str)>;
+        pub fn rsplit_once<P: Pattern>(&self, delimiter: P) -> Option<(&str, &str)>;
+        pub fn split_at(&self, mid: usize) -> (&str, &str);
+        pub fn trim(&self) -> &str;
+        pub fn trim_start(&self) -> &str;
+        pub fn trim_end(&self) -> &str;
+        pub fn trim_left(&self) -> &str;
+        pub fn trim_right(&self) -> &str;
+        pub fn trim_matches<P: Pattern>(&self, pat: P) -> &str;
+        pub fn trim_start_matches<P: Pattern>(&self, pat: P) -> &str;
+        pub fn trim_end_matches<P: Pattern>(&self, pat: P) -> &str;
+        pub fn strip_prefix<P: Pattern>(&self, prefix: P) -> Option<&str>;
+        pub fn strip_suffix<P: Pattern>(&self, suffix: P) -> Option<&str>;
+        pub fn contains<P: Pattern>(&self, pat: P) -> bool;
+        pub fn starts_with<P: Pattern>(&self, pat: P) -> bool;
+        pub fn ends_with<P: Pattern>(&self, pat: P) -> bool;
+        pub fn find<P: Pattern>(&self, pat: P) -> Option<usize>;
+        pub fn rfind<P: Pattern>(&self, pat: P) -> Option<usize>;
+        pub fn matches<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn rmatches<P: Pattern>(&self, pat: P) -> Lazy<&str>;
+        pub fn match_indices<P: Pattern>(&self, pat: P) -> Lazy<(usize, &str)>;
+        pub fn replace<P: Pattern>(&self, from: P, to: &str) -> String;
+        pub fn replacen<P: Pattern>(&self, from: P, to: &str, count: usize) -> String;
+        pub fn to_uppercase(&self) -> String;
+        pub fn to_lowercase(&self) -> String;
+        pub fn to_ascii_uppercase(&self) -> String;
+        pub fn to_ascii_lowercase(&self) -> String;
+        pub fn repeat(&self, n: usize) -> String;
+        pub fn get<R: crate::ops::RangeBounds>(&self, range: R) -> Option<&str>;
+        pub fn is_char_boundary(&self, index: usize) -> bool;
+        pub fn as_bytes(&self) -> &[u8];
+        pub fn eq_ignore_ascii_case(&self, other: &str) -> bool;
+        pub fn is_ascii(&self) -> bool;
+        pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> { F::from_str(self) }
+        pub fn escape_default(&self) -> String;
+        pub fn escape_debug(&self) -> String;
+    }
+}
+
+pub mod string {
+    use crate::iter::Lazy;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FromUtf8Error { bytes: Vec<u8> }
+    impl FromUtf8Error {
+        pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+    }
+    impl crate::fmt::Display for FromUtf8Error {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "invalid utf-8 sequence") }
+    }
+
+    pub trait ToString {
+        fn to_string(&self) -> String;
+    }
+
+    impl String {
+        pub fn with_capacity(capacity: usize) -> String { String::new() }
+        pub fn capacity(&self) -> usize { self.len() }
+        pub fn reserve(&mut self, additional: usize) {}
+        pub fn shrink_to_fit(&mut self) {}
+        pub fn insert(&mut self, idx: usize, ch: char);
+        pub fn insert_str(&mut self, idx: usize, string: &str);
+        pub fn remove(&mut self, idx: usize) -> char;
+        pub fn retain<F: FnMut(char) -> bool>(&mut self, f: F);
+        pub fn split_off(&mut self, at: usize) -> String;
+        pub fn drain<R: crate::ops::RangeBounds>(&mut self, range: R) -> Lazy<char>;
+        pub fn extend<I: IntoIterator>(&mut self, iter: I);
+        pub fn into_bytes(self) -> Vec<u8>;
+        pub fn from_utf8(vec: Vec<u8>) -> Result<String, FromUtf8Error>;
+        pub fn from_utf8_lossy(v: &[u8]) -> String;
+        pub fn replace_range<R: crate::ops::RangeBounds>(&mut self, range: R, replace_with: &str);
+        pub fn into_boxed_str(self) -> String { self }
+    }
+}
+
+pub mod char {
+    impl char {
+        pub fn is_alphabetic(self) -> bool;
+        pub fn is_numeric(self) -> bool;
+        pub fn is_alphanumeric(self) -> bool;
+        pub fn is_whitespace(self) -> bool;
+        pub fn is_uppercase(self) -> bool;
+        pub fn is_lowercase(self) -> bool;
+        pub fn is_control(self) -> bool;
+        pub fn is_ascii(&self) -> bool;
+        pub fn is_ascii_digit(&self) -> bool;
+        pub fn is_ascii_hexdigit(&self) -> bool;
+        pub fn is_ascii_alphabetic(&self) -> bool;
+        pub fn is_ascii_alphanumeric(&self) -> bool;
+        pub fn is_ascii_uppercase(&self) -> bool;
+        pub fn is_ascii_lowercase(&self) -> bool;
+        pub fn is_ascii_punctuation(&self) -> bool;
+        pub fn is_ascii_whitespace(&self) -> bool;
+        pub fn is_ascii_graphic(&self) -> bool;
+        pub fn is_ascii_control(&self) -> bool;
+        pub fn is_digit(self, radix: u32) -> bool;
+        pub fn to_digit(self, radix: u32) -> Option<u32>;
+        pub fn to_ascii_uppercase(&self) -> char;
+        pub fn to_ascii_lowercase(&self) -> char;
+        pub fn make_ascii_uppercase(&mut self);
+        pub fn make_ascii_lowercase(&mut self);
+        pub fn to_uppercase(self) -> crate::iter::Lazy<char>;
+        pub fn to_lowercase(self) -> crate::iter::Lazy<char>;
+        pub fn eq_ignore_ascii_case(&self, other: &char) -> bool;
+        pub fn len_utf8(self) -> usize;
+        pub fn from_u32(i: u32) -> Option<char>;
+        pub fn from_digit(num: u32, radix: u32) -> Option<char>;
+    }
+}
+
+pub mod f64 {
+    pub mod consts {
+        pub const PI: f64 = 3.14159265358979323846264338327950288_f64;
+        pub const TAU: f64 = 6.28318530717958647692528676655900577_f64;
+        pub const E: f64 = 2.71828182845904523536028747135266250_f64;
+        pub const SQRT_2: f64 = 1.41421356237309504880168872420969808_f64;
+        pub const FRAC_1_SQRT_2: f64 = 0.707106781186547524400844362104849039_f64;
+        pub const LN_2: f64 = 0.693147180559945309417232121458176568_f64;
+        pub const LN_10: f64 = 2.30258509299404568401799145468436421_f64;
+        pub const LOG2_E: f64 = 1.44269504088896340735992468100189214_f64;
+        pub const LOG10_E: f64 = 0.434294481903251827651128918916605082_f64;
+        pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144_f64;
+        pub const FRAC_PI_3: f64 = 1.04719755119659774615421446109316763_f64;
+        pub const FRAC_PI_4: f64 = 0.785398163397448309615660845819875721_f64;
+        pub const FRAC_PI_6: f64 = 0.52359877559829887307710723054658381_f64;
+        pub const FRAC_1_PI: f64 = 0.318309886183790671537767526745028724_f64;
+        pub const FRAC_2_PI: f64 = 0.636619772367581343075535053490057448_f64;
+    }
+}
+
+pub mod f32 {
+    pub mod consts {
+        pub const PI: f32 = 3.14159265358979323846264338327950288_f32;
+        pub const TAU: f32 = 6.28318530717958647692528676655900577_f32;
+        pub const E: f32 = 2.71828182845904523536028747135266250_f32;
+        pub const SQRT_2: f32 = 1.41421356237309504880168872420969808_f32;
+        pub const LN_2: f32 = 0.693147180559945309417232121458176568_f32;
+        pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144_f32;
+    }
+}
+
+pub mod convert {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Infallible {}
 }

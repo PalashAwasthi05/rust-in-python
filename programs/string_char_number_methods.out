@@ -1,0 +1,24 @@
+0
+HELLO, WORLD hello, world HeLLo, WorLd
+["Hello", "World"] true
+[pad] dlroW ,olleH!        a|b    |   c   
+1-2-3
+ann is 30 next year 31
+bob is 25 next year 26
+["a", "b", "c", ""]
+Some(("key", "value")) Some("bc")
+["one", "two", "three"]
+Ok(42) Err(ParseIntError { kind: InvalidDigit }) Err(ParseIntError { kind: InvalidDigit })
+Ok(3.5) true
+6 5 Some((3, 'l'))
+5
+true A Some(7) c
+x,y,z true
+1024 2 None None 4
+10 -1 64
+1.4142 8 3 -3
+3.142 1 3
+abcabcabc
+[4, 3, 1, 6, 4]
+2
+[104, 105] hi
