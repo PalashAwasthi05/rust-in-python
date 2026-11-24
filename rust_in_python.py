@@ -4,16 +4,17 @@ Run: python3 rust_in_python.py program.rs
 Demo: python3 rust_in_python.py --demo
 
 Supported types: i32, bool, &str (string literals), (), structs, and enums.
-Supported syntax: functions, initialized let bindings, mut, blocks, if/else,
+Supported syntax: functions, let bindings, mut, blocks, if/else,
 while, loop, for over integer ranges, return, break, continue, scalar operators,
 exhaustive match, and println!. Integers use checked i32 arithmetic.
-This is a subset interpreter. Ownership, borrowing, general lifetime checking,
-and the Rust standard library are outside its scope.
+This subset checks moves and initialization. General borrowing, lifetime
+checking, and the Rust standard library are outside its scope.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass, field
 import operator
 from pathlib import Path
@@ -37,9 +38,9 @@ class Token:
 
 TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|"(?:(?:\\[\s\S])|[^"\\])*"|'
-    r"'static(?![A-Za-z_0-9])|"
+    r"'[A-Za-z_][A-Za-z_0-9]*|"
     r'[0-9][0-9_]*(?:i32)?|[A-Za-z_][A-Za-z_0-9]*|'
-    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}().:,;=!+*/%&<>|\-]'
+    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}()[\]#.:,;=!+*/%&<>|\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
@@ -54,7 +55,7 @@ PRECEDENCE = {
     "||": 2, "&&": 3, "==": 4, "!=": 4, "<": 4, "<=": 4, ">": 4, ">=": 4,
     "+": 5, "-": 5, "*": 6, "/": 6, "%": 6,
 }
-BLOCK_EXPRESSIONS = {"block", "if", "while", "loop", "for", "match"}
+BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
 PRIMITIVES = {"i32", "bool", "&str", "()"}
 LIMIT = 2**31
 NEVER = "!"
@@ -95,6 +96,7 @@ class Expr:
     kind: str
     token: Token
     args: tuple = ()
+    label: Token | None = None
 
 
 @dataclass
@@ -125,6 +127,11 @@ class Program:
     types: dict = field(default_factory=dict)
     constructors: dict = field(default_factory=dict)
     patterns: dict = field(default_factory=dict)
+    expr_types: dict = field(default_factory=dict)
+    derives: dict = field(default_factory=dict)
+
+    def is_copy(self, annotation):
+        return annotation in PRIMITIVES or "Copy" in self.derives.get(annotation, {})
 
 
 class Parser:
@@ -178,11 +185,14 @@ class Parser:
     def parse(self):
         program = Program()
         while self.current.text:
+            derives = self.attributes()
             self.accept("pub")
             item = self.accept("struct") or self.accept("enum")
             if item:
-                self.type_item(program, item)
+                self.type_item(program, item, derives)
                 continue
+            if derives:
+                raise self.current.error("derive requires a struct or enum")
             self.expect("fn")
             name = self.identifier()
             if name.text in program.functions:
@@ -191,7 +201,9 @@ class Parser:
             params = []
             while self.current.text != ")":
                 mutable = bool(self.accept("mut"))
-                param = self.identifier()
+                param = self.accept("_") or self.identifier()
+                if mutable and param.text == "_":
+                    raise param.error("wildcard parameters cannot be mutable")
                 self.expect(":")
                 params.append((param, mutable, self.type_name()))
                 if not self.accept(","):
@@ -201,7 +213,26 @@ class Parser:
             program.functions[name.text] = Function(name, params, result, self.block())
         return program
 
-    def type_item(self, program, item):
+    def attributes(self):
+        derives = {}
+        while self.accept("#"):
+            self.expect("[")
+            self.expect("derive")
+            self.expect("(")
+            while self.current.text != ")":
+                trait = self.identifier()
+                if trait.text not in {"Clone", "Copy", "Debug"}:
+                    raise trait.error(f"unsupported derive {trait.text!r}")
+                if trait.text in derives:
+                    raise trait.error(f"duplicate derive {trait.text!r}")
+                derives[trait.text] = trait
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            self.expect("]")
+        return derives
+
+    def type_item(self, program, item, derives):
         name = self.identifier()
         if name.text in program.types or name.text in PRIMITIVES:
             raise name.error(f"duplicate type {name.text!r}")
@@ -224,6 +255,7 @@ class Parser:
                     break
             self.expect("}")
         program.types[name.text] = (name, tuple(constructors))
+        program.derives[name.text] = derives
         for constructor in constructors:
             program.constructors[constructor.path] = constructor
 
@@ -264,9 +296,10 @@ class Parser:
             if let:
                 pattern = self.pattern()
                 annotation = self.type_name() if self.accept(":") else None
-                self.expect("=")
-                value = self.expression()
-                otherwise = self.block() if self.accept("else") else None
+                value = self.expression() if self.accept("=") else None
+                otherwise = self.block() if value and self.accept("else") else None
+                if value is None and (annotation is None or pattern.kind != "bind"):
+                    raise pattern.token.error("uninitialized let requires a name and explicit type")
                 if otherwise and value.kind in BLOCK_EXPRESSIONS:
                     raise value.token.error("parenthesize this expression before let-else")
                 if otherwise and value.kind == "binary" and value.token.text in {"&&", "||"}:
@@ -294,6 +327,10 @@ class Parser:
             if not (IDENT.fullmatch(name.text) or re.fullmatch(r'0|[1-9][0-9]*', name.text)):
                 raise name.error("expected a field name or tuple field index")
             left = Expr("field", dot, (left, name))
+            if name.text == "clone" and self.current.text == "(":
+                if self.arguments():
+                    raise name.error("clone takes no arguments")
+                left = Expr("clone", name, (left.args[0],))
         compared = False
         while PRECEDENCE.get(self.current.text, 0) >= minimum:
             token = self.advance()
@@ -323,6 +360,15 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word.startswith("'"):
+            if word in {"'static", "'_"} or word[1:] in RESERVED:
+                raise token.error("invalid label")
+            self.expect(":")
+            if self.current.text not in {"{", "loop", "while", "for"}:
+                raise token.error("a label must precede a block or loop")
+            labeled = self.prefix(allow_record)
+            labeled.label = token
+            return labeled
         if word == "if":
             pattern, condition = self.condition()
             yes = self.block()
@@ -336,8 +382,7 @@ class Parser:
             pattern, condition = self.condition()
             body = self.block()
             if pattern:
-                branch = self.conditional_match(token, condition, pattern, body, Expr("break", token))
-                return Expr("loop", token, (branch,))
+                return Expr("while_let", token, (condition, pattern, body))
             return Expr("while", token, (condition, body))
         if word == "loop":
             return Expr("loop", token, (self.block(),))
@@ -354,9 +399,13 @@ class Parser:
         if word == "match":
             return self.match_expression(token)
         if word in {"return", "break", "continue"}:
-            if word == "return" and self.current.text not in {";", "}", ")", ","}:
-                return Expr(word, token, (self.expression(),))
-            return Expr(word, token)
+            label = None
+            if word != "return" and self.current.text.startswith("'"):
+                label = self.advance()
+            value = None
+            if word != "continue" and self.current.text not in {";", "}", ")", ",", "=>", "else"}:
+                value = self.expression(allow_record=allow_record)
+            return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
             return Expr("unary", token, (self.expression(7, allow_record=allow_record),))
         if word == "(":
@@ -450,6 +499,8 @@ class Parser:
             last = self.simple_pattern()
         if last is not None and last.kind != "literal":
             raise last.token.error("expected an integer range bound")
+        if last is None and first is None and separator.text == "..":
+            return Expr("rest", separator)
         if last is None and (first is None or separator.text == "..="):
             raise separator.error("expected an integer range bound")
         return Expr("pattern_range", separator, (first, last, separator.text == "..="))
@@ -577,7 +628,7 @@ def require(actual, expected, token):
         raise token.error(f"expected {expected}, found {actual}")
 
 
-def target(expr, scope):
+def assignment_target(expr, scope):
     fields = []
     while expr.kind in {"group", "field"}:
         if expr.kind == "field":
@@ -586,8 +637,6 @@ def target(expr, scope):
     if expr.kind != "name":
         raise expr.token.error("invalid assignment target")
     binding = scope.find(expr.token)
-    if not binding.mutable:
-        raise expr.token.error(f"cannot assign to immutable binding {expr.token.text!r}")
     return binding, tuple(reversed(fields))
 
 
@@ -755,6 +804,43 @@ COMPARE = {
 }
 
 
+@dataclass
+class ControlTarget:
+    expr: Expr
+    exit_types: list = field(default_factory=list)
+    in_condition: bool = False
+    restart: FlowNode | None = None
+    finish: FlowNode | None = None
+
+
+def find_control(targets, jump):
+    for target in reversed(targets):
+        if jump.label:
+            label = target.expr.label
+            if label is None or label.text != jump.label.text:
+                continue
+        elif target.expr.kind == "block":
+            raise jump.token.error(f"unlabeled {jump.kind} inside a labeled block")
+        elif target.in_condition:
+            raise jump.token.error(f"unlabeled {jump.kind} in a while condition")
+        if jump.kind == "continue" and target.expr.kind == "block":
+            raise jump.token.error("continue requires a loop label")
+        return target
+    if jump.label:
+        raise jump.label.error(f"unknown label {jump.label.text}")
+    raise jump.token.error(f"{jump.kind} outside a loop")
+
+
+def unify_exits(exits):
+    result = NEVER
+    for actual, token in exits:
+        if result == NEVER:
+            result = actual
+        else:
+            require(actual, result, token)
+    return result
+
+
 class Checker:
     def __init__(self, program):
         self.program = program
@@ -766,6 +852,7 @@ class Checker:
         finished = set()
         for name, (token, _) in self.program.types.items():
             self.check_layout(name, token, set(), finished)
+            self.check_derives(name)
         main = self.functions.get("main")
         if main is None:
             raise RustError("missing fn main()")
@@ -778,6 +865,8 @@ class Checker:
             scope = Scope()
             for name, mutable, annotation in function.params:
                 self.check_type(annotation, name)
+                if name.text == "_":
+                    continue
                 if name.text in scope.bindings:
                     raise name.error(f"duplicate parameter {name.text!r}")
                 scope.bindings[name.text] = Binding(annotation, mutable)
@@ -785,6 +874,19 @@ class Checker:
             self.check_type(self.result, function.name, allow_never=True)
             result = self.type_of(function.body, scope)
             require(result, function.result, function.body.token)
+
+    def check_derives(self, annotation):
+        derives = self.program.derives[annotation]
+        if "Copy" in derives and "Clone" not in derives:
+            raise derives["Copy"].error("Copy requires Clone")
+        for trait, token in derives.items():
+            for ctor in self.program.types[annotation][1]:
+                for _, kind in ctor.fields:
+                    if not self.implements(kind, trait):
+                        raise token.error(f"{kind} does not implement {trait}")
+
+    def implements(self, annotation, trait):
+        return annotation in PRIMITIVES or trait in self.program.derives.get(annotation, {})
 
     def check_type(self, annotation, token, *, allow_never=False):
         if annotation in PRIMITIVES or annotation in self.program.types:
@@ -837,6 +939,8 @@ class Checker:
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "wild":
             return Pattern(), {}
+        if kind == "rest":
+            raise token.error("'..' is only allowed within a tuple or record pattern")
         if kind == "literal":
             actual, value = args
             if actual == "i32":
@@ -880,6 +984,14 @@ class Checker:
             indices = self.field_indices(ctor, fields, rest, token)
             assignments = zip(indices, (value for _, value in fields))
         else:
+            rest = [index for index, child in enumerate(args) if child.kind == "rest"]
+            if len(rest) > 1:
+                raise args[rest[1]].token.error("a tuple pattern can contain only one '..'")
+            if rest and len(args) - 1 <= len(ctor.fields):
+                index = rest[0]
+                omitted = len(ctor.fields) - len(args) + 1
+                wildcard = Expr("wild", args[index].token)
+                args = args[:index] + (wildcard,) * omitted + args[index + 1:]
             if len(args) != len(ctor.fields):
                 raise token.error(f"{ctor.path} takes {len(ctor.fields)} fields")
             assignments = enumerate(args)
@@ -921,15 +1033,58 @@ class Checker:
             raise expr.token.error(f"non-exhaustive match, missing {show_missing(missing[0])}")
         return NEVER if annotation == NEVER else result
 
-    def loop_body(self, body, scope):
-        self.loops.append(False)
+    def loop_type(self, expr, scope):
+        kind, token, args = expr.kind, expr.token, expr.args
+        target = ControlTarget(expr)
+        test = "()"
+        if kind == "for":
+            name, mutable, start, end, _, _ = args
+            bounds = [self.type_of(bound, scope) for bound in (start, end)]
+            for bound in bounds:
+                require(bound, "i32", token)
+            if NEVER in bounds:
+                test = NEVER
+            scope = Scope(scope, {name.text: Binding("i32", mutable)})
+        self.loops.append(target)
         try:
+            if kind in {"while", "while_let"}:
+                condition = args[0]
+                target.in_condition = True
+                test = self.type_of(condition, scope)
+                target.in_condition = False
+                if kind == "while":
+                    require(test, "bool", condition.token)
+                else:
+                    source = args[1]
+                    pattern, bindings = self.prepare_pattern(source, test)
+                    self.program.patterns[id(source)] = (pattern, bindings)
+                    scope = Scope(scope, {name: Binding(kind, mutable)
+                                          for name, (kind, mutable) in bindings.items()})
+            body = args[-1]
             require(self.type_of(body, scope), "()", body.token)
-            return self.loops[-1]
         finally:
             self.loops.pop()
+        if kind == "loop":
+            return unify_exits(target.exit_types)
+        if test == NEVER and not target.exit_types:
+            return NEVER
+        return "()"
 
     def type_of(self, expr, scope):
+        if expr.kind == "block" and expr.label:
+            target = ControlTarget(expr)
+            self.loops.append(target)
+            try:
+                tail = self.check_expr(expr, scope)
+            finally:
+                self.loops.pop()
+            result = unify_exits([*target.exit_types, (tail, expr.token)])
+        else:
+            result = self.check_expr(expr, scope)
+        self.program.expr_types[id(expr)] = result
+        return result
+
+    def check_expr(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "literal":
             annotation, value = args
@@ -946,6 +1101,11 @@ class Checker:
         if kind == "field":
             value, name = args
             return self.field_type(self.type_of(value, scope), name)
+        if kind == "clone":
+            annotation = self.type_of(args[0], scope)
+            if annotation != NEVER and not self.implements(annotation, "Clone"):
+                raise token.error(f"{annotation} does not implement Clone")
+            return annotation
         if kind == "record":
             ctor = self.constructor(token, "record")
             fields = args[0]
@@ -966,12 +1126,14 @@ class Checker:
             return NEVER if diverges else result
         if kind == "let":
             source, annotation, value, otherwise = args
-            actual = self.type_of(value, scope)
+            actual = self.type_of(value, scope) if value else annotation
             if annotation:
                 self.check_type(annotation, token)
                 require(actual, annotation, token)
             annotation = annotation or actual
             pattern, bindings = self.prepare_pattern(source, annotation)
+            if value is None and not bindings:
+                raise token.error("uninitialized let requires a local binding")
             self.program.patterns[id(source)] = (pattern, bindings)
             if otherwise:
                 require(self.type_of(otherwise, scope), NEVER, otherwise.token)
@@ -999,30 +1161,19 @@ class Checker:
             if test == NEVER:
                 return NEVER
             return right if left == NEVER else left
-        if kind == "while":
-            condition, body = args
-            test = self.type_of(condition, scope)
-            require(test, "bool", condition.token)
-            self.loop_body(body, scope)
-            return NEVER if test == NEVER else "()"
-        if kind == "loop":
-            return "()" if self.loop_body(args[0], scope) else NEVER
-        if kind == "for":
-            name, mutable, start, end, _, body = args
-            bounds = [self.type_of(bound, scope) for bound in (start, end)]
-            for bound in bounds:
-                require(bound, "i32", token)
-            self.loop_body(body, Scope(scope, {name.text: Binding("i32", mutable)}))
-            return NEVER if NEVER in bounds else "()"
+        if kind in {"while", "while_let", "loop", "for"}:
+            return self.loop_type(expr, scope)
         if kind == "return":
-            actual = self.type_of(args[0], scope) if args else "()"
+            actual = self.type_of(args[0], scope) if args[0] else "()"
             require(actual, self.result, token)
             return NEVER
         if kind in {"break", "continue"}:
-            if not self.loops:
-                raise token.error(f"{kind} outside a loop")
+            target = find_control(self.loops, expr)
             if kind == "break":
-                self.loops[-1] = True
+                if args[0] and target.expr.kind not in {"loop", "block"}:
+                    raise token.error("break values require loop or a labeled block")
+                actual = self.type_of(args[0], scope) if args[0] else "()"
+                target.exit_types.append((actual, token))
             return NEVER
         if kind == "unary":
             operand = args[0]
@@ -1035,7 +1186,7 @@ class Checker:
             return actual
         if kind == "assign":
             left, right = args
-            binding, fields = target(left, scope)
+            binding, fields = assignment_target(left, scope)
             annotation = binding.value
             for name in fields:
                 annotation = self.field_type(annotation, name)
@@ -1083,7 +1234,7 @@ class Checker:
                     actual = next(positional)
                 if mode == "display" and actual == "()":
                     raise token.error("() requires debug formatting")
-                if actual in self.program.types:
+                if actual in self.program.types and (mode != "debug" or not self.implements(actual, "Debug")):
                     raise token.error(f"{actual} does not implement the requested formatting trait")
             return NEVER if NEVER in types else "()"
         raise AssertionError(kind)
@@ -1104,6 +1255,408 @@ class Checker:
         require(left, "i32", token)
         require(right, "i32", token)
         return NEVER if NEVER in {left, right} else "i32"
+
+
+@dataclass(frozen=True, eq=False)
+class Local:
+    token: Token
+    mutable: bool
+
+
+@dataclass(frozen=True)
+class Place:
+    local: Local
+    fields: tuple = ()
+
+    def child(self, field):
+        return Place(self.local, (*self.fields, field))
+
+    def contains(self, other):
+        return self.local is other.local and other.fields[:len(self.fields)] == self.fields
+
+    def overlaps(self, other):
+        return self.contains(other) or other.contains(self)
+
+    @property
+    def name(self):
+        return ".".join((self.local.token.text, *self.fields))
+
+
+@dataclass(frozen=True)
+class Effect:
+    kind: str
+    place: Place
+    token: Token
+
+
+@dataclass(eq=False)
+class FlowNode:
+    effect: Effect | None = None
+    edges: list = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MoveState:
+    missing: frozenset = frozenset()
+    written: frozenset = frozenset()
+
+    def merge(self, other):
+        return MoveState(self.missing | other.missing, self.written | other.written)
+
+    def transfer(self, effect):
+        if effect is None:
+            return self
+        kind, place = effect.kind, effect.place
+        if kind == "move":
+            return MoveState(self.missing | {(place, "moved")}, self.written)
+        if kind in {"declare", "uninitialized", "write"}:
+            missing = frozenset(item for item in self.missing if not place.contains(item[0]))
+            if kind == "uninitialized":
+                return MoveState(missing | {(place, "uninitialized")}, self.written - {place.local})
+            return MoveState(missing, self.written | {place.local})
+        return self
+
+    def validate(self, effect):
+        if effect is None:
+            return
+        kind, place, token = effect.kind, effect.place, effect.token
+        if kind == "guard_move":
+            raise token.error(f"cannot move out of {place.name!r} in a pattern guard")
+        if kind == "guard_write":
+            raise token.error(f"cannot assign to {place.name!r} in a pattern guard")
+        if kind in {"read", "move"}:
+            unavailable = [(item, reason) for item, reason in self.missing if place.overlaps(item)]
+            if unavailable:
+                item, reason = min(unavailable, key=lambda entry: (len(entry[0].fields), entry[0].name, entry[1]))
+                if item == place or item.contains(place):
+                    raise token.error(f"use of {reason} value {item.name!r}")
+                raise token.error(f"use of partially {reason} value {place.name!r} ({item.name})")
+        if kind == "write":
+            if not place.local.mutable and (place.fields or place.local in self.written):
+                raise token.error(f"cannot assign to immutable binding {place.local.token.text!r}")
+            for item, reason in sorted(self.missing, key=lambda entry: (entry[0].name, entry[1])):
+                if item != place and item.contains(place):
+                    raise token.error(f"cannot assign to a field of {reason} value {item.name!r}")
+
+
+class Ownership:
+    """Lower checked expressions to a control-flow graph, then check move paths."""
+
+    def __init__(self, program):
+        self.program = program
+        self.loops = []
+        self.guarded = set()
+        self.guard_borrows = ()
+        self.guard_tests = ()
+
+    def check(self):
+        for function in self.program.functions.values():
+            scope = Scope()
+            entry = FlowNode()
+            cursor = entry
+            for token, mutable, _ in function.params:
+                if token.text == "_":
+                    continue
+                local = Local(token, mutable)
+                scope.bindings[token.text] = local
+                cursor = self.emit(cursor, "declare", Place(local), token)
+            self.lower(function.body, scope, cursor)
+            self.check_graph(entry)
+
+    @staticmethod
+    def check_graph(entry):
+        incoming = {entry: MoveState()}
+        pending = deque([entry])
+        queued = {entry}
+        while pending:
+            node = pending.popleft()
+            queued.remove(node)
+            output = incoming[node].transfer(node.effect)
+            for successor in node.edges:
+                previous = incoming.get(successor)
+                combined = output if previous is None else previous.merge(output)
+                if combined != previous:
+                    incoming[successor] = combined
+                    if successor not in queued:
+                        pending.append(successor)
+                        queued.add(successor)
+        for node, state in incoming.items():
+            state.validate(node.effect)
+
+    @staticmethod
+    def connect(source, target):
+        if source is not None:
+            source.edges.append(target)
+
+    def emit(self, cursor, kind, place, token):
+        node = FlowNode(Effect(kind, place, token))
+        self.connect(cursor, node)
+        return node
+
+    def join(self, *cursors):
+        node = FlowNode()
+        for cursor in cursors:
+            self.connect(cursor, node)
+        return node
+
+    def place(self, expr, scope):
+        if expr.kind == "group":
+            return self.place(expr.args[0], scope)
+        if expr.kind == "name":
+            ctor = self.program.constructors.get(expr.token.text)
+            if not ctor or ctor.style != "unit":
+                return Place(scope.find(expr.token))
+        if expr.kind == "field":
+            base, name = expr.args
+            place = self.place(base, scope)
+            if place is not None:
+                return place.child(name.text)
+        return None
+
+    def annotation(self, expr):
+        return self.program.expr_types[id(expr)]
+
+    def access(self, cursor, place, annotation, token, *, consume):
+        if consume and not self.program.is_copy(annotation):
+            action = self.move_action(place)
+        else:
+            action = "read"
+        return self.emit(cursor, action, place, token)
+
+    def move_action(self, place):
+        if place.local in self.guarded or any(place.overlaps(item) for item in self.guard_borrows):
+            return "guard_move"
+        return "move"
+
+    def lower(self, expr, scope, cursor, *, consume=True):
+        kind, token, args = expr.kind, expr.token, expr.args
+        place = self.place(expr, scope)
+        if place is not None:
+            return self.access(cursor, place, self.annotation(expr), token, consume=consume)
+        if kind in {"literal", "name"}:
+            return cursor
+        if kind in {"group", "field", "unary"}:
+            return self.lower(args[0], scope, cursor)
+        if kind == "clone":
+            return self.lower(args[0], scope, cursor, consume=False)
+        if kind == "block":
+            statements, tail = args
+            inner = Scope(scope)
+            target = ControlTarget(expr, finish=FlowNode()) if expr.label else None
+            if target:
+                self.loops.append(target)
+            try:
+                for item in statements:
+                    cursor = self.lower(item, inner, cursor)
+                if tail:
+                    cursor = self.lower(tail, inner, cursor)
+            finally:
+                if target:
+                    self.loops.pop()
+            if target:
+                self.connect(cursor, target.finish)
+                return target.finish
+            return cursor
+        if kind == "let":
+            source, _, value, otherwise = args
+            pattern, types = self.program.patterns[id(source)]
+            if value is None:
+                return self.declare(source, types, scope, cursor, initialized=False)
+            origin = self.place(value, scope)
+            if origin is None:
+                cursor = self.lower(value, scope, cursor)
+            reads, moves, tests = self.pattern_accesses(pattern, origin, self.annotation(value))
+            cursor = self.read_pattern(cursor, tests | reads, source.token)
+            if otherwise:
+                self.lower(otherwise, Scope(scope), cursor)
+            cursor = self.move_pattern(cursor, moves, source.token)
+            return self.declare(source, types, scope, cursor)
+        if kind == "match":
+            return self.lower_match(expr, scope, cursor)
+        if kind == "discard":
+            return self.lower(args[0], scope, cursor)
+        if kind == "if":
+            condition, yes, no = args
+            cursor = self.lower(condition, scope, cursor)
+            yes_end = self.lower(yes, scope, cursor)
+            no_end = self.lower(no, scope, cursor) if no else cursor
+            return self.join(yes_end, no_end)
+        if kind in {"while", "while_let", "loop", "for"}:
+            return self.lower_loop(expr, scope, cursor)
+        if kind == "return":
+            if args[0]:
+                self.lower(args[0], scope, cursor)
+            return None
+        if kind in {"break", "continue"}:
+            target = find_control(self.loops, expr)
+            if args[0]:
+                cursor = self.lower(args[0], scope, cursor)
+            self.connect(cursor, target.finish if kind == "break" else target.restart)
+            return None
+        if kind == "assign":
+            left, right = args
+            target_place = self.place(left, scope)
+            cursor = self.lower(right, scope, cursor)
+            if token.text != "=":
+                cursor = self.emit(cursor, "read", target_place, token)
+            protected = self.guard_borrows + self.guard_tests
+            forbidden = target_place.local in self.guarded or any(
+                target_place.overlaps(item) for item in protected
+            )
+            action = "guard_write" if forbidden else "write"
+            return self.emit(cursor, action, target_place, token)
+        if kind == "binary":
+            left, right = args
+            cursor = self.lower(left, scope, cursor)
+            right_end = self.lower(right, scope, cursor)
+            return self.join(cursor, right_end) if token.text in {"&&", "||"} else right_end
+        if kind == "record":
+            for _, value in args[0]:
+                cursor = self.lower(value, scope, cursor)
+            return cursor
+        if kind == "call":
+            for arg in args:
+                cursor = self.lower(arg, scope, cursor)
+            return None if self.annotation(expr) == NEVER else cursor
+        if kind == "print":
+            if not args:
+                return cursor
+            template, *values = args
+            for value in values:
+                cursor = self.lower(value, scope, cursor, consume=False)
+            for mode, name in format_parts(template.args[1], template.token):
+                if mode != "text" and name:
+                    local = scope.find(Token(name, token.line, token.column))
+                    cursor = self.emit(cursor, "read", Place(local), token)
+            return cursor
+        raise AssertionError(kind)
+
+    def lower_loop(self, expr, scope, cursor):
+        kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "for":
+            name, mutable, start, end, _, body = args
+            cursor = self.lower(end, scope, self.lower(start, scope, cursor))
+        else:
+            body = args[-1]
+        restart = self.join(cursor)
+        finish = FlowNode()
+        target = ControlTarget(expr, restart=restart, finish=finish)
+        self.loops.append(target)
+        try:
+            body_entry = restart
+            if kind == "while":
+                target.in_condition = True
+                body_entry = self.lower(args[0], scope, restart)
+                target.in_condition = False
+                self.connect(body_entry, finish)
+            elif kind == "while_let":
+                condition, source, _ = args
+                origin = self.place(condition, scope)
+                target.in_condition = True
+                if origin is None:
+                    body_entry = self.lower(condition, scope, restart)
+                target.in_condition = False
+                pattern, types = self.program.patterns[id(source)]
+                annotation = self.annotation(condition)
+                reads, moves, tests = self.pattern_accesses(pattern, origin, annotation)
+                body_entry = self.read_pattern(body_entry, tests | reads, source.token)
+                if uncovered([(pattern,)], (annotation,), self.program) is not None:
+                    self.connect(body_entry, finish)
+                body_entry = self.move_pattern(body_entry, moves, source.token)
+                scope = Scope(scope)
+                body_entry = self.declare(source, types, scope, body_entry)
+            if kind == "for":
+                self.connect(restart, finish)
+                local = Local(name, mutable)
+                scope = Scope(scope, {name.text: local})
+                body_entry = self.emit(restart, "declare", Place(local), token)
+            self.connect(self.lower(body, scope, body_entry), restart)
+        finally:
+            self.loops.pop()
+        return finish
+
+    def lower_match(self, expr, scope, cursor):
+        scrutinee, arms = expr.args
+        origin = self.place(scrutinee, scope)
+        if origin is None:
+            cursor = self.lower(scrutinee, scope, cursor)
+        finishes = []
+        prepared = []
+        protected = {}
+        for source, guard, body in arms:
+            pattern, types = self.program.patterns[id(source)]
+            reads, moves, tests = self.pattern_accesses(pattern, origin, self.annotation(scrutinee))
+            protected.update(tests)
+            prepared.append((source, guard, body, types, reads, moves, tests))
+        for source, guard, body, types, reads, moves, tests in prepared:
+            tested = self.read_pattern(cursor, tests | reads, source.token)
+            inner = Scope(scope)
+            ready = self.declare(source, types, inner, tested)
+            if guard:
+                earlier = self.guarded, self.guard_borrows, self.guard_tests
+                self.guarded = self.guarded | set(inner.bindings.values())
+                self.guard_borrows = (*self.guard_borrows, *reads, *moves)
+                self.guard_tests = (*self.guard_tests, *protected)
+                try:
+                    ready = self.lower(guard, inner, ready)
+                finally:
+                    self.guarded, self.guard_borrows, self.guard_tests = earlier
+                cursor = self.join(tested, ready)
+            else:
+                cursor = tested
+            ready = self.move_pattern(ready, moves, source.token)
+            finishes.append(self.lower(body, inner, ready))
+        return self.join(*finishes)
+
+    def declare(self, source, types, scope, cursor, *, initialized=True):
+        action = "declare" if initialized else "uninitialized"
+        for name, (_, mutable) in types.items():
+            local = Local(Token(name, source.token.line, source.token.column), mutable)
+            scope.bindings[name] = local
+            cursor = self.emit(cursor, action, Place(local), source.token)
+        return cursor
+
+    def pattern_accesses(self, pattern, origin, annotation):
+        reads = {}
+        moves = {}
+        tests = {}
+        if origin is not None:
+            self.collect_pattern(pattern, origin, reads, moves, tests, annotation)
+        return reads, moves, tests
+
+    def collect_pattern(self, pattern, place, reads, moves, tests, annotation, *, opaque=False):
+        if pattern.alternatives:
+            for option in pattern.alternatives:
+                self.collect_pattern(option, place, reads, moves, tests, annotation, opaque=opaque)
+        elif pattern.binding:
+            if self.program.is_copy(annotation):
+                reads[place] = None
+            else:
+                moves[place] = annotation
+        elif isinstance(pattern.tag, Constructor):
+            ctor = pattern.tag
+            variant = "::" in ctor.path
+            if variant and len(self.program.types[ctor.annotation][1]) > 1:
+                tests[place] = None
+            for child, (field, kind) in zip(pattern.children, ctor.fields):
+                projected = place if opaque or variant else place.child(field)
+                self.collect_pattern(child, projected, reads, moves, tests, kind, opaque=opaque or variant)
+        elif pattern.tag is not None:
+            tests[place] = None
+
+    def read_pattern(self, cursor, reads, token):
+        for place in reads:
+            cursor = self.emit(cursor, "read", place, token)
+        return cursor
+
+    def move_pattern(self, cursor, moves, token):
+        # Check all paths before moving any of them. Two bindings can project
+        # different payload fields from the same opaque enum storage.
+        for place in moves:
+            cursor = self.emit(cursor, "read", place, token)
+        for place in moves:
+            cursor = self.emit(cursor, self.move_action(place), place, token)
+        return cursor
 
 
 def min_literal(expr):
@@ -1137,6 +1690,16 @@ def binary(word, left, right, token):
 
 
 def display(value, debug):
+    if isinstance(value, Value):
+        ctor = value.constructor
+        name = ctor.path.rsplit("::", 1)[-1]
+        if ctor.style == "unit" or not ctor.fields:
+            return name
+        fields = [display(item, True) for item in value.fields]
+        if ctor.style == "tuple":
+            return f"{name}({', '.join(fields)})"
+        entries = ", ".join(f"{field}: {item}" for (field, _), item in zip(ctor.fields, fields))
+        return f"{name} {{ {entries} }}"
     if value is None:
         return "()"
     if isinstance(value, bool):
@@ -1167,6 +1730,11 @@ class Continue(Exception):
     pass
 
 
+def handles_jump(expr, signal):
+    label = signal.args[0]
+    return label is None or (expr.label is not None and expr.label.text == label.text)
+
+
 class Interpreter:
     def __init__(self, program, stdout):
         self.program = program
@@ -1178,11 +1746,21 @@ class Interpreter:
         for bindings in pattern.bindings(value):
             yield {name: Binding(item, types[name][1]) for name, item in bindings.items()}
 
+    def placeholder(self, annotation):
+        # Wildcard patterns can inspect an aggregate's shape without reading
+        # its fields. Ownership prevents an uninitialized field from escaping.
+        declaration = self.program.types.get(annotation)
+        if declaration and declaration[1]:
+            ctor = declaration[1][0]
+            return Value(ctor, tuple(self.placeholder(kind) for _, kind in ctor.fields))
+        return None
+
     def call(self, name, values):
         function = self.functions[name]
         bindings = {
             param.text: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
+            if param.text != "_"
         }
         try:
             return self.eval(function.body, Scope(bindings=bindings))
@@ -1194,6 +1772,9 @@ class Interpreter:
         if kind == "literal":
             return args[1]
         if kind == "group":
+            return self.eval(args[0], scope)
+        if kind == "clone":
+            # Aggregate values are immutable records, so a clone can share storage.
             return self.eval(args[0], scope)
         if kind == "name":
             ctor = self.program.constructors.get(token.text)
@@ -1222,11 +1803,19 @@ class Interpreter:
         if kind == "block":
             statements, tail = args
             inner = Scope(scope)
-            for statement in statements:
-                self.eval(statement, inner)
-            return self.eval(tail, inner) if tail else None
+            try:
+                for statement in statements:
+                    self.eval(statement, inner)
+                return self.eval(tail, inner) if tail else None
+            except Break as signal:
+                if not expr.label or not handles_jump(expr, signal):
+                    raise
+                return signal.args[1]
         if kind == "let":
-            source, _, value, otherwise = args
+            source, annotation, value, otherwise = args
+            if value is None:
+                scope.bindings[source.token.text] = Binding(self.placeholder(annotation), source.args[0])
+                return None
             result = self.eval(value, scope)
             bindings = next(self.match_bindings(source, result), None)
             if bindings is None:
@@ -1242,16 +1831,28 @@ class Interpreter:
             condition, yes, no = args
             branch = yes if self.eval(condition, scope) else no
             return self.eval(branch, scope) if branch else None
-        if kind in {"while", "loop"}:
-            condition, body = args if kind == "while" else (None, args[0])
-            while condition is None or self.eval(condition, scope):
+        if kind in {"while", "while_let", "loop"}:
+            body = args[-1]
+            while True:
                 try:
-                    self.eval(body, scope)
-                except Continue:
-                    continue
-                except Break:
-                    break
-            return None
+                    inner = scope
+                    if kind == "while" and not self.eval(args[0], scope):
+                        return None
+                    if kind == "while_let":
+                        condition, source, _ = args
+                        value = self.eval(condition, scope)
+                        bindings = next(self.match_bindings(source, value), None)
+                        if bindings is None:
+                            return None
+                        inner = Scope(scope, bindings)
+                    self.eval(body, inner)
+                except Continue as signal:
+                    if not handles_jump(expr, signal):
+                        raise
+                except Break as signal:
+                    if not handles_jump(expr, signal):
+                        raise
+                    return signal.args[1]
         if kind == "for":
             name, mutable, start, end, inclusive, body = args
             first = self.eval(start, scope)
@@ -1260,17 +1861,21 @@ class Interpreter:
                 inner = Scope(scope, {name.text: Binding(value, mutable)})
                 try:
                     self.eval(body, inner)
-                except Continue:
+                except Continue as signal:
+                    if not handles_jump(expr, signal):
+                        raise
                     continue
-                except Break:
+                except Break as signal:
+                    if not handles_jump(expr, signal):
+                        raise
                     break
             return None
         if kind == "return":
-            raise Return(self.eval(args[0], scope) if args else None)
+            raise Return(self.eval(args[0], scope) if args[0] else None)
         if kind == "break":
-            raise Break()
+            raise Break(expr.label, self.eval(args[0], scope) if args[0] else None)
         if kind == "continue":
-            raise Continue()
+            raise Continue(expr.label)
         if kind == "unary":
             if min_literal(expr):
                 return -LIMIT
@@ -1281,7 +1886,7 @@ class Interpreter:
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
-            binding, fields = target(left, scope)
+            binding, fields = assignment_target(left, scope)
             if token.text != "=":
                 old = binding.value
                 for name in fields:
@@ -1341,6 +1946,7 @@ fn main() {
 def run(source, stdout=None):
     program = Parser(source).parse()
     Checker(program).check()
+    Ownership(program).check()
     Interpreter(program, sys.stdout if stdout is None else stdout).call("main", ())
 
 

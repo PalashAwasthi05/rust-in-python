@@ -107,6 +107,145 @@ VALID = [
         fn never(value: Empty) -> ! { match value {} }
         fn main() {}
     """, ""),
+    ("partial move and field reinitialization", """
+        struct Data(i32);
+        struct Pair { left: Data, right: Data }
+        fn main() {
+            let mut pair = Pair { left: Data(1), right: Data(2) };
+            let Data(first) = pair.left;
+            let left = pair.left;
+            let right = pair.right;
+            pair.left = Data(first + left.0);
+            pair.right = Data(right.0);
+            let rebuilt = pair;
+            println!("{} {}", rebuilt.left.0, rebuilt.right.0);
+        }
+    """, "2 2\n"),
+    ("copy clone and debug derives", """
+        #[derive(Clone, Copy, Debug)]
+        struct Coord(i32);
+        #[derive(Debug)]
+        struct Point { x: Coord }
+        #[derive(Clone, Debug)]
+        enum Label { Active(&'static str), Pending() }
+        fn main() {
+            let coord = Coord(7);
+            let first = coord;
+            let second = coord;
+            let label = Label::Active("now");
+            let cloned = label.clone();
+            println!("{:?} {:?} {label:?} {cloned:?} {:?}",
+                Point { x: first }, second, Label::Pending());
+        }
+    """, 'Point { x: Coord(7) } Coord(7) Active("now") Active("now") Pending\n'),
+    ("immutable delayed initialization across branches", """
+        struct Data(i32);
+        fn get(flag: bool) -> Data {
+            let x: Data;
+            if flag { x = Data(1); } else { x = Data(2); }
+            x
+        }
+        fn main() { println!("{} {}", get(true).0, get(false).0); }
+    """, "1 2\n"),
+    ("loop reinitialization and break", """
+        struct Data(i32);
+        fn consume(_: Data) {}
+        fn main() {
+            let mut value = Data(1);
+            for n in 2..4 {
+                consume(value);
+                value = Data(n);
+                if n == 2 { continue; }
+            }
+            let result: Data;
+            loop { result = value; break; }
+            println!("{}", result.0);
+        }
+    """, "3\n"),
+    ("wildcards only inspect aggregate shape", """
+        struct Data(i32);
+        fn main() {
+            let uninitialized: Data;
+            let Data(_) = uninitialized;
+            let initialized = Data(2);
+            let taken = initialized;
+            let _ = initialized;
+            match initialized { Data(_) => println!("{}", taken.0) }
+        }
+    """, "2\n"),
+    ("failed guard preserves value", """
+        struct Data(i32);
+        fn use_value(value: Data) -> i32 { value.0 }
+        fn main() {
+            let value = Data(7);
+            let score = match value {
+                x if x.0 == 2 => use_value(x),
+                _ => use_value(value),
+            };
+            println!("{score}");
+        }
+    """, "7\n"),
+    ("return does not pollute a merge", """
+        struct Data(i32);
+        fn consume(_: Data) {}
+        fn get(flag: bool) -> i32 {
+            let data = Data(3);
+            if flag { consume(data); return 2; }
+            data.0
+        }
+        fn main() { println!("{} {}", get(true), get(false)); }
+    """, "2 3\n"),
+    ("labeled loops return moved values", """
+        struct Data(i32);
+        fn main() {
+            let mut n = 0;
+            let result = 'outer: loop {
+                n += 1;
+                for i in 0..2 {
+                    if n < 3 { continue 'outer; }
+                    break 'outer Data(n + i);
+                }
+            };
+            let answer = 'finish: {
+                let Data(x) = result;
+                if x == 3 { break 'finish x; }
+                0
+            };
+            println!("{answer}");
+        }
+    """, "3\n"),
+    ("break through a labeled while condition", """
+        fn main() {
+            let mut n = 0;
+            'outer: while {
+                n += 1;
+                if n == 3 { break 'outer; }
+                true
+            } {}
+            println!("{n}");
+        }
+    """, "3\n"),
+    ("tuple rest skips unread fields", """
+        struct Data(i32);
+        struct Row(Data, i32, i32);
+        fn main() {
+            let row = Row(Data(1), 2, 3);
+            let moved = row.0;
+            let Row(.., last) = row;
+            println!("{} {last}", moved.0);
+        }
+    """, "1 3\n"),
+    ("guard permits writing unrelated field", """
+        struct Pair { first: i32, second: i32 }
+        fn main() {
+            let mut p = Pair { first: 0, second: 1 };
+            match p {
+                Pair { first: 0, .. } if { p.second = 2; true } => (),
+                _ => (),
+            }
+            println!("{}", p.second);
+        }
+    """, "2\n"),
 ]
 
 INVALID = [
@@ -148,6 +287,89 @@ INVALID = [
         struct Node { next: Node }
         fn main() {}
     """, "infinite size"),
+    ("repeat move", """
+        struct Data(i32);
+        fn main() { let data = Data(1); let a = data; let b = data; }
+    """, "use of moved value"),
+    ("read whole after partial move", """
+        struct Data(i32);
+        struct Pair(Data, Data);
+        fn main() { let pair = Pair(Data(1), Data(2)); let a = pair.0; let b = pair; }
+    """, "partially moved"),
+    ("write into moved field", """
+        struct Data(i32);
+        struct Pair(Data, Data);
+        fn main() { let mut pair = Pair(Data(1), Data(2)); let old = pair.0; pair.0.0 = 3; }
+    """, "field of moved value"),
+    ("possibly moved in branch", """
+        struct Data(i32);
+        fn consume(_: Data) {}
+        fn f(flag: bool) { let data = Data(1); if flag { consume(data); } consume(data); }
+        fn main() {}
+    """, "use of moved value"),
+    ("move across continue back edge", """
+        struct Data(i32);
+        fn consume(_: Data) {}
+        fn main() {
+            let mut data = Data(1);
+            for n in 1..4 { consume(data); if n == 2 { continue; } data = Data(n); }
+        }
+    """, "use of moved value"),
+    ("possibly uninitialized", """
+        fn f(flag: bool) -> i32 { let x: i32; if flag { x = 2; } x }
+        fn main() {}
+    """, "use of uninitialized value"),
+    ("move not permission to reassign immutable", """
+        struct Data(i32);
+        fn main() { let data = Data(1); let saved = data; data = Data(2); }
+    """, "immutable binding"),
+    ("copy requires copy fields", """
+        #[derive(Clone)]
+        struct Data(i32);
+        #[derive(Clone, Copy)]
+        struct Wrapper(Data);
+        fn main() {}
+    """, "Data does not implement Copy"),
+    ("pattern guard cannot move from binding", """
+        struct Data(i32);
+        fn consume(_: Data) -> bool { true }
+        fn main() { match Data(1) { data if consume(data) => (), _ => () } }
+    """, "in a pattern guard"),
+    ("print cannot borrow moved value", """
+        #[derive(Debug)]
+        struct Data(i32);
+        fn main() { let data = Data(1); let saved = data; println!("{data:?}"); }
+    """, "use of moved value"),
+    ("guard cannot change future pattern test", """
+        struct Pair { first: i32, second: i32 }
+        fn main() {
+            let mut p = Pair { first: 0, second: 1 };
+            match p {
+                Pair { first: 0, .. } if { p.second = 2; true } => (),
+                Pair { second: 1, .. } => (),
+                _ => (),
+            }
+        }
+    """, "in a pattern guard"),
+    ("break values must agree", """
+        fn f(flag: bool) -> i32 { loop { if flag { break 1; } break false; } }
+        fn main() {}
+    """, "expected i32, found bool"),
+    ("while let cannot return a break value", """
+        enum E { A, B }
+        fn main() { while let E::A = E::B { break 1; } }
+    """, "break values require loop or a labeled block"),
+    ("continue cannot target a block", """
+        fn main() { 'outer: { loop { continue 'outer; } } }
+    """, "continue requires a loop label"),
+    ("labeled break carries move to exit", """
+        struct Data(i32);
+        fn main() {
+            let data = Data(1);
+            let moved = 'exit: { loop { break 'exit data; } };
+            let again = data;
+        }
+    """, "use of moved value"),
 ]
 
 
