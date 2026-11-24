@@ -1,0 +1,26 @@
+0
+header ["title: notes", "author: me"]
+body ["first body line", "second body line"]
+tail ["trailer"]
+len 8
+took [1, 2, 3], len now 5
+nth(1) Some(5), size_hint (3, Some(3))
+rest sum 21
+(10, Some(10))
+(0, Some(10))
+(10, Some(10))
+(7, Some(7))
+(4, Some(4))
+(15, Some(15))
+(3, Some(3))
+(2, Some(6))
+(2, Some(2))
+(18446744073709551615, None)
+(1, Some(1))
+(0, None)
+10
+3
+8
+2
+abc 23 ef
+[3, 6] then [7, 8, 9, 10]

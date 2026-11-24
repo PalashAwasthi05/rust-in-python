@@ -1,0 +1,15 @@
+0
+in order [20, 30, 35, 40, 50, 60, 70, 80]
+total 385
+between 30 and 65: [30, 35, 40, 50, 60]
+min Some(20) max Some(80)
+[20, 30, 35, 40] | [50, 60, 70, 80]
+visit 0 at depth 0
+visit 1 at depth 1
+visit 2 at depth 1
+visit 3 at depth 2
+visit 4 at depth 2
+visit 5 at depth 3
+from 6: [6, 0, 1, 2, 3, 4, 5]
+deepest Some((5, 3))
+depth 2: [3, 4]

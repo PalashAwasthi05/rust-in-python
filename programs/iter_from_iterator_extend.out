@@ -1,0 +1,15 @@
+0
+total 8 distinct 5
+  the x3
+  and x2
+ bird x1
+  cat x1
+  dog x1
+[("cat", 2), ("and", 1), ("cow", 1), ("the", 1)]
+total $14.54
+over two dollars $12.55
+empty sum $0.00
+factor Scale(12.0)
+SortedVec([1, 3, 5, 9])
+SortedVec([0, 1, 2, 2, 3, 10])
+SortedVec([1, 2, 3])

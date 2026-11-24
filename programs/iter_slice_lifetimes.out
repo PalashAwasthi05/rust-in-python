@@ -1,0 +1,16 @@
+0
+doubled [8, 16, 30, 32, 46, 84]
+even refs [4, 8, 16, 42]
+sum 108
+copied [4, 8, 16, 23]
+max Some(42)
+window [4, 8, 15] avg 9.00
+window [8, 15, 16] avg 13.00
+window [15, 16, 23] avg 18.00
+window [16, 23, 42] avg 27.00
+increasing: true
+ada/grace/barbara
+longest Some("barbara")
+cloned ["ada", "grace", "barbara"]
+pairs ["ab", "ac", "ad", "bc", "bd", "cd"]
+pair count 3

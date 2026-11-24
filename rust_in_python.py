@@ -1127,6 +1127,12 @@ def integer_conversions():
 STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8") + SCALAR_STD + integer_conversions()
 ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
 INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
+DOUBLE_ENDED = MODULE_SEPARATOR.join(("std", "iter", "DoubleEndedIterator"))
+EXACT_SIZE = MODULE_SEPARATOR.join(("std", "iter", "ExactSizeIterator"))
+# Traits that let collect, sum and product build a user type, with the method each one calls.
+GATHER_TRAITS = {"collect": (MODULE_SEPARATOR.join(("std", "iter", "FromIterator")), "from_iter"),
+                 "sum": (MODULE_SEPARATOR.join(("std", "iter", "Sum")), "sum"),
+                 "product": (MODULE_SEPARATOR.join(("std", "iter", "Product")), "product")}
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
@@ -2147,6 +2153,21 @@ def borrowing_iterator(annotation):
     return isinstance(annotation, IteratorType) and annotation.borrowed
 
 
+class BufferedCursor:
+    """A Python iterator over buffered items that can also be consumed from the back."""
+
+    def __init__(self, items):
+        self.items = deque(items)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.items:
+            raise StopIteration
+        return self.items.popleft()
+
+
 @dataclass(frozen=True)
 class IteratorValue:
     collection: object
@@ -2558,6 +2579,21 @@ def loose_match(template, actual, parameters, result):
     if isinstance(template, (ArrayType, SliceType)) and type(template) is type(actual):
         return loose_match(template.element, actual.element, parameters, result)
     return template == actual
+
+
+def generic_lifetimes_erased(annotation):
+    """The type with named lifetimes other than 'static dropped from its references."""
+    if isinstance(annotation, ReferenceType):
+        inner = generic_lifetimes_erased(annotation.inner)
+        lifetime = annotation.lifetime if annotation.lifetime == "'static" else None
+        return replace(annotation, inner=inner, lifetime=lifetime)
+    if isinstance(annotation, AppliedType):
+        return AppliedType(annotation.name, tuple(map(generic_lifetimes_erased, annotation.arguments)))
+    if isinstance(annotation, TupleType):
+        return TupleType(tuple(map(generic_lifetimes_erased, annotation.elements)))
+    if isinstance(annotation, SliceType):
+        return SliceType(generic_lifetimes_erased(annotation.element))
+    return annotation
 
 
 def loose_equal(first, second):
@@ -3020,7 +3056,8 @@ class Program:
                 if trait is None:
                     return False
                 actual = self.normalize(substitute(binding.project(argument, trait), arguments))
-                if actual != self.normalize(substitute(expected, arguments)):
+                wanted = self.normalize(substitute(expected, arguments))
+                if actual != wanted and not loose_equal(actual, wanted):
                     return False
         return True
 
@@ -3120,7 +3157,10 @@ class Program:
                 or (ITERATOR in self.traits and self.implements(annotation, ITERATOR, assumed, seen=seen))):
             return True
         if isinstance(annotation, IteratorType):
-            if trait == ITERATOR:
+            if trait in {ITERATOR, DOUBLE_ENDED, EXACT_SIZE}:
+                return True
+            if trait in self.traits and trait not in TRAIT_MODULES and self.implementation(annotation, trait, seen):
+                # Blanket impls such as impl<I: Iterator> IterExt for I cover built-in iterators too.
                 return True
             source = annotation.source[1] if annotation.source[0] in {"map", "rev"} else annotation.item
             return (trait == "Clone" and self.implements(source, "Clone", assumed)
@@ -3825,6 +3865,9 @@ class Parser:
             return lifetimes, types
         outer = self.type_parameters
         self.type_parameters = dict(outer)
+        # Bounds may name parameters declared later in the list, as in <I: IntoIterator<Item = T>, T>.
+        upcoming = {name: TypeParameter(name) for name in self.upcoming_type_parameters()}
+        self.type_parameters.update(upcoming)
         while self.current.text != ">":
             token = self.advance()
             if is_lifetime(token.text) and token.text not in {"'static", "'_"}:
@@ -3851,7 +3894,7 @@ class Parser:
                 name = identifier_text(token.text)
                 if name in types:
                     raise token.error(f"duplicate type parameter {token.text}")
-                parameter = TypeParameter(name)
+                parameter = upcoming.pop(name, None) or TypeParameter(name)
                 types[name] = self.type_parameters[name] = parameter
                 if self.accept(":"):
                     parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
@@ -3867,6 +3910,26 @@ class Parser:
         for bounds in lifetimes.values():
             self.require_lifetimes(bounds, lifetimes)
         return lifetimes, types
+
+    def upcoming_type_parameters(self):
+        """The type parameter names in the generic list starting at the current token."""
+        names, depth, offset, start = [], 0, -1, True
+        while True:
+            text = self.current.text if offset < 0 else self.peek(offset)
+            if not text:
+                return names
+            if start and is_identifier(text) and text not in self.reserved and text != "const":
+                names.append(identifier_text(text))
+            start = False
+            if text in {"<", "(", "["}:
+                depth += 1
+            elif text in {">", ")", "]", ">>"}:
+                depth -= 2 if text == ">>" else 1
+                if depth < 0:
+                    return names
+            elif text == "," and depth == 0:
+                start = True
+            offset += 1
 
     def trait_path(self):
         token = self.advance() if self.current.text in {"crate", "self", "super"} else self.identifier()
@@ -8481,6 +8544,7 @@ class Checker:
         if (name in {"collect", "sum", "product"} and not isinstance(base, IteratorType)
                 and not isinstance(actual, ReferenceType) and ITERATOR in self.program.traits
                 and self.implements(self.resolve(base), ITERATOR)):
+            self.require_impl_bindings(base, ITERATOR, expr.token)
             item = self.resolve(AssociatedType(base, "Item", ITERATOR))
             return self.iterator_terminal(expr, expected, IteratorType(item, ("trait",)))
         if (isinstance(actual, IteratorType) or isinstance(base, IteratorType)) and name == "as_str" and not rest:
@@ -8581,10 +8645,23 @@ class Checker:
                           and self.trait_available(actual, trait.name.text, expr.token)]
             if candidates:
                 receiver = actual
-        if (candidates and isinstance(actual, ReferenceType) and actual.mutable and receiver is base
+        if not candidates and not isinstance(actual, ReferenceType):
+            # Autoref: `coll.into_iter()` can take &coll when only &Coll implements the trait.
+            for mutable in (False, True):
+                borrowed = ReferenceType(base, mutable)
+                candidates = [trait for trait in self.program.traits.values()
+                              if name in trait.methods and self.has_receiver(trait.methods[name])
+                              and not isinstance(trait.methods[name].params[0][2], ReferenceType)
+                              and self.implements(borrowed, trait.name.text)
+                              and self.trait_available(borrowed, trait.name.text, expr.token)]
+                if candidates:
+                    receiver = borrowed
+                    break
+        if (candidates and isinstance(actual, ReferenceType) and receiver is base
+                and (actual.mutable or self.program.implementation(actual, candidates[0].name.text) is not None)
                 and not isinstance(candidates[0].methods[name].params[0][2], ReferenceType)
                 and self.implements(actual, candidates[0].name.text)
-                and not isinstance(base, (TypeParameter, OpaqueType))):
+                and not isinstance(base, OpaqueType)):
             # Method lookup probes the receiver's own type first, so `iter.by_ref().take(n)` uses &mut I.
             receiver = actual
         if len(candidates) > 1:
@@ -8815,6 +8892,9 @@ class Checker:
             raise token.error(f"type annotations needed for {method}")
         if method == "collect":
             self.check_collect(item, target, token)
+        elif (target not in NUMBER_TYPES and not (isinstance(target, AppliedType) and target.name in {OPTION, RESULT})
+              and self.user_gather(method, item, target, token)):
+            return
         else:
             element = item.inner if isinstance(item, ReferenceType) else item
             if isinstance(target, AppliedType) and target.name in {OPTION, RESULT}:
@@ -8850,8 +8930,26 @@ class Checker:
             if name == RESULT:
                 self.require(item.arguments[1], target.arguments[1], token)
             self.check_collect(item.arguments[0], target.arguments[0], token)
-        else:
+        elif not self.user_gather("collect", item, target, token):
             raise token.error(f"cannot collect items of type {item} into {target}")
+
+    def user_gather(self, method, item, target, token):
+        """Whether a FromIterator, Sum or Product impl builds target from items, settling the item type."""
+        trait = GATHER_TRAITS[method][0]
+        if trait not in self.program.traits or isinstance(target, (TypeVariable, TypeParameter)):
+            return False
+        matches = []
+        for impl in self.program.impls:
+            found = {}
+            if impl.trait == trait and match_types(impl.target, target, impl.parameters, found):
+                matches.append((impl, found))
+        if len(matches) == 1:
+            impl, found = matches[0]
+            declared = self.program.trait_arguments(trait, impl.trait_arguments, impl.target)
+            if declared and declared[0] is not None:
+                self.require(item, substitute(declared[0], found), token)
+            return True
+        return bool(matches) and self.program.implementation(target, trait, arguments_wanted=(item,)) is not None
 
     def vector_method(self, expr, scope, expected, actual, base):
         name = expr.token.text
@@ -8909,10 +9007,27 @@ class Checker:
                     for variable, template in zip(arguments, declared):
                         if template is not None and all(part in found or part not in impl.parameters
                                                         for part in type_leaves(template)):
-                            self.require(variable, substitute(template, found), expr.token)
+                            # The impl's own lifetimes, as in impl<'a> Extend<&'a str>, fit any caller.
+                            self.require(variable, generic_lifetimes_erased(substitute(template, found)), expr.token)
         self.program.dispatches[id(expr)] = (trait.name.text, receiver, expr.token.text.rsplit("::", 1)[-1],
                                              tuple(arguments))
+        if not arguments:
+            self.require_impl_bindings(receiver, trait.name.text, expr.token)
         return bindings
+
+    def require_impl_bindings(self, receiver, trait, token):
+        """Using the only impl of a trait for a type ties its parameters' associated-type bounds,
+        such as B: Iterator<Item = A::Item> in impl Iterator for Chain<A, B>."""
+        resolved = self.resolve(receiver)
+        if not isinstance(resolved, AppliedType):
+            return
+        matches = []
+        for impl in self.program.impls:
+            found = {}
+            if impl.trait == trait and match_types(impl.target, resolved, impl.parameters, found):
+                matches.append(found)
+        if len(matches) == 1 and any(getattr(parameter, "associated_bindings", None) for parameter in matches[0]):
+            self.associated_equalities.extend(self.associated_requirements(matches[0], token))
 
     def select_trait_impls(self):
         """When exactly one impl fits a generic trait call's known types, let it settle the unknown ones."""
@@ -10903,6 +11018,7 @@ class Interpreter:
             yield value
 
     def iteration_values(self, collection, annotation, token):
+        token = token or Token("0", 0, 0)
         iterator = collection if isinstance(collection, IteratorValue) else None
         if iterator and iterator.cursor is not None:
             return iterator.cursor[0]
@@ -11048,6 +11164,26 @@ class Interpreter:
         if value.ordered:
             entries.sort(key=functools.cmp_to_key(lambda left, right: self.compare(left[0], right[0])))
         return entries
+
+    def user_gather(self, method, collection, annotation, result):
+        """Run a user FromIterator, Sum or Product impl for collect, sum or product, if result has one."""
+        if method not in GATHER_TRAITS or GATHER_TRAITS[method][0] not in self.program.traits:
+            return None
+        if result in NUMBER_TYPES or result == STRING or is_vector(result) or (
+                isinstance(result, AppliedType) and (result.name in {OPTION, RESULT, BOX} or result.name in MAP_TYPES
+                                                     or result.name.startswith("std" + MODULE_SEPARATOR))):
+            return None
+        trait, name = GATHER_TRAITS[method]
+        source = self.program.concrete_type(self.program.normalize(substitute(annotation, self.type_arguments)))
+        item = source.item if isinstance(source, IteratorType) else self.program.normalize(
+            AssociatedType(source, "Item", ITERATOR))
+        implementation = self.program.implementation(result, trait, arguments_wanted=(item,))
+        if implementation is None:
+            return None
+        impl, arguments = implementation
+        function = impl.methods[name]
+        arguments = arguments | {function.method_parameters[0]: source}
+        return self.call(function.name.text, (collection,), arguments)
 
     def collect(self, values, target):
         """Build a collection of the requested type from iterator items."""
@@ -11265,8 +11401,13 @@ class Interpreter:
 
     def trait_iteration(self, value, annotation):
         """Drive any Iterator (or IntoIterator) implementation by calling its next method."""
-        if isinstance(annotation, ReferenceType) and annotation.mutable:
+        if isinstance(annotation, ReferenceType) and annotation.mutable and (
+                isinstance(value.read(), IteratorValue) or isinstance(annotation.inner, DynType)
+                or self.program.implements(self.program.concrete_type(annotation.inner), ITERATOR)):
             address, annotation = value, self.program.concrete_type(annotation.inner)
+            if isinstance(annotation, DynType) and isinstance(address, DynAddress):
+                # &mut dyn Iterator drives the concrete iterator behind the trait object.
+                address, annotation = address.address, self.program.concrete_type(address.concrete)
             if isinstance(address.read(), IteratorValue):
                 yield from self.iteration_values(self.start_iterator(address), annotation, None)
                 return
@@ -11309,6 +11450,18 @@ class Interpreter:
         sentinel = object()
         item = next(iterator.cursor[0], sentinel)
         return self.variant(result, "None") if item is sentinel else self.variant(result, "Some", item)
+
+    def buffered_cursor(self, address):
+        """The remaining items of a built-in iterator, buffered so they can be taken from either end."""
+        iterator = self.start_iterator(address)
+        cursor = iterator.cursor[0]
+        if not isinstance(cursor, BufferedCursor):
+            cursor = iterator.cursor[0] = BufferedCursor(cursor)
+        return iterator, cursor
+
+    def iterator_next_back(self, address, result):
+        _, cursor = self.buffered_cursor(address)
+        return self.variant(result, "Some", cursor.items.pop()) if cursor.items else self.variant(result, "None")
 
     def placeholder(self, annotation):
         # Wildcard patterns can inspect an aggregate's shape without reading
@@ -11546,8 +11699,11 @@ class Interpreter:
             source = args[0]
             annotation = self.program.expr_types[id(source)]
             collection = self.address(source, scope) if ungroup(source).kind == "box_deref" else self.eval(source, scope)
-            values = self.iteration_values(collection, annotation, source.token)
             result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+            gathered = self.user_gather(token.text, collection, annotation, result)
+            if gathered is not None:
+                return gathered
+            values = self.iteration_values(collection, annotation, source.token)
             if token.text == "collect":
                 return self.collect(values, result)
             if token.text == "count":
@@ -11613,12 +11769,18 @@ class Interpreter:
             return IteratorValue(self.eval(args[0], scope), True, string_mode=token.text)
         if kind == "reverse_iterator":
             iterator = self.eval(args[0], scope)
+            if iterator.cursor is not None:
+                # A started iterator reverses what it has left.
+                return replace(iterator, cursor=[BufferedCursor(reversed(tuple(iterator.cursor[0])))])
             return replace(iterator, reverse=not iterator.reverse)
         if kind == "map_iterator":
             iterator = self.eval(args[0], scope)
             mapper = self.eval(args[1], scope)
             if mapper.environment and self.program.is_copy(self.program.expr_types[id(args[1])]):
                 mapper = self.clone_value(mapper)
+            if iterator.cursor is not None:
+                # A started iterator maps what it has left.
+                return replace(iterator, cursor=[self.mapped_items(iterator.cursor[0], (mapper,))])
             return replace(iterator, mappers=(*iterator.mappers, mapper))
         if kind in {"function_pointer", "closure_value"}:
             name, arguments = args
@@ -12052,6 +12214,9 @@ class Interpreter:
                 if implementation is None and trait == ITERATOR and name == "next":
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
                     return self.iterator_next(values[0], result)
+                if implementation is None and trait == DOUBLE_ENDED and name == "next_back":
+                    result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+                    return self.iterator_next_back(values[0], result)
                 impl, specialized = implementation or (Implementation(token, receiver, trait, (), {}, {}), {})
                 if name in impl.methods:
                     prototype = function
@@ -12935,6 +13100,85 @@ def rust_iter_collect(interpreter, result, iterator):
 @intrinsic
 def rust_lazy_next(interpreter, result, address):
     return interpreter.iterator_next(address, result)
+
+
+@intrinsic
+def rust_extend_builtin(interpreter, result, collection, source):
+    """Extend::extend called generically on a built-in collection: run its inherent extend."""
+    value = collection.read()
+    if isinstance(value, (str, ArrayValue)):
+        element = collection_element(interpreter.program.concrete_type(interpreter.intrinsic_types[0]))
+        added = tuple(interpreter.iterate(source, -1))
+        if isinstance(value, str):
+            collection.write(value + "".join(display(item, False) for item in added))
+        else:
+            collection.write(ArrayValue(value.items + tuple(plain_item(interpreter, item, element)
+                                                            if element is not None else item for item in added)))
+        return None
+    raise RustPanic("Extend::extend is not supported for this collection")
+
+
+@intrinsic
+def rust_iter_size_hint(interpreter, result, address):
+    """Iterator::size_hint's default: exact for built-in iterators, (0, None) otherwise."""
+    bound = result.elements[1]
+    if not isinstance(address.read(), IteratorValue):
+        return make_tuple(interpreter, result, 0, option(interpreter, bound))
+    iterator, cursor = interpreter.buffered_cursor(address)
+    if iterator.string_mode == "chars":
+        size = sum(len(str(char).encode("utf-8")) for char in cursor.items)
+        return make_tuple(interpreter, result, (size + 3) // 4, option(interpreter, bound, size))
+    return make_tuple(interpreter, result, len(cursor.items), option(interpreter, bound, len(cursor.items)))
+
+
+@intrinsic
+def rust_double_ended(interpreter, result, address):
+    if isinstance(address.read(), IteratorValue):
+        return True
+    annotation = interpreter.program.concrete_type(interpreter.program.normalize(interpreter.intrinsic_types[0]))
+    return interpreter.program.implements(annotation, DOUBLE_ENDED)
+
+
+@intrinsic
+def rust_next_back(interpreter, result, address):
+    if isinstance(address.read(), IteratorValue):
+        return interpreter.iterator_next_back(address, result)
+    annotation = interpreter.program.concrete_type(interpreter.program.normalize(interpreter.intrinsic_types[0]))
+    impl, arguments = interpreter.program.implementation(annotation, DOUBLE_ENDED)
+    return interpreter.call(impl.methods["next_back"].name.text, (address,), arguments)
+
+
+@intrinsic
+def rust_range_count(interpreter, result, bounds):
+    value = map_of(bounds)
+    start, end = value.fields[:2]
+    if isinstance(start, Character):
+        start, end = ord(start), ord(end)
+    if len(value.fields) == 3:
+        return 0 if value.fields[2] else max(0, end - start + 1)
+    return max(0, end - start)
+
+
+@intrinsic
+def rust_range_next_back(interpreter, result, address):
+    value = address.read()
+    start, end = value.fields
+    if interpreter.compare(start, end) >= 0:
+        return option(interpreter, result)
+    end = range_step(end, None, -1)
+    address.write(Value(value.constructor, (start, end)))
+    return option(interpreter, result, end)
+
+
+@intrinsic
+def rust_range_inclusive_next_back(interpreter, result, address):
+    value = address.read()
+    start, end, exhausted = value.fields
+    if exhausted or interpreter.compare(start, end) > 0:
+        return option(interpreter, result)
+    done = interpreter.compare(start, end) == 0
+    address.write(Value(value.constructor, (start, end if done else range_step(end, None, -1), done)))
+    return option(interpreter, result, end)
 
 
 def make_tuple(interpreter, annotation, *values):

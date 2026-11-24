@@ -1,0 +1,85 @@
+0
+-- building the chain does nothing
+-- now pulling two
+source: yield 1
+map: 1 -> 10
+filter: 10 false
+source: yield 2
+map: 2 -> 20
+filter: 20 true
+source: yield 3
+map: 3 -> 30
+filter: 30 false
+source: yield 4
+map: 4 -> 40
+filter: 40 true
+got [20, 40]
+-- inspect + take_while
+source: yield 1
+inspect 1
+source: yield 2
+inspect 2
+source: yield 3
+inspect 3
+total 3
+-- zip pulls left first
+source: yield 1
+source: yield 101
+source: yield 2
+source: yield 102
+source: exhausted
+zipped [(1, 101), (2, 102)]
+-- chain switches over
+source: yield 1
+source: exhausted
+source: yield 51
+source: exhausted
+count 2
+-- find stops early
+source: yield 1
+source: yield 2
+source: yield 3
+found Some(3)
+-- skip consumes on first next
+skip built
+source: yield 1
+source: yield 2
+source: yield 3
+next Some(3)
+-- flat_map
+source: yield 1
+expand 1
+source: yield 2
+expand 2
+source: exhausted
+[1, 101, 2, 102]
+-- for loop with break
+source: yield 1
+body 1
+source: yield 2
+body 4
+source: yield 3
+break at 9
+-- peekable peeks once
+source: yield 1
+peek Some(1)
+peek Some(1)
+next Some(1)
+source: yield 2
+next Some(2)
+-- scan with early stop
+source: yield 1
+scan acc 1
+source: yield 2
+scan acc 3
+source: yield 3
+scan acc 6
+source: yield 4
+scan acc 10
+[1, 3, 6]
+-- fuse after exhaustion
+source: yield 1
+Some(1)
+source: exhausted
+None
+None

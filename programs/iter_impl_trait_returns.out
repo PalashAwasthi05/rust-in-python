@@ -1,0 +1,12 @@
+0
+in stock: ["apple", "melon", "kiwi"]
+apple costs 0.50
+pear costs 0.75
+melon costs 3.25
+total value 10.00
+evens [0, 2, 4, 6, 8]
+sum of squares 30
+long words ["quick", "brown", "jumps"]
+counter [11, 12, 13, 14]
+composed <3><9><15><21>
+nested count 10
