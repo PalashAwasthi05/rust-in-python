@@ -14,6 +14,48 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("opaque associated bindings are visible after specialization", """
+        trait Read { type Item; fn read(&self) -> Self::Item; }
+        trait Source: Read {}
+        struct Packet<T: Copy>(T);
+        impl<T: Copy> Read for Packet<T> {
+            type Item = T;
+            fn read(&self) -> T { self.0 }
+        }
+        impl<T: Copy> Source for Packet<T> {}
+        fn packet<T: Copy>(value: T) -> impl Source<Item = T> { Packet(value) }
+        fn via_object(source: &dyn Read<Item = u8>) -> u8 { source.read() }
+        fn main() {
+            let exact: u16 = packet(7u16).read();
+            let input = packet(3u8);
+            println!("{exact} {}", via_object(&input));
+        }
+    """, "7 3\n"),
+    ("opaque returns support trait calls and generic specialization", """
+        trait Number { fn read(&self) -> i32; }
+        struct Meter(i32);
+        impl Number for Meter { fn read(&self) -> i32 { self.0 } }
+        impl Meter { fn hide(self) -> impl Number { self } }
+        fn meter(n: i32) -> impl Number { Meter(n) }
+        fn wrap<T: Number>(n: T) -> impl Number { n }
+        fn relay() -> impl Number { wrap(meter(7)) }
+        fn display() -> impl std::fmt::Display { 12u8 }
+        fn read_dynamic(value: &dyn Number) -> i32 { value.read() }
+        fn main() {
+            let first = relay();
+            let second = wrap(wrap(Meter(5)));
+            println!("{} {} {} {}", first.read(), read_dynamic(&second), Meter(3).hide().read(), display());
+        }
+    """, "7 5 3 12\n"),
+    ("explicit and tail returns use the same opaque type", """
+        fn counted(flag: bool) -> impl Copy + std::fmt::Debug {
+            if flag { return 3u8; }
+            4u8
+        }
+        fn never_returns() -> impl Copy { never_returns() }
+        fn same<T: std::fmt::Debug + Copy>(a: T, b: T) { println!("{a:?} {b:?}"); }
+        fn main() { same(counted(true), counted(false)); }
+    """, "3 4\n"),
     ("scalar statics have crate-wide storage and static borrow lifetime", """
         macro_rules! bake { ($number:expr) => { $number + 2 }; }
         macro_rules! block_value { () => { const { 3 } }; }
@@ -1879,6 +1921,46 @@ VALID = [
 ]
 
 INVALID = [
+    ("opaque associated bindings enforce the return type's projection", """
+        trait Read { type Item; }
+        struct Unit;
+        impl Read for Unit { type Item = u8; }
+        fn packet() -> impl Read<Item = u16> { Unit }
+        fn main() {}
+    """, "expected u16, found u8"),
+    ("opaque associated types stay hidden unless constrained", """
+        trait Read { type Item; }
+        struct Unit;
+        impl Read for Unit { type Item = u8; }
+        fn hidden() -> impl Read { Unit }
+        fn exposed() -> impl Read<Item = u8> { hidden() }
+        fn main() {}
+    """, "expected u8, found impl Read returned by hidden::Item"),
+    ("opaque return branches must use a single concrete type", """
+        fn different(flag: bool) -> impl Copy {
+            if flag { 2u8 } else { 2u16 }
+        }
+        fn main() {}
+    """, "expected u8, found u16"),
+    ("opaque types from distinct functions remain distinct", """
+        fn first() -> impl Copy { 2u8 }
+        fn second() -> impl Copy { 3u8 }
+        fn same<T: Copy>(_: T, _: T) {}
+        fn main() { same(first(), second()); }
+    """, "expected impl Copy returned by first"),
+    ("opaque returns expose only their declared bounds", """
+        fn first() -> impl Copy { 2u8 }
+        fn main() { println!("{:?}", first()); }
+    """, "does not implement Debug"),
+    ("opaque return values must satisfy declared bounds", """
+        struct Unit;
+        fn value() -> impl Copy { Unit }
+        fn main() {}
+    """, "Unit does not implement Copy"),
+    ("an opaque return requires a resolvable concrete type", """
+        fn again() -> impl Copy { (again(),) }
+        fn main() {}
+    """, "cannot resolve recursive opaque return type"),
     ("immutable statics cannot be assigned", """
         static NUMBER: i32 = 4;
         fn main() { NUMBER = 5; }

@@ -1405,6 +1405,17 @@ def is_vector(annotation):
 
 
 @dataclass(frozen=True)
+class OpaqueType:
+    function: str
+    bounds: frozenset
+    arguments: tuple
+    bindings: tuple = ()
+
+    def __str__(self):
+        return f"impl {' + '.join(sorted(self.bounds))} returned by {self.function}"
+
+
+@dataclass(frozen=True)
 class ConstValue:
     value: int | bool | float | Character
     kind: str | None = field(default=None, compare=False)
@@ -1689,6 +1700,10 @@ def substitute(annotation, arguments, *, defer_const=False):
                        source=tuple(substitute(part, arguments) for part in annotation.source))
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
+    if isinstance(annotation, OpaqueType):
+        return replace(annotation, arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments),
+                       bindings=tuple((bound, item, substitute(kind, arguments))
+                                      for bound, item, kind in annotation.bindings))
     if isinstance(annotation, TupleType):
         return TupleType(tuple(substitute(kind, arguments) for kind in annotation.elements))
     if isinstance(annotation, ArrayType):
@@ -1724,6 +1739,7 @@ class Program:
     values_in_scope: dict = field(default_factory=dict)
     constants_in_scope: dict = field(default_factory=dict)
     statics: dict = field(default_factory=dict)
+    opaque_witnesses: dict = field(default_factory=dict)
     formats: dict = field(default_factory=dict)
 
     def add_prelude(self):
@@ -1750,13 +1766,18 @@ class Program:
         if annotation.trait:
             trait = self.traits.get(annotation.trait)
             return trait if trait and annotation.item in trait.associated else None
-        if isinstance(annotation.owner, TypeParameter):
+        if isinstance(annotation.owner, (TypeParameter, OpaqueType)):
             bounds = self.trait_closure(annotation.owner.bounds)
             matches = [trait for name, trait in self.traits.items()
                        if name in bounds and annotation.item in trait.associated]
             if len(matches) == 1:
                 return matches[0]
         return None
+
+    def associated_trait(self, bound, item):
+        matches = [self.traits[name] for name in self.trait_closure({bound})
+                   if name in self.traits and item in self.traits[name].associated]
+        return matches[0] if len(matches) == 1 else None
 
     def normalize(self, annotation, seen=()):
         if isinstance(annotation, AssociatedType):
@@ -1770,6 +1791,10 @@ class Program:
             trait = self.projection_trait(annotation)
             if trait:
                 annotation = replace(annotation, trait=trait.name.text)
+                if isinstance(owner, OpaqueType):
+                    for bound, item, kind in owner.bindings:
+                        if item == annotation.item and self.associated_trait(bound, item) is trait:
+                            return self.normalize(kind, (*seen, annotation))
                 if not isinstance(owner, (TypeParameter, TypeVariable)):
                     implementation = self.implementation(owner, trait.name.text)
                     if implementation:
@@ -1790,12 +1815,27 @@ class Program:
                            source=tuple(self.normalize(part, seen) for part in annotation.source))
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
+        if isinstance(annotation, OpaqueType):
+            return replace(annotation, arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments),
+                           bindings=tuple((bound, item, self.normalize(kind, seen))
+                                          for bound, item, kind in annotation.bindings))
         if isinstance(annotation, TupleType):
             return TupleType(tuple(self.normalize(kind, seen) for kind in annotation.elements))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.normalize(annotation.element, seen), annotation.length)
         if isinstance(annotation, SliceType):
             return SliceType(self.normalize(annotation.element, seen))
+        return annotation
+
+    def concrete_type(self, annotation):
+        seen = set()
+        while isinstance(annotation, OpaqueType):
+            function = self.functions[annotation.function]
+            if annotation in seen:
+                raise function.name.error("cannot resolve recursive opaque return type")
+            seen.add(annotation)
+            arguments = dict(zip(function.type_parameters, annotation.arguments))
+            annotation = self.normalize(substitute(self.opaque_witnesses[function.name.text], arguments))
         return annotation
 
     def trait_closure(self, bounds):
@@ -1876,7 +1916,7 @@ class Program:
             return bool(declaration and trait in self.trait_closure(
                 declaration.associated[normalized.item].bounds
             ))
-        if isinstance(annotation, TypeParameter):
+        if isinstance(annotation, (TypeParameter, OpaqueType)):
             if annotation in assumed or trait in self.trait_closure(annotation.bounds):
                 return True
             return trait in self.traits and self.implementation(annotation, trait, seen) is not None
@@ -2202,7 +2242,17 @@ class Parser:
                 break
         self.expect(")")
         self.argument_parameters = None
-        result = self.type_name(signature=lifetimes) if self.accept("->") else "()"
+        result = "()"
+        if self.accept("->"):
+            if opaque := self.accept("impl"):
+                if self.current_trait is not None:
+                    raise opaque.error("opaque return types in trait methods are unsupported")
+                bindings = {}
+                bounds = self.trait_bounds(bindings=bindings, signature=lifetimes)
+                result = OpaqueType(name.text, frozenset(bounds), tuple(self.type_parameters.values()),
+                                    tuple((bound, item, kind) for (bound, item), kind in bindings.items()))
+            else:
+                result = self.type_name(signature=lifetimes)
         self.sized_receiver = False
         self.where_clause(lifetimes)
         sized_receiver = self.sized_receiver
@@ -2456,10 +2506,24 @@ class Parser:
         self.expect(";")
         self.trait_names[alias] = trait
 
-    def trait_bounds(self):
-        bounds = {self.trait_path()}
-        while self.accept("+"):
-            bounds.add(self.trait_path())
+    def trait_bounds(self, *, bindings=None, signature=None):
+        bounds = set()
+        while True:
+            bound = self.trait_path()
+            bounds.add(bound)
+            if bindings is not None and self.accept("<"):
+                while self.current.text != ">":
+                    name = self.identifier()
+                    self.expect("=")
+                    key = bound, name.text
+                    if key in bindings:
+                        raise name.error(f"duplicate associated type binding {name.text!r}")
+                    bindings[key] = self.type_name(signature=signature)
+                    if not self.accept(","):
+                        break
+                self.expect(">")
+            if not self.accept("+"):
+                break
         return bounds
 
     def lifetime_bounds(self):
@@ -4164,13 +4228,24 @@ class Checker:
                 if name.key in scope.bindings:
                     raise name.error(f"duplicate parameter {name.text!r}")
                 scope.bindings[name.key] = Binding(annotation, mutable)
+            self.check_type(function.result, function.name, allow_never=True)
             self.result = function.result
-            self.check_type(self.result, function.name, allow_never=True)
+            opaque = isinstance(self.result, OpaqueType)
+            if opaque:
+                self.result = TypeVariable("opaque return type", function.name)
+                self.variables.append(self.result)
+                for bound in sorted(function.result.bounds):
+                    self.obligation(self.result, bound, function.name)
+                self.program.opaque_witnesses[function.name.text] = self.result
             concrete = self.effective_function(function, tuple(kind for _, _, kind in function.params),
                                                self.resolve(self.result))
             function.return_inputs = concrete.return_inputs
-            result = self.type_of(function.body, scope, function.result)
-            self.require_argument(result, function.result, function.body.token)
+            result = self.type_of(function.body, scope, self.result)
+            if opaque and result == function.result:
+                result = NEVER
+            self.require_argument(result, self.result, function.body.token)
+            if opaque and result == NEVER and isinstance(self.resolve(self.result), TypeVariable):
+                self.require(self.result, "()", function.name)
         self.finish_inference()
 
     def check_bounds(self, parameters, token):
@@ -4296,6 +4371,10 @@ class Checker:
             return replace(annotation, item=self.resolve(annotation.item), source=tuple(map(self.resolve, annotation.source)))
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
+        if isinstance(annotation, OpaqueType):
+            return replace(annotation, arguments=tuple(self.resolve(arg) for arg in annotation.arguments),
+                           bindings=tuple((bound, item, self.resolve(kind))
+                                          for bound, item, kind in annotation.bindings))
         if isinstance(annotation, TupleType):
             return TupleType(tuple(map(self.resolve, annotation.elements)))
         if isinstance(annotation, ArrayType):
@@ -4320,7 +4399,7 @@ class Checker:
             return any(self.occurs(variable, kind) for kind in (*annotation.parameters, annotation.result))
         if isinstance(annotation, IteratorType):
             return any(self.occurs(variable, part) for part in (annotation.item, *annotation.source))
-        if isinstance(annotation, AppliedType):
+        if isinstance(annotation, (AppliedType, OpaqueType)):
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
         if isinstance(annotation, TupleType):
             return any(self.occurs(variable, kind) for kind in annotation.elements)
@@ -4364,6 +4443,11 @@ class Checker:
                 return
         if isinstance(actual, AppliedType) and isinstance(expected, AppliedType):
             if actual.name == expected.name and len(actual.arguments) == len(expected.arguments):
+                for left, right in zip(actual.arguments, expected.arguments):
+                    self.require(left, right, token)
+                return
+        if isinstance(actual, OpaqueType) and isinstance(expected, OpaqueType):
+            if actual.function == expected.function:
                 for left, right in zip(actual.arguments, expected.arguments):
                     self.require(left, right, token)
                 return
@@ -4491,6 +4575,7 @@ class Checker:
         for variable in self.variables:
             if isinstance(self.resolve(variable), TypeVariable):
                 raise variable.token.error(f"type annotations needed for {variable.name}")
+        self.check_opaque_witnesses()
         for key, (token, parts) in self.program.formats.items():
             resolved = []
             for field in parts:
@@ -4562,6 +4647,43 @@ class Checker:
             function.result = self.resolve(function.result)
             function.return_inputs = Parser.return_inputs(function.name, function.params, function.result, {})
 
+    def check_opaque_witnesses(self):
+        witnesses = self.program.opaque_witnesses
+        for name, annotation in witnesses.items():
+            witnesses[name] = self.resolve(annotation)
+        visiting, finished = set(), set()
+
+        def visit(name):
+            if name in visiting:
+                raise self.functions[name].name.error("cannot resolve recursive opaque return type")
+            if name in finished:
+                return
+            visiting.add(name)
+            parts = list(self.type_parts(witnesses[name]))
+            while parts:
+                part = parts.pop()
+                if isinstance(part, OpaqueType):
+                    visit(part.function)
+                    for argument in part.arguments:
+                        parts.extend(self.type_parts(argument))
+                elif isinstance(part, FunctionType):
+                    for argument in (*part.parameters, part.result):
+                        parts.extend(self.type_parts(argument))
+            visiting.remove(name)
+            finished.add(name)
+
+        for name in witnesses:
+            visit(name)
+            function = self.functions[name]
+            witness = self.program.concrete_type(function.result)
+            if (isinstance(witness, ReferenceType) or borrowing_iterator(witness)
+                    or isinstance(witness, FunctionType) and witness.closure):
+                raise function.name.error("opaque returns of borrowed values or capturing closures are unsupported")
+            for bound, item, expected in function.result.bindings:
+                trait = self.program.associated_trait(bound, item)
+                projection = AssociatedType(witnesses[name], item, trait.name.text)
+                self.require(projection, expected, function.name)
+
     def resolve_pattern(self, pattern):
         tag = pattern.tag
         if isinstance(tag, Constructor):
@@ -4598,6 +4720,16 @@ class Checker:
         if isinstance(annotation, (TypeParameter, TypeVariable)):
             if annotation.const_type:
                 raise token.error("expected a type, found a const parameter")
+            return
+        if isinstance(annotation, OpaqueType):
+            self.check_bounds((annotation,), token)
+            for bound, item, expected in annotation.bindings:
+                trait = self.program.associated_trait(bound, item)
+                if trait is None:
+                    raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
+                if trait.associated[item].parameters:
+                    raise token.error("generic associated type bindings require specialization")
+                self.check_type(expected, token)
             return
         if isinstance(annotation, FunctionType):
             for kind in annotation.parameters:
@@ -6135,7 +6267,7 @@ class Checker:
     def trait_available(self, base, name, token):
         if isinstance(base, DynType):
             return name in self.program.trait_closure({base.trait})
-        if isinstance(base, TypeParameter) and name in self.program.trait_closure(base.bounds):
+        if isinstance(base, (TypeParameter, OpaqueType)) and name in self.program.trait_closure(base.bounds):
             return True
         return name in self.program.traits_in_scope.get(token.module, ())
 
@@ -7952,7 +8084,7 @@ class Interpreter:
             if isinstance(value, DynAddress):
                 return value
             concrete = self.program.normalize(substitute(args[1], self.type_arguments))
-            return DynAddress(value, concrete)
+            return DynAddress(value, self.program.concrete_type(concrete))
         if kind in {"slice_reference", "string_reference"}:
             return self.eval(args[0], scope)
         if kind == "literal":
@@ -8161,6 +8293,7 @@ class Interpreter:
                 if isinstance(receiver, DynType):
                     receiver = values[0].concrete
                     values = (values[0].address, *values[1:])
+                receiver = self.program.concrete_type(receiver)
                 impl, specialized = self.program.implementation(receiver, trait)
                 if name in impl.methods:
                     prototype = function

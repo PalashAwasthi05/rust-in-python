@@ -44,6 +44,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments, plus argument-position `impl Trait`
+- Opaque owned return types in free functions and inherent methods with `-> impl Trait` and associated-type bindings
 - Type aliases in type positions, including lifetime, type, and const parameters
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
