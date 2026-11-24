@@ -1,0 +1,12 @@
+0
+[(1, 150), (2, 500)]
+moved 120 from 1 to 2
+failed: account 1 has only 30
+failed: savings withdrawals are capped at 100
+moved 80 from 2 to 1
+failed: no such source
+failed: no account 9
+[(1, 110), (2, 594)]
+[100, 50, -120, 80]
+Some(100) rc=2
+704

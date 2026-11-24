@@ -6799,8 +6799,8 @@ class Checker:
                 if parameter.const_type:
                     self.check_const(argument, parameter.const_type, token)
                     continue
-                if annotation.name in POINTER_TYPES and isinstance(argument, (DynType, SliceType)) or (
-                        annotation.name in POINTER_TYPES and argument == "str"):
+                if (annotation.name in POINTER_TYPES or "?Sized" in parameter.bounds) and (
+                        isinstance(argument, (DynType, SliceType)) or argument == "str"):
                     if isinstance(argument, DynType):
                         self.check_dyn(argument, token)
                     continue
@@ -7336,9 +7336,37 @@ class Checker:
                 and (is_box(result) or not isinstance(self.resolve(result.arguments[0]), DynType))):
             self.check_dyn_conversion(result.arguments[0], expected.arguments[0], expr.token)
             result = expected
+        elif (isinstance(result, AppliedType) and isinstance(expected, AppliedType) and result.name == expected.name
+              and result.name in POINTER_TYPES and result != expected):
+            # `Rc<RefCell<T>>` to `Rc<RefCell<dyn Trait>>`: unsize the last field's `?Sized` parameter.
+            unsized = self.nested_unsizing(self.resolve(result.arguments[0]), self.resolve(expected.arguments[0]))
+            if unsized is not None:
+                self.check_dyn_conversion(*unsized, expr.token)
+                result = expected
         result = self.coerce_reference(expr, result, expected)
         self.program.expr_types[id(expr)] = result
         return result
+
+    def nested_unsizing(self, actual, expected):
+        """The (concrete, dyn) pair when `expected` is `actual` with one ?Sized argument made a trait object."""
+        if not (isinstance(actual, AppliedType) and isinstance(expected, AppliedType) and actual.name == expected.name
+                and len(actual.arguments) == len(expected.arguments)):
+            return None
+        parameters = self.program.type_parameters.get(actual.name, ())
+        found = None
+        for parameter, left, right in zip(parameters, actual.arguments, expected.arguments):
+            left, right = self.resolve(left), self.resolve(right)
+            if left == right:
+                continue
+            if found is not None:
+                return None
+            if isinstance(right, DynType) and "?Sized" in parameter.bounds and not isinstance(left, DynType):
+                found = (left, right)
+            else:
+                found = self.nested_unsizing(left, right)
+                if found is None:
+                    return None
+        return found
 
     def coerce_reference(self, expr, actual, expected):
         if (not isinstance(expected, ReferenceType) or not isinstance(actual, ReferenceType)
@@ -12033,7 +12061,15 @@ class Interpreter:
             try:
                 for statement in statements:
                     mark = len(self.temporaries)
-                    self.eval(statement, inner)
+                    try:
+                        self.eval(statement, inner)
+                    except ProcessExit:
+                        raise
+                    except BaseException:
+                        # `guard.method()?` returning early still drops the statement's temporaries.
+                        if self.track_drops and len(self.temporaries) > mark:
+                            self.drop_temporaries(mark, statement)
+                        raise
                     if self.track_drops and len(self.temporaries) > mark:
                         self.drop_temporaries(mark, statement)
                 return self.eval(tail, inner) if tail else None
@@ -14367,13 +14403,19 @@ for _function in (Rc__new, Rc__clone, Rc__strong_count, Rc__weak_count, Rc__ptr_
 @intrinsic
 def rust_rc_deref(interpreter, result, this):
     rc = map_of(this)
-    if isinstance(result.inner, DynType):
+    if any(isinstance(part, DynType) for part in type_leaves(result.inner)):
+        # `Rc<dyn T>` or `Rc<RefCell<dyn T>>`: carry the concrete type for dispatch further in.
         return DynAddress(Address(rc.cell), rc.concrete)
     return Address(rc.cell)
 
 
 @intrinsic
 def rust_cell_value(interpreter, result, cell):
+    if isinstance(cell, DynAddress) and isinstance(result.inner, DynType):
+        # A `RefCell<dyn Trait>` built from `RefCell<Concrete>`: the contents keep the concrete type.
+        concrete = interpreter.program.concrete_type(cell.concrete)
+        inner = concrete.arguments[0] if isinstance(concrete, AppliedType) and concrete.arguments else concrete
+        return DynAddress(cell.child(Token("value", 0, 0)), inner)
     return cell.child(Token("value", 0, 0))
 
 

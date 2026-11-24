@@ -350,6 +350,12 @@ pub mod iter {
         fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
     }
 
+    // A boxed iterator (such as `Box<dyn Iterator<Item = T>>`) is an iterator, so adapters take it by value.
+    impl<I: Iterator + ?Sized> Iterator for Box<I> {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<I::Item> { (**self).next() }
+    }
+
     // Numeric sums are built in; these traits let user types opt into `iter.sum()` and `iter.product()`.
     pub trait Sum<A = Self>: Sized {
         fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
@@ -2220,26 +2226,26 @@ pub mod cell {
     use crate::fmt;
 
     // `borrow` counts shared borrows above zero and marks a mutable borrow with -1.
-    pub struct RefCell<T> { value: T, borrow: Cell<isize> }
+    pub struct RefCell<T: ?Sized> { value: T, borrow: Cell<isize> }
 
-    pub struct Ref<'b, T> { value: &'b T, borrow: &'b Cell<isize> }
-    pub struct RefMut<'b, T> { value: &'b mut T, borrow: &'b Cell<isize> }
+    pub struct Ref<'b, T: ?Sized> { value: &'b T, borrow: &'b Cell<isize> }
+    pub struct RefMut<'b, T: ?Sized> { value: &'b mut T, borrow: &'b Cell<isize> }
 
-    impl<'b, T> crate::ops::Deref for Ref<'b, T> {
+    impl<'b, T: ?Sized> crate::ops::Deref for Ref<'b, T> {
         type Target = T;
         fn deref(&self) -> &T { self.value }
     }
-    impl<'b, T> Drop for Ref<'b, T> {
+    impl<'b, T: ?Sized> Drop for Ref<'b, T> {
         fn drop(&mut self) { self.borrow.set(self.borrow.get() - 1); }
     }
-    impl<'b, T> crate::ops::Deref for RefMut<'b, T> {
+    impl<'b, T: ?Sized> crate::ops::Deref for RefMut<'b, T> {
         type Target = T;
         fn deref(&self) -> &T { &*self.value }
     }
-    impl<'b, T> crate::ops::DerefMut for RefMut<'b, T> {
+    impl<'b, T: ?Sized> crate::ops::DerefMut for RefMut<'b, T> {
         fn deref_mut(&mut self) -> &mut T { &mut *self.value }
     }
-    impl<'b, T> Drop for RefMut<'b, T> {
+    impl<'b, T: ?Sized> Drop for RefMut<'b, T> {
         fn drop(&mut self) { self.borrow.set(0); }
     }
     impl<'b, T: fmt::Display> fmt::Display for Ref<'b, T> {
@@ -2272,6 +2278,9 @@ pub mod cell {
             crate::intrinsics::track_drops();
             RefCell { value: value, borrow: Cell::new(0) }
         }
+    }
+    // Borrowing works for unsized contents too, as in `Rc<RefCell<dyn Trait>>`.
+    impl<T: ?Sized> RefCell<T> {
         pub fn borrow(&self) -> Ref<'_, T> {
             match self.try_borrow() {
                 Ok(guard) => guard,
@@ -2295,6 +2304,8 @@ pub mod cell {
             self.borrow.set(-1);
             Ok(RefMut { value: crate::intrinsics::refcell_value(self), borrow: &self.borrow })
         }
+    }
+    impl<T> RefCell<T> {
         pub fn get_mut(&mut self) -> &mut T { &mut self.value }
         pub fn into_inner(self) -> T { self.value }
         pub fn replace(&self, value: T) -> T { crate::mem::replace(crate::intrinsics::refcell_value(self), value) }
