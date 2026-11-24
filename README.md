@@ -45,6 +45,9 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
 - Const generic parameters and fixed-size arrays with length inference, indexing, and repeat literals
 - Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
+- Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
+- Generic associated types and const expressions evaluated at specialization
+- Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -176,12 +179,48 @@ fn main() {
 
 The array length infers the const argument `N`. The trait's default method reads the implementation's associated constant and prints `3`.
 
+## Pass a trait object
+
+```rust
+trait Measure {
+    fn read(&self) -> i32;
+}
+
+struct Meter(i32);
+impl Measure for Meter {
+    fn read(&self) -> i32 { self.0 }
+}
+
+fn report(value: &dyn Measure) {
+    println!("{}", value.read());
+}
+
+fn main() {
+    let meter = Meter(7);
+    report(&meter);
+}
+```
+
+## Load procedural macros
+
+The optional host uses the installed Rust compiler to expand function-like, attribute, and derive macros from compiled Rust crates. Pass the name and path of each crate.
+
+```sh
+python3 rust_in_python.py --proc-extern demo_macros=./libdemo_macros.so program.rs
+```
+
+On macOS, use the compiled `.dylib` path. The Python interpreter checks and runs the expanded program. The host exchanges expanded source text, so compiler span metadata is lost at that boundary.
+
 ## Scope
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
 Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures remain incomplete.
 
-Generic bodies are checked against their declared trait bounds. Const parameters support `i32`, 64-bit `usize`, and `bool`. Type-level expressions cover standalone parameters and basic constant expressions. Trait support covers static dispatch, methods, and non-reference associated types. Declarative macros support selected fragments and local-name hygiene. Trait objects, specialization, generic associated types, full macro hygiene, and procedural macros remain open.
+Generic bodies are checked against their declared trait bounds. Const parameters support `i32`, 64-bit `usize`, and `bool`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax.
+
+Trait objects currently use shared or mutable references. Generic associated types support type, const, and lifetime parameters, including lending projections on concrete receivers. Trait specialization and general borrow analysis for abstract lending projections remain open.
+
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity in supported scopes. Cross-module and exported-macro hygiene remain open.
 
 General reference types as type arguments, modules, the standard library, Cargo integration, and native code generation are also incomplete.

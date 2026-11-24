@@ -16,10 +16,14 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass, field, replace
+import json
 import operator
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 
 class RustError(Exception):
@@ -31,6 +35,18 @@ class Token:
     text: str
     line: int
     column: int
+    context: tuple = ()
+    definition: int | None = None
+
+    @property
+    def key(self):
+        return (self.text, self.context) if self.context else self.text
+
+    def binding(self, key):
+        if isinstance(key, tuple):
+            name, context = key
+            return replace(self, text=name, context=context)
+        return replace(self, text=key, context=())
 
     def error(self, message):
         return RustError(f"{self.line}:{self.column}: {message}")
@@ -102,6 +118,13 @@ class TokenGroup:
     closing: Token
 
 
+@dataclass(frozen=True)
+class OpaqueFragment:
+    token: Token
+    fragment: str
+    items: tuple
+
+
 def token_trees(tokens):
     stack = [(None, [])]
     for token in tokens:
@@ -128,12 +151,21 @@ def flatten_trees(trees):
             yield tree.opening
             yield from flatten_trees(tree.items)
             yield tree.closing
+        elif isinstance(tree, OpaqueFragment):
+            grouped = tree.fragment in {"expr", "pat"}
+            if grouped:
+                yield replace(tree.token, text="(")
+            yield from flatten_trees(tree.items)
+            if grouped:
+                yield replace(tree.token, text=")")
         else:
             yield tree
 
 
 def tree_text(tree):
-    return tree.opening.text if isinstance(tree, TokenGroup) else tree.text
+    if isinstance(tree, TokenGroup):
+        return tree.opening.text
+    return "@opaque" if isinstance(tree, OpaqueFragment) else tree.text
 
 
 @dataclass(frozen=True)
@@ -198,6 +230,7 @@ class MacroExpander:
     def __init__(self):
         self.steps = 0
         self.match_steps = 0
+        self.definitions = 0
 
     def expand(self, items, inherited=None, depth=0):
         if depth > 64:
@@ -211,7 +244,9 @@ class MacroExpander:
                 marker, name, body = items[index + 1:index + 4]
                 if tree_text(marker) != "!" or not isinstance(name, Token) or not isinstance(body, TokenGroup):
                     raise item.error("invalid macro_rules definition")
-                macros[name.text] = self.rules(body)
+                self.definitions += 1
+                macros[name.text] = (self.definitions, self.rules(body))
+                result.append(replace(name, text="@macro_definition", definition=self.definitions))
                 index += 4
                 if index < len(items) and tree_text(items[index]) == ";":
                     index += 1
@@ -221,14 +256,15 @@ class MacroExpander:
                 self.steps += 1
                 if self.steps > 10_000:
                     raise item.error("macro expansion limit reached")
-                expanded = self.invoke(item, macros[item.text], items[index + 2].items)
+                definition, rules = macros[item.text]
+                expanded = self.invoke(item, rules, items[index + 2].items, (definition, self.steps))
                 index += 3
                 result.extend(self.expand(expanded, macros, depth + 1))
                 if (expanded and tree_text(expanded[0]) in {"#", "fn", "struct", "enum", "trait", "impl"}
                         and index < len(items) and tree_text(items[index]) == ";"):
                     index += 1
                 continue
-            if isinstance(item, TokenGroup):
+            if isinstance(item, (TokenGroup, OpaqueFragment)):
                 item = replace(item, items=self.expand(item.items, macros, depth))
             result.append(item)
             index += 1
@@ -254,15 +290,12 @@ class MacroExpander:
                 index += 1
         return rules
 
-    def invoke(self, token, rules, items):
+    def invoke(self, token, rules, items, mark):
         self.match_steps = 0
         for matcher, body in rules:
             for offset, captures in self.match(matcher, items, 0, {}, ()):
                 if offset == len(items):
-                    # Keep literal local declarations separate from caller tokens.
-                    names = self.local_names(body)
-                    renamed = {name: f"__macro_{self.steps}_{name}" for name in names}
-                    return tuple(self.render(body, captures, (), renamed))
+                    return tuple(self.render(body, captures, (), mark))
         raise token.error(f"no matching rule for {token.text}!")
 
     def match(self, nodes, items, pos, captures, path):
@@ -322,6 +355,8 @@ class MacroExpander:
         item = items[0]
         if fragment == "tt":
             return True
+        if len(items) == 1 and isinstance(item, OpaqueFragment):
+            return fragment == item.fragment
         if fragment == "ident":
             return isinstance(item, Token) and bool(IDENT.fullmatch(item.text))
         if fragment == "literal":
@@ -358,42 +393,33 @@ class MacroExpander:
             elif isinstance(node, TokenGroup):
                 yield from MacroExpander.variables(node.items)
 
-    @staticmethod
-    def local_names(nodes):
-        names = set()
+    def render(self, nodes, captures, path, mark):
+        skip_separator = False
         for index, node in enumerate(nodes):
-            if isinstance(node, TokenGroup):
-                names.update(MacroExpander.local_names(node.items))
-            elif isinstance(node, MacroRepeat):
-                names.update(MacroExpander.local_names(node.body))
-            elif isinstance(node, Token) and node.text in {"let", "for"}:
-                following = index + 1
-                if following < len(nodes) and isinstance(nodes[following], Token) and nodes[following].text == "mut":
-                    following += 1
-                if following < len(nodes) and isinstance(nodes[following], Token):
-                    name = nodes[following].text
-                    if IDENT.fullmatch(name) and name not in RESERVED:
-                        names.add(name)
-        return names
-
-    def render(self, nodes, captures, path, renamed):
-        for index, node in enumerate(nodes):
+            if skip_separator:
+                skip_separator = False
+                continue
             if isinstance(node, MacroCapture):
+                if node.name.text == "crate":
+                    following = nodes[index + 1] if index + 1 < len(nodes) else None
+                    if not isinstance(following, Token) or following.text != "::":
+                        raise node.name.error("expected a path after $crate")
+                    # This interpreter's single source file is the crate root.
+                    skip_separator = True
+                    continue
                 for level in range(len(path), -1, -1):
                     key = (node.name.text, path[:level])
                     if key in captures:
                         fragment, items = captures[key]
-                        if fragment in {"expr", "pat"}:
-                            opening = replace(node.name, text="(")
-                            closing = replace(node.name, text=")")
-                            yield TokenGroup(opening, items, closing)
+                        if fragment not in {"ident", "tt"}:
+                            yield OpaqueFragment(node.name, fragment, items)
                         else:
                             yield from items
                         break
                 else:
                     raise node.name.error(f"metavariable {node.name.text!r} has no value at this repetition depth")
             elif isinstance(node, TokenGroup):
-                yield replace(node, items=tuple(self.render(node.items, captures, path, renamed)))
+                yield replace(node, items=tuple(self.render(node.items, captures, path, mark)))
             elif isinstance(node, MacroRepeat):
                 names = set(self.variables(node.body))
                 if not names:
@@ -404,16 +430,9 @@ class MacroExpander:
                 for position, index_in_path in enumerate(sorted(indices)):
                     if position and node.separator is not None:
                         yield node.separator
-                    yield from self.render(node.body, captures, (*path, index_in_path), renamed)
+                    yield from self.render(node.body, captures, (*path, index_in_path), mark)
             else:
-                previous = nodes[index - 1] if index else None
-                field = isinstance(previous, Token) and previous.text in {".", "::"}
-                if node.text.startswith('"') and renamed:
-                    template = re.sub(r"(?<!\{)\{([A-Za-z_][A-Za-z_0-9]*)(?=[:}])",
-                                      lambda found: "{" + renamed.get(found[1], found[1]), node.text)
-                    yield replace(node, text=template)
-                else:
-                    yield replace(node, text=renamed[node.text]) if node.text in renamed and not field else node
+                yield replace(node, context=(*node.context, mark))
 
 
 @dataclass
@@ -438,6 +457,8 @@ class Function:
     type_parameters: tuple = ()
     associated_const: bool = False
     method_parameters: tuple = ()
+    lifetimes: dict = field(default_factory=dict)
+    self_sized: bool = False
 
 
 @dataclass(frozen=True)
@@ -509,6 +530,42 @@ class ConstValue:
 
 
 @dataclass(frozen=True)
+class ConstExpression:
+    operator: str
+    operands: tuple
+    kind: str
+    token: Token = field(compare=False)
+    integer: str | None = None
+
+    def __str__(self):
+        if len(self.operands) == 1:
+            return f"({self.operator}{self.operands[0]})"
+        return f"({self.operands[0]} {self.operator} {self.operands[1]})"
+
+
+def const_kind(value):
+    return value.const_type if isinstance(value, (TypeParameter, TypeVariable)) else value.kind
+
+
+def fold_const(expression):
+    if not all(isinstance(value, ConstValue) for value in expression.operands):
+        return expression
+    values = tuple(value.value for value in expression.operands)
+    word, token, kind = expression.operator, expression.token, expression.kind
+    if word == "&&":
+        result = values[0] and values[1]
+    elif word == "||":
+        result = values[0] or values[1]
+    elif word in COMPARE:
+        result = COMPARE[word](*values)
+    elif len(values) == 1:
+        result = checked(-values[0], token, kind)
+    else:
+        result = binary(word, *values, token, expression.integer or kind)
+    return ConstValue(result, kind)
+
+
+@dataclass(frozen=True)
 class ArrayType:
     element: object
     length: object
@@ -522,9 +579,40 @@ class AssociatedType:
     owner: object
     item: str
     trait: str | None = None
+    arguments: tuple = ()
 
     def __str__(self):
-        return f"{self.owner}::{self.item}"
+        suffix = f"<{', '.join(map(str, self.arguments))}>" if self.arguments else ""
+        return f"{self.owner}::{self.item}{suffix}"
+
+
+@dataclass(frozen=True)
+class LifetimeArgument:
+    name: str
+
+    def __str__(self):
+        return self.name
+
+
+@dataclass(frozen=True)
+class AssociatedDeclaration:
+    parameters: tuple
+    bounds: set
+
+
+@dataclass(frozen=True)
+class AssociatedDefinition:
+    parameters: tuple
+    body: object
+
+
+@dataclass(frozen=True)
+class DynType:
+    trait: str
+    bindings: tuple = ()
+
+    def __str__(self):
+        return f"dyn {self.trait}"
 
 
 @dataclass(frozen=True)
@@ -587,14 +675,24 @@ DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized"}
 
 
 def substitute(annotation, arguments):
+    if isinstance(annotation, ConstExpression):
+        return fold_const(replace(annotation, operands=tuple(substitute(value, arguments)
+                                                            for value in annotation.operands)))
     if isinstance(annotation, ReferenceType):
-        return replace(annotation, inner=substitute(annotation.inner, arguments))
+        lifetime = arguments.get(LifetimeArgument(annotation.lifetime), None) if annotation.lifetime else None
+        return replace(annotation, inner=substitute(annotation.inner, arguments),
+                       lifetime=(None if lifetime.name == "'_" else lifetime.name)
+                       if lifetime else annotation.lifetime)
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
     if isinstance(annotation, ArrayType):
         return ArrayType(substitute(annotation.element, arguments), substitute(annotation.length, arguments))
     if isinstance(annotation, AssociatedType):
-        return replace(annotation, owner=substitute(annotation.owner, arguments))
+        return replace(annotation, owner=substitute(annotation.owner, arguments),
+                       arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments))
+    if isinstance(annotation, DynType):
+        return DynType(annotation.trait, tuple((name, substitute(value, arguments))
+                                                for name, value in annotation.bindings))
     return arguments.get(annotation, annotation)
 
 
@@ -629,7 +727,10 @@ class Program:
     def normalize(self, annotation, seen=()):
         if isinstance(annotation, AssociatedType):
             owner = self.normalize(annotation.owner, seen)
-            annotation = replace(annotation, owner=owner)
+            annotation = replace(annotation, owner=owner,
+                                 arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments))
+            if isinstance(owner, DynType):
+                return dict(owner.bindings).get(annotation.item, annotation)
             if annotation in seen:
                 return annotation
             trait = self.projection_trait(annotation)
@@ -640,8 +741,10 @@ class Program:
                     if implementation:
                         impl, arguments = implementation
                         if annotation.item in impl.associated:
-                            resolved = substitute(impl.associated[annotation.item], arguments)
-                            return self.normalize(resolved, (*seen, annotation))
+                            definition = impl.associated[annotation.item]
+                            if len(definition.parameters) == len(annotation.arguments):
+                                arguments = arguments | dict(zip(definition.parameters, annotation.arguments))
+                                return self.normalize(substitute(definition.body, arguments), (*seen, annotation))
             return annotation
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.normalize(annotation.inner, seen))
@@ -698,6 +801,8 @@ class Program:
                        fields=tuple((name, substitute(kind, arguments)) for name, kind in ctor.fields))
 
     def implements(self, annotation, trait, assumed=(), *, seen=()):
+        if isinstance(annotation, DynType):
+            return trait in self.trait_closure({annotation.trait})
         if trait == "Sized":
             return True
         if isinstance(annotation, AssociatedType):
@@ -705,7 +810,9 @@ class Program:
             if not isinstance(normalized, AssociatedType):
                 return self.implements(normalized, trait, assumed, seen=seen)
             declaration = self.projection_trait(normalized)
-            return bool(declaration and trait in self.trait_closure(declaration.associated[normalized.item]))
+            return bool(declaration and trait in self.trait_closure(
+                declaration.associated[normalized.item].bounds
+            ))
         if isinstance(annotation, TypeParameter):
             if annotation in assumed or trait in self.trait_closure(annotation.bounds):
                 return True
@@ -746,6 +853,7 @@ class Parser:
         self.lookahead = deque()
         self.self_type = None
         self.current_trait = None
+        self.sized_receiver = False
         self.constants = {}
         self.current = next(self.tokens)
         self.type_parameters = {}
@@ -781,9 +889,21 @@ class Parser:
 
     def type_name(self, *, static_string=False, signature=None, output=False):
         token = self.advance()
+        if token.text == "dyn":
+            trait = self.trait_path()
+            bindings = []
+            if self.accept("<"):
+                while self.current.text != ">":
+                    name = self.identifier()
+                    self.expect("=")
+                    bindings.append((name.text, self.type_name(signature=signature)))
+                    if not self.accept(","):
+                        break
+                self.expect(">")
+            return DynType(trait, tuple(sorted(bindings)))
         if token.text == "Self" and self.self_type is not None:
             if self.accept("::"):
-                return AssociatedType(self.self_type, self.identifier().text, self.current_trait)
+                return self.associated_projection(self.self_type, self.current_trait)
             return self.self_type
         if token.text == "<":
             owner = self.type_name(signature=signature)
@@ -791,13 +911,13 @@ class Parser:
             trait = self.trait_path()
             self.expect(">")
             self.expect("::")
-            return AssociatedType(owner, self.identifier().text, trait)
+            return self.associated_projection(owner, trait)
         if token.text in {"i32", "usize", "bool"}:
             return token.text
         if token.text == "[":
             element = self.type_name(static_string=static_string, signature=signature)
             self.expect(";")
-            length = self.const_argument()
+            length = self.const_expression(self.expression(), "usize")
             self.expect("]")
             return ArrayType(element, length)
         if token.text == "&":
@@ -826,15 +946,38 @@ class Parser:
         if IDENT.fullmatch(token.text) and token.text not in RESERVED:
             if self.current.text == "::" and token.text in self.type_parameters:
                 self.advance()
-                return AssociatedType(self.type_parameters[token.text], self.identifier().text)
+                return self.associated_projection(self.type_parameters[token.text])
             if self.accept("<"):
                 return AppliedType(token.text, self.type_arguments())
             return self.type_parameters.get(token.text, token.text)
         raise token.error(f"unsupported type {token.text!r}")
 
+    def associated_projection(self, owner, trait=None):
+        name = self.identifier()
+        arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
+        return AssociatedType(owner, name.text, trait, arguments)
+
     def parse(self):
         program = Program()
         while self.current.text:
+            if self.accept("@macro_definition"):
+                continue
+            if self.current.text == "#" and self.peek() == "!":
+                self.expect("#")
+                self.expect("!")
+                self.expect("[")
+                attribute = self.identifier()
+                if attribute.text == "feature":
+                    self.expect("(")
+                    self.expect("generic_const_exprs")
+                    self.accept(",")
+                    self.expect(")")
+                elif attribute.text in {"allow", "warn", "deny", "forbid"}:
+                    self.skip_group()
+                else:
+                    raise attribute.error("unsupported inner attribute")
+                self.expect("]")
+                continue
             if self.accept("use"):
                 self.trait_import()
                 continue
@@ -885,14 +1028,17 @@ class Parser:
                 break
         self.expect(")")
         result = self.type_name(signature=lifetimes, output=True) if self.accept("->") else "()"
+        self.sized_receiver = False
         self.where_clause(lifetimes)
+        sized_receiver = self.sized_receiver
         if receiver and isinstance(params[0][2], ReferenceType) and isinstance(result, ReferenceType) and not result.lifetime:
             return_inputs = (0,)
         else:
             return_inputs = self.return_inputs(name, params, result, lifetimes)
         body = None if declaration and self.accept(";") else self.block()
         function = Function(name, params, result, body, return_inputs, tuple(self.type_parameters.values()),
-                            method_parameters=tuple(parameters.values()) if method else ())
+                            method_parameters=tuple(parameters.values()) if method else (),
+                            lifetimes=lifetimes, self_sized=sized_receiver)
         self.type_parameters = outer_parameters
         return function
 
@@ -995,11 +1141,20 @@ class Parser:
                     raise name.error("associated types require a trait")
                 if name.text in associated:
                     raise name.error(f"duplicate associated type {name.text!r}")
+                lifetimes, parameters = self.generic_parameters()
+                outer = self.type_parameters
+                self.type_parameters = outer | parameters
+                ordered = (*map(LifetimeArgument, lifetimes), *parameters.values())
                 if declaration:
-                    associated[name.text] = self.trait_bounds() if self.accept(":") else set()
+                    bounds = self.trait_bounds() if self.accept(":") else set()
+                    self.associated_where(lifetimes)
+                    associated[name.text] = AssociatedDeclaration(ordered, bounds)
                 else:
+                    self.associated_where(lifetimes)
                     self.expect("=")
-                    associated[name.text] = self.type_name()
+                    associated[name.text] = AssociatedDefinition(ordered, self.type_name(signature=lifetimes))
+                    self.associated_where(lifetimes)
+                self.type_parameters = outer
                 self.expect(";")
                 continue
             constant = self.accept("const")
@@ -1027,6 +1182,20 @@ class Parser:
             if function.body is not None:
                 program.functions[internal.text] = function
         return methods, associated
+
+    def associated_where(self, lifetimes):
+        if not self.accept("where"):
+            return
+        while self.current.text not in {";", "="}:
+            owner = self.advance()
+            if owner.text != "Self" and owner.text not in self.type_parameters:
+                raise owner.error("associated lifetime bounds require Self or a type parameter")
+            self.expect(":")
+            for bound in self.lifetime_bounds():
+                if bound.text not in lifetimes and bound.text != "'static":
+                    raise bound.error(f"undeclared lifetime {bound.text}")
+            if not self.accept(","):
+                break
 
     def generic_parameters(self):
         lifetimes = {}
@@ -1111,6 +1280,14 @@ class Parser:
         if not self.accept("where"):
             return
         while self.current.text not in {"{", ";"}:
+            if self.current.text == "[":
+                bound = self.type_name()
+                if bound.element != "()":
+                    raise self.current.error("const evaluation bounds use unit arrays")
+                self.expect(":")
+                if not self.accept(","):
+                    break
+                continue
             lhs = self.advance()
             self.expect(":")
             if lhs.text.startswith("'"):
@@ -1118,6 +1295,10 @@ class Parser:
                 bounds = self.lifetime_bounds()
                 self.require_lifetimes(bounds, lifetimes)
                 lifetimes[lhs.text].update(bounds)
+            elif lhs.text == "Self" and self.self_type is not None:
+                if self.trait_bounds() != {"Sized"}:
+                    raise lhs.error("method Self bounds currently support Sized")
+                self.sized_receiver = True
             elif lhs.text in self.type_parameters:
                 self.type_parameters[lhs.text].bounds.update(self.trait_bounds())
             else:
@@ -1255,6 +1436,9 @@ class Parser:
         statements = []
         tail = None
         while self.current.text != "}":
+            if marker := self.accept("@macro_definition"):
+                statements.append(Expr("macro_definition", marker))
+                continue
             if self.accept(";"):
                 continue
             let = self.accept("let")
@@ -1309,6 +1493,8 @@ class Parser:
                 if type_arguments is not None:
                     raise name.error("explicit method arguments require a call")
                 left = Expr("field", dot, (left, name))
+        while minimum <= 6 and (cast := self.accept("as")):
+            left = Expr("cast", cast, (left, self.type_name()))
         compared = False
         while PRECEDENCE.get(self.current.text, 0) >= minimum:
             token = self.advance()
@@ -1427,7 +1613,7 @@ class Parser:
                 return Expr("array", token)
             first = self.expression()
             if self.accept(";"):
-                count = self.const_argument()
+                count = self.const_expression(self.expression(), "usize")
                 self.expect("]")
                 return Expr("array_repeat", token, (first, count))
             elements = [first]
@@ -1506,13 +1692,15 @@ class Parser:
             arguments = self.type_arguments()
         return path, arguments
 
-    def type_arguments(self):
+    def type_arguments(self, *, lifetimes=False):
         arguments = []
         while self.current.text not in {">", ">="}:
             word = self.current.text
             parameter = self.type_parameters.get(word)
             if self.accept("_"):
                 arguments.append(None)
+            elif lifetimes and word.startswith("'"):
+                arguments.append(LifetimeArgument(self.advance().text))
             elif (word in {"{", "-", "true", "false"} or word in self.constants or word[0].isdigit()
                   or (parameter and parameter.const_type)):
                 arguments.append(self.const_argument())
@@ -1541,7 +1729,7 @@ class Parser:
         kind, value = literal.args
         return ConstValue(value, None if literal.unsuffixed else kind)
 
-    def const_expression(self, expr):
+    def const_expression(self, expr, hint=None):
         expr = ungroup(expr)
         if expr.kind == "const_value":
             return expr.args[0]
@@ -1549,12 +1737,23 @@ class Parser:
             kind, value = expr.args
             return ConstValue(value, None if expr.unsuffixed else kind)
         if expr.kind == "unary" and expr.token.text == "-":
-            value = self.const_expression(expr.args[0])
+            value = self.const_expression(expr.args[0], hint)
             if isinstance(value, ConstValue) and type(value.value) is int:
                 return ConstValue(-value.value, value.kind)
+            if const_kind(value) == "i32":
+                return ConstExpression("-", (value,), "i32", expr.token)
         if expr.kind == "binary":
-            left, right = (self.const_expression(arg) for arg in expr.args)
+            left, right = (self.const_expression(arg, hint) for arg in expr.args)
             word = expr.token.text
+            left_kind, right_kind = const_kind(left), const_kind(right)
+            if not all(isinstance(arg, ConstValue) for arg in (left, right)):
+                kind = left_kind or right_kind or hint or "i32"
+                if left_kind and right_kind and left_kind != right_kind:
+                    raise expr.token.error("constant operands have different types")
+                if word in COMPARE or (kind == "bool" and word in {"&&", "||"}):
+                    return ConstExpression(word, (left, right), "bool", expr.token, kind)
+                if kind != "bool" and word in {*ARITHMETIC, "/", "%"}:
+                    return ConstExpression(word, (left, right), kind, expr.token, kind)
             if all(isinstance(arg, ConstValue) for arg in (left, right)):
                 if left.boolean and right.boolean and word in {"&&", "||"}:
                     return ConstValue((left.value and right.value) if word == "&&"
@@ -1566,7 +1765,8 @@ class Parser:
                 kind = left.kind or right.kind
                 if (not left.boolean and not right.boolean and word in {*ARITHMETIC, "/", "%"}
                         and (not left.kind or not right.kind or left.kind == right.kind)):
-                    return ConstValue(binary(word, left.value, right.value, expr.token, kind or "i32"), kind)
+                    return ConstValue(binary(word, left.value, right.value, expr.token,
+                                             kind or hint or "i32"), kind)
         raise expr.token.error("unsupported constant expression")
 
     def record_fields(self, parse_value, shorthand):
@@ -1729,13 +1929,36 @@ class Scope:
     parent: Scope | None = None
     bindings: dict = field(default_factory=dict)
     owned: set = field(default_factory=set)
+    definitions: dict | None = None
+
+    def __post_init__(self):
+        self.definitions = self.parent.definitions if self.parent else {}
+
+    def remember(self, token):
+        frames = []
+        scope = self
+        while scope:
+            frames.append(scope.bindings)
+            scope = scope.parent
+        snapshot = {}
+        for bindings in reversed(frames):
+            snapshot.update(bindings)
+        self.definitions[token.definition] = snapshot
 
     def find(self, token):
         scope = self
-        while scope is not None:
-            if token.text in scope.bindings:
-                return scope.bindings[token.text]
+        while scope:
+            if token.key in scope.bindings:
+                return scope.bindings[token.key]
             scope = scope.parent
+        context = token.context
+        while context:
+            definition, _ = context[-1]
+            context = context[:-1]
+            key = (token.text, context) if context else token.text
+            snapshot = self.definitions.get(definition, {})
+            if key in snapshot:
+                return snapshot[key]
         raise token.error(f"unknown binding {token.text!r}")
 
 
@@ -1759,7 +1982,7 @@ def place_root(expr):
 
 def reference_source(expr):
     expr = ungroup(expr)
-    return expr.kind in {"name", "borrow", "call", "if", "match"} or (
+    return expr.kind in {"name", "borrow", "call", "if", "match", "dyn_reference"} or (
         expr.kind == "block" and not expr.label
     )
 
@@ -1788,6 +2011,21 @@ class Address:
         if self.fields:
             value = self.binding.value.replace(self.fields, value)
         self.binding.value = value
+
+
+@dataclass(frozen=True)
+class DynAddress:
+    address: Address
+    concrete: object
+
+    def child(self, field):
+        return self.address.child(field)
+
+    def read(self):
+        return self.address.read()
+
+    def write(self, value):
+        self.address.write(value)
 
 
 @dataclass(frozen=True)
@@ -1989,12 +2227,30 @@ class ControlTarget:
     finish: FlowNode | None = None
 
 
-def find_control(targets, jump):
+def find_control(targets, jump, definitions=None):
+    bound = next((target for target in reversed(targets)
+                  if jump.label is not None and target.expr.label is jump.label), None)
+    if bound:
+        if jump.kind == "continue" and bound.expr.kind == "block":
+            raise jump.token.error("continue requires a loop label")
+        return bound
     for target in reversed(targets):
         if jump.label:
             label = target.expr.label
-            if label is None or label.text != jump.label.text:
-                continue
+            if label is None or label.key != jump.label.key:
+                if not label or not definitions:
+                    continue
+                context = jump.label.context
+                visible = False
+                while context:
+                    definition, _ = context[-1]
+                    context = context[:-1]
+                    if (target in definitions.get(definition, ())
+                            and label.text == jump.label.text and label.context == context):
+                        visible = True
+                        break
+                if not visible:
+                    continue
         elif target.expr.kind == "block":
             raise jump.token.error(f"unlabeled {jump.kind} inside a labeled block")
         elif target.in_condition:
@@ -2023,6 +2279,7 @@ class Checker:
         self.functions = program.functions
         self.result = "()"
         self.loops = []
+        self.macro_labels = {}
         self.substitutions = {}
         self.variables = []
         self.obligations = []
@@ -2056,17 +2313,22 @@ class Checker:
                 self.check_type(annotation, name)
                 if name.text == "_":
                     continue
-                if name.text in scope.bindings:
+                if name.key in scope.bindings:
                     raise name.error(f"duplicate parameter {name.text!r}")
-                scope.bindings[name.text] = Binding(annotation, mutable)
+                scope.bindings[name.key] = Binding(annotation, mutable)
             self.result = function.result
             self.check_type(self.result, function.name, allow_never=True)
+            concrete = self.effective_function(function, tuple(kind for _, _, kind in function.params),
+                                               self.resolve(self.result))
+            function.return_inputs = concrete.return_inputs
             result = self.type_of(function.body, scope, function.result)
             self.require_argument(result, function.result, function.body.token)
         self.finish_inference()
 
     def check_bounds(self, parameters, token):
         for parameter in parameters:
+            if isinstance(parameter, LifetimeArgument):
+                continue
             for name in parameter.bounds:
                 if name not in TRAIT_MODULES and name not in self.program.traits:
                     raise token.error(f"unknown trait {name!r}")
@@ -2076,15 +2338,17 @@ class Checker:
             self.check_bounds((trait.self_type,), trait.name)
             if trait.name.text in self.program.trait_closure(trait.bounds):
                 raise trait.name.error("cyclic supertrait relationship")
-            for bounds in trait.associated.values():
-                for bound in bounds:
+            for associated in trait.associated.values():
+                self.check_bounds(associated.parameters, trait.name)
+                for bound in associated.bounds:
                     if bound not in TRAIT_MODULES and bound not in self.program.traits:
                         raise trait.name.error(f"unknown trait {bound!r}")
             for method in trait.methods.values():
                 self.check_bounds(method.type_parameters, method.name)
                 by_value = (method.result is trait.self_type
                             or any(kind is trait.self_type for _, _, kind in method.params))
-                if method.body and by_value and "Sized" not in self.program.trait_closure(trait.self_type.bounds):
+                if (method.body and by_value and not method.self_sized
+                        and "Sized" not in self.program.trait_closure(trait.self_type.bounds)):
                     raise method.name.error("default body using Self by value requires Self: Sized")
                 for name, _, annotation in method.params:
                     self.check_type(annotation, name)
@@ -2110,11 +2374,20 @@ class Checker:
                 self.obligation(impl.target, bound, impl.token)
             for name in impl.associated.keys() ^ trait.associated.keys():
                 raise impl.token.error(f"missing or unexpected associated type {name!r}")
-            for name, kind in impl.associated.items():
+            for name, definition in impl.associated.items():
+                declaration = trait.associated[name]
+                if (len(definition.parameters) != len(declaration.parameters)
+                        or any(not self.same_parameter_kind(wanted, actual)
+                               for wanted, actual in zip(declaration.parameters, definition.parameters))):
+                    raise impl.token.error(f"associated type {name!r} has incompatible generic parameters")
+                kind = definition.body
                 self.check_type(kind, impl.token)
-                if isinstance(self.resolve(kind), (ReferenceType, AssociatedType)):
-                    raise impl.token.error("associated types must resolve to a non-reference type")
-                for bound in sorted(trait.associated[name]):
+                resolved = self.resolve(kind)
+                if isinstance(resolved, AssociatedType):
+                    raise impl.token.error("associated type cannot resolve to itself")
+                if isinstance(resolved, ReferenceType) and LifetimeArgument(resolved.lifetime) not in definition.parameters:
+                    raise impl.token.error("associated reference types require a lifetime parameter")
+                for bound in sorted(declaration.bounds):
                     self.obligation(kind, bound, impl.token)
             for name in impl.methods.keys() - trait.methods.keys():
                 raise impl.methods[name].name.error(f"{name!r} is not a method of {impl.trait}")
@@ -2132,12 +2405,32 @@ class Checker:
                 bindings.update(zip(required.method_parameters, method.method_parameters))
                 required_types = tuple(self.resolve(substitute(kind, bindings)) for _, _, kind in required.params)
                 actual_types = tuple(self.resolve(kind) for _, _, kind in method.params)
+                required_result = self.resolve(substitute(required.result, bindings))
+                actual_result = self.resolve(method.result)
+                required_signature = self.effective_function(required, required_types, required_result)
+                actual_signature = self.effective_function(method, actual_types, actual_result)
                 if (required_types != actual_types
-                        or self.resolve(method.result) != self.resolve(substitute(required.result, bindings))
-                        or method.return_inputs != required.return_inputs
+                        or actual_result != required_result
+                        or actual_signature.return_inputs != required_signature.return_inputs
                         or method.associated_const != required.associated_const
                         or self.has_receiver(method) != self.has_receiver(required)):
                     raise method.name.error(f"method {name!r} has an incompatible trait signature")
+
+    @staticmethod
+    def same_parameter_kind(first, second):
+        if isinstance(first, LifetimeArgument) or isinstance(second, LifetimeArgument):
+            return isinstance(first, LifetimeArgument) and isinstance(second, LifetimeArgument)
+        return first.const_type == second.const_type and first.bounds == second.bounds
+
+    def effective_function(self, function, types, result):
+        if not isinstance(function.result, AssociatedType) or not isinstance(result, ReferenceType):
+            return function
+        params = [(name, mutable, kind) for (name, mutable, _), kind in zip(function.params, types)]
+        if self.has_receiver(function) and isinstance(types[0], ReferenceType) and not result.lifetime:
+            inputs = (0,)
+        else:
+            inputs = Parser.return_inputs(function.name, params, result, function.lifetimes)
+        return replace(function, params=params, result=result, return_inputs=inputs)
 
     def resolve(self, annotation):
         if isinstance(annotation, TypeVariable) and annotation in self.substitutions:
@@ -2150,8 +2443,13 @@ class Checker:
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.resolve(annotation.element), self.resolve(annotation.length))
+        if isinstance(annotation, ConstExpression):
+            return fold_const(replace(annotation, operands=tuple(map(self.resolve, annotation.operands))))
+        if isinstance(annotation, DynType):
+            return DynType(annotation.trait, tuple((name, self.resolve(value)) for name, value in annotation.bindings))
         if isinstance(annotation, AssociatedType):
-            projected = replace(annotation, owner=self.resolve(annotation.owner))
+            projected = replace(annotation, owner=self.resolve(annotation.owner),
+                                arguments=tuple(map(self.resolve, annotation.arguments)))
             return self.program.normalize(projected)
         return annotation
 
@@ -2163,8 +2461,12 @@ class Checker:
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
         if isinstance(annotation, ArrayType):
             return self.occurs(variable, annotation.element) or self.occurs(variable, annotation.length)
+        if isinstance(annotation, ConstExpression):
+            return any(self.occurs(variable, value) for value in annotation.operands)
         if isinstance(annotation, AssociatedType):
-            return self.occurs(variable, annotation.owner)
+            return self.occurs(variable, annotation.owner) or any(
+                self.occurs(variable, arg) for arg in annotation.arguments
+            )
         return annotation is variable
 
     def require(self, actual, expected, token):
@@ -2192,6 +2494,13 @@ class Checker:
             self.require(actual.element, expected.element, token)
             self.require(actual.length, expected.length, token)
             return
+        if isinstance(actual, AssociatedType) and isinstance(expected, AssociatedType):
+            if (actual.item, actual.trait, actual.owner, len(actual.arguments)) == (
+                expected.item, expected.trait, expected.owner, len(expected.arguments)
+            ):
+                for left, right in zip(actual.arguments, expected.arguments):
+                    self.require(left, right, token)
+                return
         raise token.error(f"expected {expected}, found {actual}")
 
     def require_argument(self, actual, expected, token):
@@ -2208,12 +2517,14 @@ class Checker:
     def check_variable_binding(self, variable, value, token):
         if variable.const_type:
             self.check_const(value, variable.const_type, token)
-        elif isinstance(value, ConstValue) or getattr(value, "const_type", None):
+        elif isinstance(value, (ConstValue, ConstExpression)) or getattr(value, "const_type", None):
             raise token.error("expected a type argument, found a constant")
 
     def check_const(self, value, kind, token):
         value = self.resolve(value)
         if isinstance(value, (TypeParameter, TypeVariable)) and value.const_type == kind:
+            return
+        if isinstance(value, ConstExpression) and value.kind == kind:
             return
         if not isinstance(value, ConstValue) or (value.kind and value.kind != kind):
             raise token.error(f"expected a {kind} constant")
@@ -2359,12 +2670,30 @@ class Checker:
             if not trait:
                 raise token.error(f"unknown or ambiguous associated type {annotation}")
             self.obligation(annotation.owner, trait.name.text, token)
+            parameters = trait.associated[annotation.item].parameters
+            if len(parameters) != len(annotation.arguments):
+                raise token.error(f"{annotation.item} expects {len(parameters)} generic arguments")
+            for parameter, argument in zip(parameters, annotation.arguments):
+                if isinstance(parameter, LifetimeArgument):
+                    if not isinstance(argument, LifetimeArgument):
+                        raise token.error(f"{annotation.item} expects a lifetime argument")
+                elif parameter.const_type:
+                    self.check_const(argument, parameter.const_type, token)
+                else:
+                    self.check_type(argument, token)
+                    for bound in parameter.bounds:
+                        self.obligation(argument, bound, token)
             return
         if isinstance(annotation, ReferenceType):
             if isinstance(annotation.inner, ReferenceType):
                 raise token.error("nested reference types are unsupported")
-            self.check_type(annotation.inner, token)
+            if isinstance(annotation.inner, DynType):
+                self.check_dyn(annotation.inner, token)
+            else:
+                self.check_type(annotation.inner, token)
             return
+        if isinstance(annotation, DynType):
+            raise token.error("trait objects require a reference")
         if isinstance(annotation, AppliedType):
             parameters = self.program.type_parameters.get(annotation.name)
             if not parameters or len(parameters) != len(annotation.arguments):
@@ -2385,6 +2714,45 @@ class Checker:
             return
         if annotation != NEVER or not allow_never:
             raise token.error(f"unsupported type {annotation!r}")
+
+    def check_dyn(self, annotation, token):
+        if annotation.trait not in self.program.traits:
+            raise token.error(f"unknown object trait {annotation.trait!r}")
+        traits = self.program.trait_closure({annotation.trait})
+        if "Sized" in traits:
+            raise token.error(f"{annotation.trait} is not dyn-compatible")
+        required = set()
+        for name in traits:
+            trait = self.program.traits.get(name)
+            if not trait:
+                continue
+            required.update(trait.associated)
+            if any(item.parameters for item in trait.associated.values()):
+                raise token.error(f"{name} is not dyn-compatible")
+            for method in trait.methods.values():
+                if method.self_sized:
+                    continue
+                if (method.associated_const or method.method_parameters or not self.has_receiver(method)
+                        or self.mentions_self(method.result, trait.self_type)
+                        or any(self.mentions_self(kind, trait.self_type) for _, _, kind in method.params[1:])):
+                    raise token.error(f"{name} is not dyn-compatible")
+        given = dict(annotation.bindings)
+        if len(given) != len(annotation.bindings) or required != given.keys():
+            raise token.error(f"{annotation.trait} needs bindings for its associated types")
+        for kind in given.values():
+            self.check_type(kind, token)
+
+    @staticmethod
+    def mentions_self(kind, self_type):
+        if kind is self_type:
+            return True
+        if isinstance(kind, ReferenceType):
+            return Checker.mentions_self(kind.inner, self_type)
+        if isinstance(kind, ArrayType):
+            return Checker.mentions_self(kind.element, self_type)
+        if isinstance(kind, AppliedType):
+            return any(Checker.mentions_self(arg, self_type) for arg in kind.arguments)
+        return False
 
     def check_layout(self, name, token, visiting, finished):
         if name in finished:
@@ -2493,7 +2861,7 @@ class Checker:
         if kind == "bind":
             ctor = self.program.constructors.get(token.text)
             if not ctor or ctor.style != "unit":
-                return Pattern(binding=token.text), {token.text: (annotation, args[0])}
+                return Pattern(binding=token.key), {token.key: (annotation, args[0])}
             if args[0]:
                 raise token.error(f"cannot shadow unit struct {token.text!r}")
             kind = "pattern_unit"
@@ -2523,7 +2891,7 @@ class Checker:
             child_pattern, added = self.prepare_pattern(child, ctor.fields[index][1])
             duplicate = bindings.keys() & added.keys()
             if duplicate:
-                raise child.token.error(f"duplicate pattern binding {sorted(duplicate)[0]!r}")
+                raise child.token.error(f"duplicate pattern binding {sorted(duplicate, key=str)[0]!r}")
             bindings.update(added)
             children[index] = child_pattern
         return Pattern(tag=ctor, children=tuple(children)), bindings
@@ -2573,7 +2941,7 @@ class Checker:
                 self.require(bound, integer, token)
             if NEVER in bounds:
                 test = NEVER
-            scope = Scope(scope, {name.text: Binding(integer, mutable)})
+            scope = Scope(scope, {name.key: Binding(integer, mutable)})
         self.loops.append(target)
         try:
             if kind in {"while", "while_let"}:
@@ -2604,10 +2972,8 @@ class Checker:
     def type_of(self, expr, scope, expected=None):
         if id(expr) in self.program.call_functions or expr.kind == "length":
             cached = self.resolve(self.program.expr_types[id(expr)])
-            if expected is not None:
-                self.require_argument(cached, expected, expr.token)
-            return cached
-        if expr.kind == "block" and expr.label:
+            result = cached
+        elif expr.kind == "block" and expr.label:
             target = ControlTarget(expr)
             self.loops.append(target)
             try:
@@ -2618,10 +2984,35 @@ class Checker:
         else:
             result = self.check_expr(expr, scope, expected)
         result = self.resolve(result)
+        result = self.coerce_dyn(expr, result, self.resolve(expected))
         if isinstance(result, ReferenceType) and not reference_source(expr):
             raise expr.token.error(f"reference result from {expr.kind} is unsupported")
         self.program.expr_types[id(expr)] = result
         return result
+
+    def coerce_dyn(self, expr, actual, expected):
+        if (not isinstance(expected, ReferenceType) or not isinstance(expected.inner, DynType)
+                or not isinstance(actual, ReferenceType) or actual.inner == expected.inner
+                or (expected.mutable and not actual.mutable)):
+            return actual
+        target = expected.inner
+        self.check_dyn(target, expr.token)
+        self.obligation(actual.inner, target.trait, expr.token)
+        traits = self.program.trait_closure({target.trait})
+        for name, kind in target.bindings:
+            owners = [trait for trait in traits if trait in self.program.traits
+                      and name in self.program.traits[trait].associated]
+            if len(owners) != 1:
+                raise expr.token.error(f"ambiguous associated type {name!r}")
+            self.require(AssociatedType(actual.inner, name, owners[0]), kind, expr.token)
+        original = replace(expr)
+        for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
+            if id(expr) in table:
+                table[id(original)] = table.pop(id(expr))
+        self.program.expr_types[id(original)] = actual
+        expr.kind = "dyn_reference"
+        expr.args = (original, actual.inner)
+        return expected
 
     def require_place(self, expr, *, write=False, allow_temporary=False):
         place = place_root(expr)
@@ -2642,6 +3033,20 @@ class Checker:
 
     def check_expr(self, expr, scope, expected=None):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "macro_definition":
+            scope.remember(token)
+            self.macro_labels[token.definition] = tuple(self.loops)
+            return "()"
+        if kind == "cast":
+            value, target = args
+            if not isinstance(target, ReferenceType) or not isinstance(target.inner, DynType):
+                raise token.error("supported casts convert references to trait objects")
+            result = self.type_of(value, scope, target)
+            self.require_argument(result, target, token)
+            expr.kind, expr.args = "group", (value,)
+            return result
+        if kind == "dyn_reference":
+            return self.program.expr_types[id(expr)]
         if kind == "literal":
             annotation, value = args
             hint = self.resolve(expected)
@@ -2790,7 +3195,9 @@ class Checker:
             self.require_argument(actual, self.result, token)
             return NEVER
         if kind in {"break", "continue"}:
-            target = find_control(self.loops, expr)
+            target = find_control(self.loops, expr, self.macro_labels)
+            if expr.label:
+                expr.label = target.expr.label
             if kind == "break":
                 if args[0] and target.expr.kind not in {"loop", "block"}:
                     raise token.error("break values require loop or a labeled block")
@@ -2855,7 +3262,7 @@ class Checker:
             positional = iter(types)
             for mode, name in placeholders:
                 if name:
-                    actual = scope.find(Token(name, token.line, token.column)).value
+                    actual = scope.find(replace(template.token, text=name)).value
                 else:
                     actual = next(positional)
                 if isinstance(actual, ReferenceType):
@@ -2953,10 +3360,13 @@ class Checker:
         if function.method_parameters:
             local = self.specialize(function.method_parameters, expr.type_arguments, expr.token)
             arguments = arguments | local
-        self.program.call_functions[id(expr)] = function
         params = tuple(substitute(self.resolve(kind), arguments) for _, _, kind in function.params)
         result = substitute(self.resolve(function.result), arguments)
-        return self.check_call(expr, scope, expected, params, result, arguments, first)
+        annotation = self.check_call(expr, scope, expected, params, result, arguments, first)
+        self.program.call_functions[id(expr)] = self.effective_function(
+            function, tuple(map(self.resolve, params)), self.resolve(result)
+        )
+        return annotation
 
     def check_call(self, expr, scope, expected, params, result, arguments, first=None):
         token, args = expr.token, expr.args
@@ -3012,6 +3422,8 @@ class Checker:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
             trait = candidates[0]
+            if isinstance(base, DynType) and trait.methods[name].self_sized:
+                raise expr.token.error(f"method {name!r} requires Self: Sized")
             self.program.dispatches[id(expr)] = (trait.name.text, base, name)
             return self.receiver_call(expr, scope, expected, trait.methods[name],
                                       {trait.self_type: base}, actual)
@@ -3074,6 +3486,8 @@ class Checker:
         trait = self.program.traits.get(trait_name)
         if not trait or name not in trait.methods:
             raise expr.token.error(f"trait {trait_name!r} has no function {name!r}")
+        if isinstance(owner, DynType) and trait.methods[name].self_sized:
+            raise expr.token.error(f"method {name!r} requires Self: Sized")
         self.obligation(owner, trait_name, expr.token)
         self.program.dispatches[id(expr)] = (trait_name, owner, name)
         return self.function_call(expr, scope, expected, trait.methods[name], {trait.self_type: owner}, first)
@@ -3290,7 +3704,7 @@ class Ownership:
                         self.return_roots.add(referent)
                     cursor = self.emit(cursor, "declare", loan.place, token)
                 local = Local(token, mutable, loan)
-                scope.bindings[token.text] = local
+                scope.bindings[token.key] = local
                 cursor = self.emit(cursor, "declare", Place(local), token)
             self.lower_return(function.body, scope, cursor)
             self.check_graph(entry)
@@ -3460,6 +3874,9 @@ class Ownership:
         annotation = self.annotation(expr)
         if annotation == NEVER:
             return self.lower(expr, scope, cursor), None
+        if expr.kind == "dyn_reference":
+            return self.lower_reference(expr.args[0], scope, cursor, reborrow=reborrow,
+                                        two_phase=two_phase, extend_to=extend_to)
         if expr.kind == "call":
             return self.lower_call(expr, scope, cursor)
         if expr.kind == "block":
@@ -3617,7 +4034,7 @@ class Ownership:
         for mode, name in format_parts(template.args[1], template.token):
             if mode == "text" or not name:
                 continue
-            local = scope.find(Token(name, token.line, token.column))
+            local = scope.find(replace(template.token, text=name))
             place = self.referent(local) if local.loan else Place(local)
             cursor, loan = self.start_loan(cursor, place, False, token)
             cursor, holder = self.keep_loan(cursor, loan, token)
@@ -3637,6 +4054,11 @@ class Ownership:
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "macro_definition":
+            scope.remember(token)
+            return cursor
+        if kind == "dyn_reference":
+            return self.lower(args[0], scope, cursor, consume=consume)
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
@@ -3820,7 +4242,7 @@ class Ownership:
             if kind == "for":
                 self.connect(restart, finish)
                 local = Local(name, mutable)
-                scope = Scope(scope, {name.text: local})
+                scope = Scope(scope, {name.key: local})
                 body_entry = self.emit(restart, "declare", Place(local), token)
             self.connect(self.lower(body, scope, body_entry), restart)
         finally:
@@ -3871,7 +4293,7 @@ class Ownership:
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None):
         action = "declare" if initialized else "uninitialized"
         for name, (_, mutable) in types.items():
-            local = Local(Token(name, source.token.line, source.token.column), mutable, loan)
+            local = Local(source.token.binding(name), mutable, loan)
             scope.bindings[name] = local
             scope.owned.add(local)
             cursor = self.emit(cursor, action, Place(local), source.token)
@@ -3947,7 +4369,7 @@ def binary(word, left, right, token, integer="i32"):
 
 
 def display(value, debug):
-    if isinstance(value, Address):
+    if isinstance(value, (Address, DynAddress)):
         return display(value.read(), debug)
     if isinstance(value, ArrayValue):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
@@ -3993,7 +4415,7 @@ class Continue(Exception):
 
 def handles_jump(expr, signal):
     label = signal.args[0]
-    return label is None or (expr.label is not None and expr.label.text == label.text)
+    return label is None or expr.label is label
 
 
 class Interpreter:
@@ -4020,7 +4442,7 @@ class Interpreter:
     def call(self, name, values, arguments=None):
         function = self.functions[name]
         bindings = {
-            param.text: Binding(value, mutable)
+            param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
             if param.text != "_"
         }
@@ -4096,6 +4518,15 @@ class Interpreter:
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "macro_definition":
+            scope.remember(token)
+            return None
+        if kind == "dyn_reference":
+            value = self.eval(args[0], scope)
+            if isinstance(value, DynAddress):
+                return value
+            concrete = self.program.normalize(substitute(args[1], self.type_arguments))
+            return DynAddress(value, concrete)
         if kind == "literal":
             return args[1]
         if kind == "const_value":
@@ -4166,7 +4597,7 @@ class Interpreter:
         if kind == "let":
             source, annotation, value, otherwise = args
             if value is None:
-                scope.bindings[source.token.text] = Binding(self.placeholder(annotation), source.args[0])
+                scope.bindings[source.token.key] = Binding(self.placeholder(annotation), source.args[0])
                 return None
             result = self.eval(value, scope)
             bindings = next(self.match_bindings(source, result), None)
@@ -4210,7 +4641,7 @@ class Interpreter:
             first = self.eval(start, scope)
             stop = self.eval(end, scope) + int(inclusive)
             for value in range(first, stop):
-                inner = Scope(scope, {name.text: Binding(value, mutable)})
+                inner = Scope(scope, {name.key: Binding(value, mutable)})
                 try:
                     self.eval(body, inner)
                 except Continue as signal:
@@ -4267,6 +4698,9 @@ class Interpreter:
             if dispatch:
                 trait, receiver, name = dispatch
                 receiver = self.program.normalize(substitute(receiver, self.type_arguments))
+                if isinstance(receiver, DynType):
+                    receiver = values[0].concrete
+                    values = (values[0].address, *values[1:])
                 impl, specialized = self.program.implementation(receiver, trait)
                 if name in impl.methods:
                     prototype = function
@@ -4289,7 +4723,7 @@ class Interpreter:
                     rendered.append(value)
                     continue
                 if value:
-                    item = scope.find(Token(value, token.line, token.column)).value
+                    item = scope.find(replace(template.token, text=value)).value
                 else:
                     item = next(evaluated)
                 rendered.append(display(item, mode == "debug"))
@@ -4311,7 +4745,152 @@ fn main() {
 """
 
 
-def run(source, stdout=None):
+def render_source(trees):
+    return " ".join(token.text for token in flatten_trees(trees))
+
+
+def rustc_source(source, libraries):
+    # rustc's expanded text lowers standard derives and println into internal
+    # library calls. Preserve those two interpreter entry points through it.
+    prefix = "__rust_in_python_host"
+    while prefix in source:
+        prefix += "_"
+    marker = prefix + ":derive:"
+    shim = prefix + "_print"
+    trees, _ = token_trees(lex(source))
+
+    def keep_derives(items):
+        result = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            attribute = items[index + 1] if index + 1 < len(items) else None
+            if (tree_text(item) == "#" and isinstance(attribute, TokenGroup)
+                    and len(attribute.items) == 2 and tree_text(attribute.items[0]) == "derive"
+                    and isinstance(attribute.items[1], TokenGroup)):
+                derives = attribute.items[1]
+                pieces = []
+                current = []
+                for part in derives.items:
+                    if tree_text(part) == ",":
+                        if current:
+                            pieces.append(tuple(current))
+                        current = []
+                    else:
+                        current.append(part)
+                if current:
+                    pieces.append(tuple(current))
+                builtin = [part[0].text for part in pieces if len(part) == 1 and tree_text(part[0]) in DERIVABLE]
+                if builtin:
+                    replacements, _ = token_trees(lex("#[doc=" + json.dumps(marker + ",".join(builtin)) + "]"))
+                    result.extend(replacements)
+                other = [part for part in pieces if not (len(part) == 1 and tree_text(part[0]) in DERIVABLE)]
+                if other:
+                    flattened = []
+                    for part in other:
+                        if flattened:
+                            flattened.append(replace(item, text=","))
+                        flattened.extend(part)
+                    result.extend((item, replace(attribute, items=(attribute.items[0],
+                                                               replace(derives, items=tuple(flattened))))))
+                index += 2
+                continue
+            if isinstance(item, TokenGroup):
+                item = replace(item, items=keep_derives(item.items))
+            result.append(item)
+            index += 1
+        return tuple(result)
+
+    source = render_source(keep_derives(trees))
+    macro = ("fn " + shim + "() {}\n"
+             "macro_rules! println { () => { " + shim + "() }; "
+             "($fmt:expr $(, $arg:expr)* $(,)?) => { " + shim + "($fmt $(,$arg)*) }; }\n")
+    # Inner attributes belong first in a crate.
+    trees, _ = token_trees(lex(source))
+    start = 0
+    while (start + 2 < len(trees) and tree_text(trees[start]) == "#" and tree_text(trees[start + 1]) == "!"
+           and isinstance(trees[start + 2], TokenGroup)):
+        start += 3
+    source = render_source(trees[:start]) + "\n" + macro + render_source(trees[start:])
+    with TemporaryDirectory(prefix="rust-in-python-") as folder:
+        path = Path(folder) / "input.rs"
+        path.write_text(source, encoding="utf-8")
+        args = ["rustc", "--edition=2021", "--crate-name", "rust_in_python_input",
+                "--crate-type", "lib", "-Zunpretty=expanded", str(path)]
+        for name, library in libraries.items():
+            args.extend(("--extern", f"{name}={library}"))
+        try:
+            compiler = subprocess.run(args, cwd=folder, text=True, capture_output=True, timeout=30,
+                                      env={**os.environ, "RUSTC_BOOTSTRAP": "1"}, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RustError("procedural macro expansion exceeded 30 seconds") from error
+        if compiler.returncode:
+            raise RustError("rustc macro expansion failed\n" + compiler.stderr.strip())
+    output, _ = token_trees(lex(compiler.stdout))
+    return render_source(strip_host_items(output, marker, shim, libraries))
+
+
+def strip_host_items(items, marker, shim, libraries, *, top=True):
+    result = []
+    index = 0
+    while index < len(items):
+        current = items[index]
+        words = tuple(tree_text(t) for t in items[index:index + 4])
+        if top and words[:2] == ("#", "!") and index + 2 < len(items):
+            index += 3
+            continue
+        if words and words[0] == "#" and index + 1 < len(items) and isinstance(items[index + 1], TokenGroup):
+            attribute = items[index + 1].items
+            name = tree_text(attribute[0]) if attribute else ""
+            if name == "doc" and len(attribute) == 3 and isinstance(attribute[-1], Token):
+                content = decode_string(attribute[-1])
+                if content.startswith(marker):
+                    derives = content.removeprefix(marker)
+                    restored, _ = token_trees(lex(f"#[derive({derives})]"))
+                    result.extend(restored)
+                index += 2
+                continue
+            if name in {"prelude_import", "allow", "warn", "deny", "forbid", "automatically_derived"}:
+                index += 2
+                continue
+        if top and (words[:3] == ("extern", "crate", "std")
+                    or (len(words) > 1 and words[0] == "use"
+                        and (words[1] in libraries or words[1:4] == ("std", "::", "prelude")))):
+            while index < len(items) and tree_text(items[index]) != ";":
+                index += 1
+            index += 1
+            continue
+        if top and (words[:3] == ("macro_rules", "!", "println") or words[:2] == ("fn", shim)):
+            index += 4
+            continue
+        if isinstance(current, Token) and current.text == shim:
+            result.extend((replace(current, text="println"), replace(current, text="!")))
+        elif isinstance(current, TokenGroup):
+            result.append(replace(current, items=strip_host_items(current.items, marker, shim, libraries, top=False)))
+        else:
+            result.append(current)
+        index += 1
+    return tuple(result)
+
+
+def proc_libraries(values):
+    libraries = {}
+    for item in values:
+        name, separator, file = item.partition("=")
+        if not separator or not IDENT.fullmatch(name) or not file:
+            raise RustError("expected a procedural macro library as NAME=PATH")
+        path = Path(file).resolve()
+        if not path.is_file():
+            raise RustError(f"procedural macro library does not exist: {path}")
+        if name in libraries:
+            raise RustError(f"duplicate procedural macro crate {name!r}")
+        libraries[name] = path
+    return libraries
+
+
+def run(source, stdout=None, *, proc_extern=()):
+    if proc_extern:
+        source = rustc_source(source, proc_libraries(proc_extern))
     trees, end = token_trees(lex(source))
     expanded = MacroExpander().expand(trees)
     program = Parser("", tokens=(*flatten_trees(expanded), end)).parse()
@@ -4324,6 +4903,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", nargs="?", help="Rust source file, or - for stdin")
     parser.add_argument("--demo", action="store_true", help="run a built-in Rust program")
+    parser.add_argument("--proc-extern", action="append", default=[], metavar="NAME=PATH",
+                        help="load a compiled Rust procedural macro crate through rustc")
     args = parser.parse_args()
     if args.demo == bool(args.source):
         parser.error("provide either a source file or --demo")
@@ -4335,7 +4916,7 @@ def main():
             source = sys.stdin.read()
         else:
             source = Path(args.source).read_text(encoding="utf-8")
-        run(source)
+        run(source, proc_extern=args.proc_extern)
     except (RustError, OSError, UnicodeError) as error:
         print(f"{label}: {error}", file=sys.stderr)
         return 1

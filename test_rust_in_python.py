@@ -1,6 +1,7 @@
 """Regression cases that also run against rustc when it is installed."""
 
 from io import StringIO
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -744,6 +745,134 @@ VALID = [
         }
         fn main() { println!("{} {}", count!(a (b c) [d]), count!()); }
     """, "3 0\n"),
+    ("borrowed trait objects dispatch to multiple implementations", """
+        trait Measure {
+            fn read(&self) -> i32;
+            fn set(&mut self, value: i32);
+            fn create() -> Self where Self: Sized;
+        }
+        struct First(i32);
+        struct Second(i32);
+        impl Measure for First {
+            fn read(&self) -> i32 { self.0 }
+            fn set(&mut self, value: i32) { self.0 = value; }
+            fn create() -> Self { First(3) }
+        }
+        impl Measure for Second {
+            fn read(&self) -> i32 { self.0 * 2 }
+            fn set(&mut self, value: i32) { self.0 = value; }
+            fn create() -> Self { Second(4) }
+        }
+        fn read(value: &dyn Measure) -> i32 { value.read() }
+        fn main() {
+            let first = First::create();
+            let mut second = Second::create();
+            let target: &mut dyn Measure = &mut second;
+            target.set(read(&first as &dyn Measure));
+            println!("{} {}", read(&first), target.read());
+        }
+    """, "3 6\n"),
+    ("trait objects bind associated types and upcast to their supertrait", """
+        trait Read { type Item; fn read(&self) -> Self::Item; }
+        trait Rich: Read { fn bonus(&self) -> i32 { 1 } }
+        struct Cell(i32);
+        impl Read for Cell { type Item = i32; fn read(&self) -> i32 { self.0 } }
+        impl Rich for Cell {}
+        fn plain(item: &dyn Read<Item = i32>) -> i32 { item.read() }
+        fn main() {
+            let cell = Cell(9);
+            let rich: &dyn Rich<Item = i32> = &cell;
+            println!("{} {}", plain(rich), rich.bonus());
+        }
+    """, "9 1\n"),
+    ("trait object chosen by control flow keeps its concrete dispatch tag", """
+        trait Read { fn read(&self) -> i32; }
+        struct First;
+        struct Second;
+        impl Read for First { fn read(&self) -> i32 { 1 } }
+        impl Read for Second { fn read(&self) -> i32 { 2 } }
+        fn choose(flag: bool) -> i32 {
+            let first = First;
+            let second = Second;
+            let result: &dyn Read = if flag { &first } else { &second };
+            result.read()
+        }
+        fn main() { println!("{} {}", choose(true), choose(false)); }
+    """, "1 2\n"),
+    ("generic associated type and const projections", """
+        trait Family { type Member<T: Copy>; type Block<const N: usize>; }
+        struct Owner;
+        impl Family for Owner {
+            type Member<T: Copy> = [T; 2];
+            type Block<const N: usize> = [i32; N];
+        }
+        fn main() {
+            let first: <Owner as Family>::Member<bool> = [true, false];
+            let second: <Owner as Family>::Block<3> = [1, 2, 3];
+            println!("{first:?} {second:?}");
+        }
+    """, "[true, false] [1, 2, 3]\n"),
+    ("lending projection borrows a concrete receiver", """
+        trait Lending {
+            type Item<'a> where Self: 'a;
+            fn get<'a>(&'a self) -> Self::Item<'a>;
+        }
+        struct Cell(i32);
+        impl Lending for Cell {
+            type Item<'a> = &'a i32;
+            fn get<'a>(&'a self) -> Self::Item<'a> { &self.0 }
+        }
+        fn main() {
+            let mut cell = Cell(7);
+            let item = cell.get();
+            println!("{item}");
+            cell.0 = 9;
+            println!("{}", cell.get());
+        }
+    """, "7\n9\n"),
+    ("dependent const expressions specialize and compose", """
+        #![feature(generic_const_exprs)]
+        #![allow(incomplete_features)]
+        fn repeat<const N: usize>() -> [i32; N] { [7; N] }
+        fn padded<const N: usize>() -> [i32; N + 1] where [(); N + 1]: {
+            repeat::<{ N + 1 }>()
+        }
+        fn main() {
+            let result: [i32; 4] = padded::<3>();
+            println!("{result:?}");
+        }
+    """, "[7, 7, 7, 7]\n"),
+    ("macro definition-site locals and invocation tokens stay distinct", """
+        struct Pair { x: i32 }
+        macro_rules! shadow {
+            ($input:expr) => {{ let x = 7; let pair = Pair { x }; pair.x + $input }};
+        }
+        fn main() {
+            let x = 2;
+            macro_rules! definition { () => { x }; }
+            let x = 5;
+            println!("{} {} {x}", shadow!(x), definition!());
+        }
+    """, "12 2 5\n"),
+    ("macro labels resolve to definition-site target", """
+        fn main() {
+            let result = 'outer: loop {
+                macro_rules! leave { () => { break 'outer 7 }; }
+                'outer: loop { leave!(); }
+            };
+            println!("{result}");
+        }
+    """, "7\n"),
+    ("forwarded macro expressions stay opaque to literal matchers", """
+        macro_rules! inner { (1) => { 9 }; ($expr:expr) => { $expr }; }
+        macro_rules! outer { ($expr:expr) => { inner!($expr) }; }
+        fn main() { println!("{} {}", inner!(1), outer!(1)); }
+    """, "9 1\n"),
+    ("macro crate-qualified paths use crate-root items", """
+        fn answer() -> i32 { 42 }
+        macro_rules! root { () => { $crate::answer() }; }
+        fn main() { let answer = 3; println!("{} {answer}", root!()); }
+    """, "42 3\n"),
 ]
 
 INVALID = [
@@ -1106,6 +1235,46 @@ INVALID = [
         macro_rules! require_name { ($name:ident) => { 0 }; }
         fn main() { let _value = require_name!(3); }
     """, "no matching rule for require_name"),
+    ("trait objects reject generic associated types", """
+        trait Family { type Item<T>; }
+        fn object(_: &dyn Family) {}
+        fn main() {}
+    """, "not dyn-compatible"),
+    ("trait object coercions check associated equalities", """
+        trait Read { type Item; fn read(&self) -> Self::Item; }
+        struct Cell;
+        impl Read for Cell { type Item = bool; fn read(&self) -> bool { true } }
+        fn main() { let _object: &dyn Read<Item = i32> = &Cell; }
+    """, "expected i32, found bool"),
+    ("generic associated type argument bounds are checked", """
+        trait Family { type Item<T: Copy>; }
+        struct Owner;
+        struct NonCopy(i32);
+        impl Family for Owner { type Item<T: Copy> = T; }
+        fn bad(_: <Owner as Family>::Item<NonCopy>) {}
+        fn main() {}
+    """, "NonCopy does not implement Copy"),
+    ("lending projection keeps receiver borrowed", """
+        trait Lending {
+            type Item<'a> where Self: 'a;
+            fn get<'a>(&'a self) -> Self::Item<'a>;
+        }
+        struct Cell(i32);
+        impl Lending for Cell {
+            type Item<'a> = &'a i32;
+            fn get<'a>(&'a self) -> Self::Item<'a> { &self.0 }
+        }
+        fn main() {
+            let mut cell = Cell(7);
+            let item = cell.get();
+            cell.0 = 9;
+            println!("{item}");
+        }
+    """, "immutably borrowed"),
+    ("macro literals do not capture invocation locals", """
+        macro_rules! invalid { () => { captured }; }
+        fn main() { let captured = 4; println!("{}", invalid!()); }
+    """, "unknown binding 'captured'"),
 ]
 
 
@@ -1148,7 +1317,50 @@ class InterpreterTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=30,
+            env={**os.environ, "RUSTC_BOOTSTRAP": "1"} if "feature(generic_const_exprs)" in source else None,
         )
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_procedural_macro_host(self):
+        with TemporaryDirectory() as folder:
+            folder = Path(folder)
+            helper = folder / "helper.rs"
+            helper.write_text("""
+                extern crate proc_macro;
+                use proc_macro::TokenStream;
+                #[proc_macro]
+                pub fn answer(_: TokenStream) -> TokenStream { "6 * 7".parse().unwrap() }
+                #[proc_macro_attribute]
+                pub fn add(_: TokenStream, item: TokenStream) -> TokenStream {
+                    let mut result = item;
+                    result.extend("fn from_attribute() -> i32 { 5 }".parse::<TokenStream>().unwrap());
+                    result
+                }
+                #[proc_macro_derive(Marker)]
+                pub fn marker(_: TokenStream) -> TokenStream {
+                    "fn from_derive() -> i32 { 7 }".parse().unwrap()
+                }
+            """, encoding="utf-8")
+            subprocess.run(["rustc", "--crate-type", "proc-macro", "--crate-name", "helper",
+                            "--out-dir", folder, helper], check=True, capture_output=True, timeout=30)
+            crate = next(path for path in folder.iterdir() if path != helper)
+            external = f"helper={crate}"
+            source = """
+                use helper::{answer, add, Marker};
+                #[derive(Marker, Debug)]
+                struct Number(i32);
+                #[add]
+                fn main() { println!("{} {} {} {:?}", answer!(), from_attribute(), from_derive(), Number(3)); }
+            """
+            input_file = folder / "main.rs"
+            binary = folder / "binary"
+            input_file.write_text(source, encoding="utf-8")
+            subprocess.run(["rustc", "--edition=2021", "--extern", external, input_file, "-o", binary],
+                           check=True, capture_output=True, timeout=30)
+            rust = subprocess.check_output([binary], text=True, timeout=10)
+            output = StringIO()
+            run(source, output, proc_extern=(external,))
+            self.assertEqual(output.getvalue(), rust)
 
 
 if __name__ == "__main__":
