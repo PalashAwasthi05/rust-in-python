@@ -1499,6 +1499,23 @@ VALID = [
             println!("{sum}");
         }
     """, "7\n"),
+    ("collection iterators can be stored, cloned, moved, and reversed", """
+        fn main() {
+            let mut data = vec![1, 2, 3];
+            let reverse = data.iter().rev();
+            let another = reverse.clone();
+            for &n in reverse { println!("{n}"); }
+            for n in another.rev() { println!("{n}"); }
+            data.push(4);
+            let iter = data.iter_mut().rev();
+            for n in iter { *n *= 2; }
+            for value in data.into_iter().rev() { println!("{value}"); }
+            for x in [0, 1].into_iter() { println!("{x}"); }
+            let mut selected = Some(7);
+            for value in selected.iter_mut() { *value = 8; }
+            for n in selected.iter() { println!("{n}"); }
+        }
+    """, "3\n2\n1\n1\n2\n3\n8\n6\n4\n2\n0\n1\n8\n"),
 ]
 
 INVALID = [
@@ -2201,6 +2218,28 @@ INVALID = [
             println!("{v:?}");
         }
     """, "use of moved value 'v'"),
+    ("a stored iterator retains its collection loan", """
+        fn main() {
+            let mut v = vec![1, 2];
+            let it = v.iter().rev();
+            v.push(3);
+            for value in it { println!("{value}"); }
+        }
+    """, "immutably borrowed"),
+    ("using an iterator over a dropped temporary is invalid", """
+        fn main() {
+            let it = vec![1, 2].iter();
+            for value in it { println!("{value}"); }
+        }
+    """, "temporary value dropped while borrowed"),
+    ("for loops consume a stored iterator", """
+        fn main() {
+            let a = [1, 2];
+            let it = a.iter();
+            for value in it { println!("{value}"); }
+            for value in it { println!("{value}"); }
+        }
+    """, "use of moved value 'it'"),
 ]
 
 
@@ -2277,11 +2316,17 @@ class InterpreterTests(unittest.TestCase):
                     for n in vec![1, 2, 3] { println!("{n}"); }
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "iterator_method.rs"
-            unsupported.write_text('''
+            iterator = folder / "iterator_method.rs"
+            iterator.write_text('''
                 fn main() {
                     let v = vec![1, 2, 3];
                     for n in v.iter() { println!("{n}"); }
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "iterator_adapter.rs"
+            unsupported.write_text('''
+                fn main() {
+                    for n in vec![1, 2, 3].into_iter().map(|n| n + 1) { println!("{n}"); }
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2304,13 +2349,14 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, unsupported, panics, bounds, overflow, shift],
+                                     for_iteration, iterator, unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
