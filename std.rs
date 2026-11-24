@@ -7,6 +7,7 @@ pub mod prelude {
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
+    pub use crate::ops::{Drop, Fn, FnMut, FnOnce};
     pub use crate::string::ToString;
 }
 
@@ -68,6 +69,9 @@ pub mod intrinsics {
     pub fn set_pop<S, R>(set: &mut S, last: bool) -> R;
     pub fn set_range<S, B, R>(set: &S, range: B) -> R;
     pub fn lazy_elements<C, R>(items: C) -> R;
+    pub fn rc_deref<T>(rc: &crate::rc::Rc<T>) -> &T;
+    pub fn refcell_value<'a, T>(cell: &'a crate::cell::RefCell<T>) -> &'a mut T;
+    pub fn cell_value<'a, T>(cell: &'a crate::cell::Cell<T>) -> &'a mut T;
     pub fn lazy_range<C, B, R>(items: C, range: B) -> R;
     pub fn parse_float<T>(text: &str) -> Result<T, crate::num::ParseFloatError>;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
@@ -1665,4 +1669,127 @@ pub mod collections {
     impl<T: fmt::Debug> fmt::Debug for BinaryHeap<T> {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.items) }
     }
+}
+
+pub mod rc {
+    use crate::fmt;
+    use crate::ops::Deref;
+
+    // At runtime an Rc is a shared cell with strong and weak counts.
+    pub struct Rc<T: ?Sized> { value: Box<T> }
+    pub struct Weak<T: ?Sized> { value: Option<Box<T>> }
+
+    impl<T> Rc<T> {
+        pub fn new(value: T) -> Rc<T>;
+        pub fn clone(this: &Rc<T>) -> Rc<T>;
+        pub fn strong_count(this: &Rc<T>) -> usize;
+        pub fn weak_count(this: &Rc<T>) -> usize;
+        pub fn ptr_eq(this: &Rc<T>, other: &Rc<T>) -> bool;
+        pub fn downgrade(this: &Rc<T>) -> Weak<T>;
+        pub fn try_unwrap(this: Rc<T>) -> Result<T, Rc<T>>;
+        pub fn into_inner(this: Rc<T>) -> Option<T>;
+        pub fn unwrap_or_clone(this: Rc<T>) -> T where T: Clone;
+        pub fn get_mut(this: &mut Rc<T>) -> Option<&mut T>;
+        pub fn make_mut(this: &mut Rc<T>) -> &mut T where T: Clone;
+        pub fn as_ptr(this: &Rc<T>) -> usize;
+    }
+    impl<T> Deref for Rc<T> {
+        type Target = T;
+        fn deref(&self) -> &T { crate::intrinsics::rc_deref(self) }
+    }
+    impl<T> AsRef<T> for Rc<T> {
+        fn as_ref(&self) -> &T { crate::intrinsics::rc_deref(self) }
+    }
+    impl<T> From<T> for Rc<T> {
+        fn from(value: T) -> Rc<T> { Rc::new(value) }
+    }
+    impl<T> Weak<T> {
+        pub fn new() -> Weak<T>;
+        pub fn upgrade(&self) -> Option<Rc<T>>;
+        pub fn strong_count(&self) -> usize;
+        pub fn weak_count(&self) -> usize;
+    }
+}
+
+pub mod sync {
+    pub use crate::rc::Rc as Arc;
+    pub use crate::rc::Weak;
+
+    pub struct Mutex<T> { value: crate::cell::RefCell<T> }
+    pub struct RwLock<T> { value: crate::cell::RefCell<T> }
+    #[derive(Debug)]
+    pub struct PoisonError<T> { guard: T }
+    pub type LockResult<T> = Result<T, PoisonError<T>>;
+
+    impl<T> Mutex<T> {
+        pub fn new(value: T) -> Mutex<T> { Mutex { value: crate::cell::RefCell::new(value) } }
+        pub fn lock(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
+        pub fn try_lock(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
+        pub fn into_inner(self) -> Result<T, PoisonError<T>> { Ok(self.value.into_inner()) }
+        pub fn get_mut(&mut self) -> Result<&mut T, PoisonError<&mut T>> { Ok(self.value.get_mut()) }
+    }
+    impl<T> RwLock<T> {
+        pub fn new(value: T) -> RwLock<T> { RwLock { value: crate::cell::RefCell::new(value) } }
+        pub fn read(&self) -> Result<&T, PoisonError<&T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
+        pub fn write(&self) -> Result<&mut T, PoisonError<&mut T>> { Ok(crate::intrinsics::refcell_value(&self.value)) }
+        pub fn into_inner(self) -> Result<T, PoisonError<T>> { Ok(self.value.into_inner()) }
+    }
+}
+
+pub mod cell {
+    use crate::fmt;
+
+    #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct RefCell<T> { value: T }
+    #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Cell<T> { value: T }
+
+    impl<T> RefCell<T> {
+        pub fn new(value: T) -> RefCell<T> { RefCell { value: value } }
+        pub fn borrow(&self) -> &T { crate::intrinsics::refcell_value(self) }
+        pub fn borrow_mut(&self) -> &mut T { crate::intrinsics::refcell_value(self) }
+        pub fn try_borrow(&self) -> Result<&T, BorrowError> { Ok(crate::intrinsics::refcell_value(self)) }
+        pub fn try_borrow_mut(&self) -> Result<&mut T, BorrowMutError> { Ok(crate::intrinsics::refcell_value(self)) }
+        pub fn get_mut(&mut self) -> &mut T { &mut self.value }
+        pub fn into_inner(self) -> T { self.value }
+        pub fn replace(&self, value: T) -> T { crate::mem::replace(crate::intrinsics::refcell_value(self), value) }
+        pub fn replace_with<F: FnOnce(&mut T) -> T>(&self, f: F) -> T {
+            let slot: &mut T = crate::intrinsics::refcell_value(self);
+            let value = f(slot);
+            crate::mem::replace(slot, value)
+        }
+        pub fn take(&self) -> T where T: Default { crate::mem::take(crate::intrinsics::refcell_value(self)) }
+        pub fn swap(&self, other: &RefCell<T>) {
+            crate::mem::swap(crate::intrinsics::refcell_value(self), crate::intrinsics::refcell_value(other))
+        }
+    }
+    impl<T: fmt::Debug> fmt::Debug for RefCell<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "RefCell {{ value: {:?} }}", self.value) }
+    }
+
+    impl<T> Cell<T> {
+        pub fn new(value: T) -> Cell<T> { Cell { value: value } }
+        pub fn get(&self) -> T where T: Copy { self.value }
+        pub fn set(&self, value: T) { *crate::intrinsics::cell_value(self) = value; }
+        pub fn replace(&self, value: T) -> T { crate::mem::replace(crate::intrinsics::cell_value(self), value) }
+        pub fn take(&self) -> T where T: Default { crate::mem::take(crate::intrinsics::cell_value(self)) }
+        pub fn get_mut(&mut self) -> &mut T { &mut self.value }
+        pub fn into_inner(self) -> T { self.value }
+        pub fn update<F: FnOnce(T) -> T>(&self, f: F) -> T where T: Copy {
+            let value = f(self.value);
+            self.set(value);
+            value
+        }
+        pub fn swap(&self, other: &Cell<T>) {
+            crate::mem::swap(crate::intrinsics::cell_value(self), crate::intrinsics::cell_value(other))
+        }
+    }
+    impl<T: fmt::Debug + Copy> fmt::Debug for Cell<T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "Cell {{ value: {:?} }}", self.value) }
+    }
+
+    #[derive(Debug)]
+    pub struct BorrowError;
+    #[derive(Debug)]
+    pub struct BorrowMutError;
 }

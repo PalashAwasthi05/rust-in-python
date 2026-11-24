@@ -1,0 +1,23 @@
+0
+in block
+drop inner
+consuming y
+drop y
+len 2
+drop a
+drop b
+drop r1
+reassigned r2
+count 2
+count 1
+got opt
+drop opt
+drop discarded
+drop temp
+end boxed
+drop boxed
+drop rc
+drop r2
+drop v1
+drop v2
+drop x

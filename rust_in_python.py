@@ -1108,6 +1108,12 @@ INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
+DEREF = MODULE_SEPARATOR.join(("std", "ops", "Deref"))
+DROP = MODULE_SEPARATOR.join(("std", "ops", "Drop"))
+RC = MODULE_SEPARATOR.join(("std", "rc", "Rc"))
+WEAK = MODULE_SEPARATOR.join(("std", "rc", "Weak"))
+INDIRECT_TYPES = {VEC, BOX, RC, WEAK, *(MODULE_SEPARATOR.join(("std", "collections", name)) for name in (
+    "HashMap", "BTreeMap", "HashSet", "BTreeSet", "VecDeque", "BinaryHeap"))}
 MAP_TYPES = {MODULE_SEPARATOR.join(("std", "collections", name)): name
              for name in ("HashMap", "BTreeMap", "HashSet", "BTreeSet")}
 DEQUE = MODULE_SEPARATOR.join(("std", "collections", "VecDeque"))
@@ -1257,6 +1263,8 @@ class Modules:
 
     def scan(self, unit, items, *, expanded=False):
         items = tuple(expose_fragments(items, {"item", "vis"}))
+        if not expanded:
+            items = self.hoist_inner_items(items)
         output = []
         index = 0
         while index < len(items):
@@ -1387,6 +1395,93 @@ class Modules:
             output.append(items[index])
             index += 1
         return tuple(output)
+
+    INNER_ITEMS = {"fn", "struct", "enum", "impl", "trait", "use", "type", "static", "mod"}
+
+    def hoist_inner_items(self, items):
+        """Move items declared inside function bodies to module level, renaming any that collide."""
+        output = []
+        taken = {tree_text(items[index + 1]) for index in range(len(items) - 1)
+                 if tree_text(items[index]) in {"fn", "struct", "enum", "trait", "type", "const", "static"}}
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if tree_text(item) == "fn" and index + 1 < len(items):
+                end = self.item_end(items, index, "fn")
+                body_index = end - 1
+                if body_index > index and isinstance(items[body_index], TokenGroup) and tree_text(items[body_index]) == "{":
+                    hoisted = []
+                    body = self.extract_items(items[body_index], hoisted)
+                    renames = {}
+                    for inner in hoisted:
+                        kind_index = next((position for position, tree in enumerate(inner)
+                                           if tree_text(tree) in self.INNER_ITEMS | {"const"}), None)
+                        if kind_index is None or tree_text(inner[kind_index]) in {"use", "impl", "mod"}:
+                            continue
+                        name = tree_text(inner[kind_index + 1])
+                        if name in taken:
+                            renames[name] = f"{name}_in_{tree_text(items[index + 1])}_{len(taken)}"
+                        taken.add(renames.get(name, name))
+                    hoisted_trees = [tree for inner in hoisted for tree in inner]
+                    if renames:
+                        body = self.rename_tokens(body, renames)
+                        hoisted_trees = [self.rename_tokens(tree, renames) for tree in hoisted_trees]
+                    output.extend(items[index:body_index])
+                    output.append(body)
+                    output.extend(self.hoist_inner_items(tuple(hoisted_trees)))
+                    index = end
+                    continue
+            if isinstance(item, TokenGroup) and tree_text(item) == "{" and index and tree_text(items[index - 1]) != "=":
+                # Method bodies inside impl and trait blocks.
+                item = replace(item, items=self.hoist_method_items(item.items))
+            output.append(item)
+            index += 1
+        return tuple(output)
+
+    def hoist_method_items(self, items):
+        hoisted = self.hoist_inner_items(items)
+        return hoisted
+
+    def extract_items(self, group, hoisted):
+        items = group.items
+        kept = []
+        index = 0
+        while index < len(items):
+            start = index
+            statement_start = index == 0 or tree_text(items[index - 1]) in {";", "}"} or (
+                isinstance(items[index - 1], TokenGroup) and tree_text(items[index - 1]) == "{")
+            if statement_start:
+                cursor = index
+                while (cursor + 1 < len(items) and tree_text(items[cursor]) == "#"
+                       and isinstance(items[cursor + 1], TokenGroup)):
+                    cursor += 2
+                if cursor < len(items) and tree_text(items[cursor]) == "pub":
+                    cursor += 1
+                word = tree_text(items[cursor]) if cursor < len(items) else ""
+                is_const_item = (word == "const" and cursor + 2 < len(items)
+                                 and isinstance(items[cursor + 1], Token) and tree_text(items[cursor + 2]) == ":")
+                if word in self.INNER_ITEMS or is_const_item:
+                    if word == "fn" and (cursor + 1 >= len(items) or not isinstance(items[cursor + 1], Token)
+                                         or not is_identifier(tree_text(items[cursor + 1]))):
+                        word = ""
+                if word in self.INNER_ITEMS or is_const_item:
+                    end = self.item_end(items, cursor, word if word != "mod" else "fn")
+                    hoisted.append(items[start:end])
+                    index = end
+                    continue
+            item = items[index]
+            if isinstance(item, TokenGroup):
+                item = replace(item, items=self.extract_items(item, hoisted).items)
+            kept.append(item)
+            index += 1
+        return replace(group, items=tuple(kept))
+
+    def rename_tokens(self, tree, renames):
+        if isinstance(tree, TokenGroup):
+            return replace(tree, items=tuple(self.rename_tokens(item, renames) for item in tree.items))
+        if isinstance(tree, Token) and tree.text in renames:
+            return replace(tree, text=renames[tree.text])
+        return tree
 
     def load_module(self, unit, token, custom_path=None):
         if unit.directory is None:
@@ -2382,6 +2477,7 @@ class Program:
     formats: dict = field(default_factory=dict)
     type_lifetimes: dict = field(default_factory=dict)
     try_conversions: dict = field(default_factory=dict)
+    moves: set = field(default_factory=set)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2677,6 +2773,14 @@ class Program:
                         and self.implements(error, "Debug", assumed, seen=seen))
         if annotation == EXIT_CODE and trait in {"Copy", "Clone", "Debug", "PartialEq"}:
             return True
+        if isinstance(annotation, AppliedType) and annotation.name in {RC, WEAK} and trait in TRAIT_MODULES:
+            if trait == "Clone":
+                return True
+            if trait in {"Copy", "Sized"}:
+                return trait == "Sized"
+            if annotation.name == WEAK:
+                return trait == "Debug"
+            return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
         if is_box(annotation):
             if trait in {"Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", *CALLABLE_TRAITS}:
                 return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
@@ -4649,6 +4753,7 @@ def decode_string(token, *, byte=False):
 class Binding:
     value: object
     mutable: bool
+    moved: bool = False
 
 
 @dataclass
@@ -4861,6 +4966,27 @@ class MapValue:
         return isinstance(other, MapValue) and self.entries.keys() == other.entries.keys()
 
     __hash__ = None
+
+
+class RcValue:
+    """An Rc or Arc: clones share one cell and one pair of strong and weak counts."""
+
+    __slots__ = ("cell", "counts")
+
+    def __init__(self, cell, counts):
+        self.cell = cell
+        self.counts = counts
+
+    def read(self):
+        return self.cell.value
+
+
+class WeakValue:
+    __slots__ = ("cell", "counts")
+
+    def __init__(self, cell, counts):
+        self.cell = cell
+        self.counts = counts
 
 
 class MapSlot:
@@ -6241,7 +6367,7 @@ class Checker:
     def type_parts(annotation, *, inline_only=False):
         if isinstance(annotation, AppliedType):
             yield annotation.name
-            if not (inline_only and annotation.name in {VEC, BOX}):
+            if not (inline_only and annotation.name in INDIRECT_TYPES):
                 for argument in annotation.arguments:
                     yield from Checker.type_parts(argument, inline_only=inline_only)
         elif isinstance(annotation, ArrayType):
@@ -6930,6 +7056,10 @@ class Checker:
                 expr.args = (base, *bounds)
                 annotation = self.type_of(base, scope)
             string_range = kind == "range_index" and annotation in {"str", STRING}
+            while self.derefs(annotation) and not (
+                    self.implements(self.resolve(annotation), MODULE_SEPARATOR.join(("std", "ops", "Index")))):
+                base, annotation = self.deref_call(base, annotation, scope, token)
+                expr.args = (base, *bounds)
             if kind == "index" and annotation != NEVER and not (
                     isinstance(annotation, (ArrayType, SliceType)) or is_vector(annotation)):
                 return self.index_call(expr, scope, base, bounds[0], annotation)
@@ -6994,9 +7124,12 @@ class Checker:
             if isinstance(annotation, ReferenceType):
                 value = Expr("deref", value.token, (value, False))
                 annotation = self.type_of(value, scope)
-            while is_box(annotation):
-                value = Expr("box_deref", value.token, (value,))
-                annotation = self.type_of(value, scope)
+            while is_box(annotation) or (not self.has_field(annotation, name) and self.derefs(annotation)):
+                if is_box(annotation):
+                    value = Expr("box_deref", value.token, (value,))
+                    annotation = self.type_of(value, scope)
+                else:
+                    value, annotation = self.deref_call(value, annotation, scope, value.token)
             expr.args = (value, name)
             return self.field_type(annotation, name)
         if kind == "borrow":
@@ -7021,6 +7154,10 @@ class Checker:
             if is_box(annotation):
                 expr.kind, expr.args = "box_deref", (value,)
                 return annotation.arguments[0]
+            if not isinstance(annotation, ReferenceType) and self.derefs(annotation):
+                target, inner = self.deref_call(value, annotation, scope, token)
+                expr.args = target.args
+                return inner
             if not isinstance(annotation, ReferenceType):
                 raise token.error(f"cannot dereference {annotation}")
             return annotation.inner
@@ -7857,6 +7994,10 @@ class Checker:
             self.obligation(base, "Display", expr.token)
             expr.kind, expr.args = "to_string", (original,)
             return STRING
+        if self.derefs(base):
+            target, _ = self.deref_call(original, actual, scope, expr.token)
+            expr.args = (target, *rest)
+            return self.method_type(expr, scope, expected)
         raise expr.token.error(f"no method {name!r} for {base}")
 
     def inherent_method(self, target, name):
@@ -8257,6 +8398,33 @@ class Checker:
         self.variables.append(variable)
         return variable
 
+    def has_field(self, annotation, name):
+        layout = self.program.layout(self.resolve(annotation))
+        if not layout or len(layout[1]) != 1:
+            return False
+        return any(field == name.text for field, _ in layout[1][0].fields) and (
+            name.module[:1] == STD_ROOT or self.resolve(annotation) not in self.program.types
+            and not (isinstance(self.resolve(annotation), AppliedType)
+                     and self.resolve(annotation).name.startswith("std" + MODULE_SEPARATOR)))
+
+    def derefs(self, annotation):
+        annotation = self.resolve(annotation)
+        return (DEREF in self.program.traits and not isinstance(annotation, (ReferenceType, TypeVariable))
+                and not is_box(annotation) and self.implements(annotation, DEREF))
+
+    def deref_call(self, value, actual, scope, token):
+        """`*Deref::deref(&value)` with its target type, for auto-deref through smart pointers."""
+        base = self.resolve(actual)
+        base = base.inner if isinstance(base, ReferenceType) else base
+        trait = self.program.traits[DEREF]
+        call = Expr("method", replace(token, text="deref"), (value,))
+        bindings = self.trait_bindings(trait, base, call)
+        reference = self.resolve(self.receiver_call(call, scope, None, trait.methods["deref"], bindings, actual))
+        self.program.expr_types[id(call)] = reference
+        target = Expr("deref", token, (call, False))
+        self.program.expr_types[id(target)] = reference.inner
+        return target, self.resolve(reference.inner)
+
     def index_call(self, expr, scope, base, index, annotation):
         """Index a non-built-in collection through std::ops::Index or IndexMut."""
         mutable = id(expr) in self.mutable_places
@@ -8530,6 +8698,18 @@ class Ownership:
         for function in ordered:
             if function.body is None:
                 continue
+            added = []
+            for parameter, bounds, _ in function.where_bounds:
+                added.append((parameter, bounds - parameter.bounds))
+                parameter.bounds.update(bounds)
+            try:
+                self.check_function(function)
+            finally:
+                for parameter, bounds in added:
+                    parameter.bounds.difference_update(bounds)
+
+    def check_function(self, function):
+        if True:
             scope = Scope()
             entry = FlowNode()
             cursor = entry
@@ -9028,6 +9208,8 @@ class Ownership:
             return self.lower(args[0], scope, cursor, consume=consume)
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
+            if consume and place.holder is None and not self.program.is_copy(self.annotation(expr)):
+                self.program.moves.add(id(expr))
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
         if kind in {"literal", "name", "default", "const_value", "function_pointer", "byte_string"}:
             return cursor
@@ -9679,7 +9861,7 @@ def format_float(value, debug):
 
 
 def pretty_debug(value, indent=0):
-    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         value = value.read()
     if USER_FORMAT is not None and isinstance(value, Value):
         text = USER_FORMAT(value, True, alternate=True)
@@ -9752,8 +9934,10 @@ FORMATTER = MODULE_SEPARATOR.join(("std", "fmt", "Formatter"))
 
 
 def display(value, debug):
-    if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
+    if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         return display(value.read(), debug)
+    if isinstance(value, WeakValue):
+        return "(Weak)"
     if USER_FORMAT is not None and isinstance(value, Value):
         text = USER_FORMAT(value, debug)
         if text is not None:
@@ -9821,6 +10005,7 @@ class Interpreter:
         global USER_FORMAT, MAP_ORDER
         USER_FORMAT = self.user_format
         MAP_ORDER = self.map_order
+        self.track_drops = any(impl.trait == DROP for impl in program.impls)
         self.implementations = {}
         self.program = program
         self.functions = program.functions
@@ -9836,6 +10021,10 @@ class Interpreter:
                 annotation, mutable = types[name]
                 if isinstance(item, FunctionValue) and item.environment and self.program.is_copy(annotation):
                     item = self.clone_value(item)
+                if (self.track_drops and isinstance(address, Address) and isinstance(address.binding, Binding)
+                        and not isinstance(item, (Address, SliceAddress, StringAddress, DynAddress))
+                        and not self.program.is_copy(self.program.normalize(substitute(annotation, self.type_arguments)))):
+                    address.binding.moved = True
                 scope[name] = Binding(item, mutable)
             yield scope
 
@@ -9872,6 +10061,12 @@ class Interpreter:
         if isinstance(value, MapValue):
             return MapValue({key: [self.clone_value(item[0]), self.clone_value(item[1])]
                              for key, item in value.entries.items()}, value.ordered)
+        if isinstance(value, RcValue):
+            value.counts[0] += 1
+            return RcValue(value.cell, value.counts)
+        if isinstance(value, WeakValue):
+            value.counts[1] += 1
+            return WeakValue(value.cell, value.counts)
         if isinstance(value, ArrayValue):
             return ArrayValue(tuple(map(self.clone_value, value.items)))
         if isinstance(value, Value):
@@ -9965,7 +10160,7 @@ class Interpreter:
 
     def map_key(self, value):
         """A hashable stand-in for a key value, reading through references and boxes."""
-        while isinstance(value, (Address, StringAddress, SliceAddress, DynAddress, BoxValue)):
+        while isinstance(value, (Address, StringAddress, SliceAddress, DynAddress, BoxValue, RcValue)):
             value = value.read()
         if isinstance(value, Value):
             return (value.constructor.path, tuple(map(self.map_key, value.fields)))
@@ -10016,6 +10211,39 @@ class Interpreter:
             ordered = sorted(items.items, key=functools.cmp_to_key(self.compare), reverse=True)
             return Value(self.program.layout(target)[1][0], (ArrayValue(tuple(ordered)),))
         return items
+
+    def drop_value(self, value):
+        """Run Rust drop glue: Drop impls first, then fields; Rc values release their counts."""
+        if isinstance(value, RcValue):
+            value.counts[0] -= 1
+            if value.counts[0] == 0:
+                self.drop_value(value.cell.value)
+        elif isinstance(value, WeakValue):
+            value.counts[1] -= 1
+        elif isinstance(value, Value):
+            if value.constructor.path:
+                implementation = self.cached_implementation(value.constructor.annotation, DROP)
+                if implementation:
+                    impl, arguments = implementation
+                    self.call(impl.methods["drop"].name.text, (Address(Binding(value, True)),), arguments)
+            for item in value.fields:
+                self.drop_value(item)
+        elif isinstance(value, ArrayValue):
+            for item in value.items:
+                self.drop_value(item)
+        elif isinstance(value, MapValue):
+            for key, item in value.entries.values():
+                self.drop_value(key)
+                if item is not MAP_MEMBER:
+                    self.drop_value(item)
+        elif isinstance(value, BoxValue):
+            self.drop_value(value.read())
+
+    def drop_scope(self, bindings):
+        for binding in reversed(list(bindings.values())):
+            if not binding.moved:
+                binding.moved = True
+                self.drop_value(binding.value)
 
     def call_value(self, callee, *arguments):
         """Call a closure, function pointer, or reference to one from Python."""
@@ -10187,6 +10415,15 @@ class Interpreter:
         return None
 
     def call(self, name, values, arguments=None, environment=None):
+        if self.track_drops:
+            parameters = {}
+            try:
+                return self.call_body(name, values, arguments, environment, parameters)
+            finally:
+                self.drop_scope(parameters)
+        return self.call_body(name, values, arguments, environment, None)
+
+    def call_body(self, name, values, arguments, environment, parameters):
         function = self.functions[name]
         if function.body is None:
             previous = self.type_arguments
@@ -10195,16 +10432,30 @@ class Interpreter:
             try:
                 result = self.program.normalize(substitute(function.result, self.type_arguments))
                 self.intrinsic_types = [self.type_arguments.get(parameter) for parameter in function.type_parameters]
-                key = "." + name.rsplit(":", 1)[-1] if name.startswith("@") else name.rsplit(MODULE_SEPARATOR, 1)[-1]
+                if name.startswith("@impl:"):
+                    target = self.program.impls[int(name.split(":")[1])].target
+                    owner = target.name if isinstance(target, AppliedType) else str(target)
+                    method = name.rsplit(":", 1)[-1]
+                    key = f"{owner.rsplit(MODULE_SEPARATOR, 1)[-1]}.{method}"
+                    if key not in INTRINSICS:
+                        key = "." + method
+                else:
+                    key = name.rsplit(MODULE_SEPARATOR, 1)[-1]
                 self.intrinsic_receiver = function.params[0][2] if function.params else None
                 return INTRINSICS[key](self, result, *values)
             finally:
                 self.type_arguments = previous
-        bindings = dict(environment or {}) | {
+        own = {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
             if param.text != "_"
         }
+        if parameters is not None:
+            parameters.update(own)
+            for index, ((param, _, _), value) in enumerate(zip(function.params, values)):
+                if param.text == "_":
+                    parameters[("_", index)] = Binding(value, False)
+        bindings = dict(environment or {}) | own
         previous = self.type_arguments
         self.type_arguments = {p: self.program.normalize(substitute(t, previous))
                                for p, t in (arguments or {}).items()}
@@ -10241,9 +10492,9 @@ class Interpreter:
         return Value(ctor, tuple(self.default_value(kind) for _, kind in ctor.fields))
 
     def compare(self, left, right, equality=False):
-        while isinstance(left, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
+        while isinstance(left, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
             left = left.read()
-        while isinstance(right, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
+        while isinstance(right, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
             right = right.read()
         if isinstance(left, Value) and left.constructor.path:
             order = self.user_compare(left, right, equality)
@@ -10588,9 +10839,16 @@ class Interpreter:
             ctor = self.program.constructors.get(token.text)
             if ctor and ctor.style == "unit":
                 return Value(self.runtime_constructor(expr, ctor), ())
-            return scope.find(token).value
+            binding = scope.find(token)
+            if id(expr) in self.program.moves:
+                binding.moved = True
+            return binding.value
         if kind == "field":
             value, name = args
+            if id(expr) in self.program.moves:
+                root = place_root(expr)
+                if root.kind == "name":
+                    scope.find(root.token).moved = True
             aggregate = self.eval(value, scope)
             return aggregate.fields[aggregate.constructor.index(name)]
         if kind == "record":
@@ -10608,7 +10866,11 @@ class Interpreter:
                 for bindings in self.match_bindings(source, address):
                     inner = Scope(scope, bindings)
                     if guard is None or self.eval(guard, inner):
-                        return self.eval(body, inner)
+                        try:
+                            return self.eval(body, inner)
+                        finally:
+                            if self.track_drops:
+                                self.drop_scope(bindings)
             raise AssertionError("type checker accepted a non-exhaustive match")
         if kind == "block":
             statements, tail = args
@@ -10621,6 +10883,9 @@ class Interpreter:
                 if not expr.label or not handles_jump(expr, signal):
                     raise
                 return signal.args[1]
+            finally:
+                if self.track_drops:
+                    self.drop_scope(inner.bindings)
         if kind == "let":
             source, annotation, value, otherwise = args
             if value is None:
@@ -10628,15 +10893,20 @@ class Interpreter:
                 for name, (kind, mutable) in types.items():
                     scope.bindings[name] = Binding(self.placeholder(kind), mutable)
                 return None
-            bindings = next(self.match_bindings(source, self.address(value, scope)), None)
+            address = self.address(value, scope)
+            bindings = next(self.match_bindings(source, address), None)
             if bindings is None:
                 if otherwise:
                     self.eval(otherwise, scope)
                 raise AssertionError("type checker accepted a fall-through let pattern")
+            if self.track_drops and not bindings and ungroup(value).kind not in {"name", "field", "index", "deref"}:
+                self.drop_value(address.read())
             scope.bindings.update(bindings)
             return None
         if kind == "discard":
-            self.eval(args[0], scope)
+            value = self.eval(args[0], scope)
+            if self.track_drops and not isinstance(value, (Address, SliceAddress, StringAddress, DynAddress)):
+                self.drop_value(value)
             return None
         if kind == "if":
             condition, yes, no = args
@@ -10645,7 +10915,13 @@ class Interpreter:
         if kind == "if_chain":
             conditions, yes, no = args
             inner = self.eval_chain(conditions, scope)
-            return self.eval(yes, inner) if inner is not None else self.eval(no, scope) if no else None
+            if inner is None:
+                return self.eval(no, scope) if no else None
+            try:
+                return self.eval(yes, inner)
+            finally:
+                if self.track_drops:
+                    self.drop_scope(inner.bindings)
         if kind in {"while", "while_let", "while_chain", "loop"}:
             body = args[-1]
             while True:
@@ -10663,7 +10939,11 @@ class Interpreter:
                         inner = self.eval_chain(args[0], scope)
                         if inner is None:
                             return None
-                    self.eval(body, inner)
+                    try:
+                        self.eval(body, inner)
+                    finally:
+                        if self.track_drops and inner is not scope:
+                            self.drop_scope(inner.bindings)
                 except Continue as signal:
                     if not handles_jump(expr, signal):
                         raise
@@ -10684,6 +10964,8 @@ class Interpreter:
                 inner = Scope(scope, next(self.match_bindings(source, address)))
                 try:
                     self.eval(body, inner)
+                    if self.track_drops:
+                        self.drop_scope(inner.bindings)
                 except Continue as signal:
                     if not handles_jump(expr, signal):
                         raise
@@ -10714,6 +10996,15 @@ class Interpreter:
             left, right = args
             value = self.eval(right, scope)
             address = self.address(left, scope)
+            if self.track_drops and token.text == "=" and isinstance(address, Address):
+                binding = address.binding
+                if isinstance(binding, Binding):
+                    if not binding.moved:
+                        self.drop_value(address.read())
+                    if not address.fields:
+                        binding.moved = False
+                else:
+                    self.drop_value(address.read())
             if token.text != "=":
                 value = binary(token.text[:-1], address.read(), value, token,
                                self.program.expr_types[id(left)], runtime=True)
@@ -11047,9 +11338,14 @@ INTRINSICS = {}
 
 
 def intrinsic(function):
-    """Register a Python body for a std function (rust_name) or method (method_name)."""
+    """Register a Python body for a std function (rust_name), method (method_name), or Type__method."""
     name = function.__name__
-    key = name.removeprefix("rust_") if name.startswith("rust_") else "." + name.removeprefix("method_")
+    if name.startswith("rust_"):
+        key = name.removeprefix("rust_")
+    elif name.startswith("method_"):
+        key = "." + name.removeprefix("method_")
+    else:
+        key = name.replace("__", ".", 1)
     INTRINSICS[key] = function
     return function
 
@@ -12743,6 +13039,115 @@ def rust_lazy_range(interpreter, result, items, bounds):
     if start is None:
         raise RustPanic("range out of bounds")
     return lazy(child(items, index) for index in range(start, stop))
+
+
+def Rc__new(interpreter, result, value):
+    interpreter.track_drops = True
+    return RcValue(Binding(value, True), [1, 0])
+
+
+def Rc__clone(interpreter, result, this):
+    rc = map_of(this)
+    rc.counts[0] += 1
+    return RcValue(rc.cell, rc.counts)
+
+
+def Rc__strong_count(interpreter, result, this):
+    return map_of(this).counts[0]
+
+
+def Rc__weak_count(interpreter, result, this):
+    return map_of(this).counts[1]
+
+
+def Rc__ptr_eq(interpreter, result, this, other):
+    return map_of(this).cell is map_of(other).cell
+
+
+def Rc__as_ptr(interpreter, result, this):
+    return id(map_of(this).cell)
+
+
+def Rc__downgrade(interpreter, result, this):
+    rc = map_of(this)
+    rc.counts[1] += 1
+    return WeakValue(rc.cell, rc.counts)
+
+
+def Rc__try_unwrap(interpreter, result, this):
+    if this.counts[0] == 1:
+        this.counts[0] = 0
+        return interpreter.variant(result, "Ok", this.cell.value)
+    return interpreter.variant(result, "Err", this)
+
+
+def Rc__into_inner(interpreter, result, this):
+    this.counts[0] -= 1
+    return option(interpreter, result, this.cell.value) if this.counts[0] == 0 else option(interpreter, result)
+
+
+def Rc__unwrap_or_clone(interpreter, result, this):
+    if this.counts[0] == 1:
+        return this.cell.value
+    this.counts[0] -= 1
+    return interpreter.clone_value(this.cell.value)
+
+
+def Rc__get_mut(interpreter, result, this):
+    rc = this.read()
+    if rc.counts[0] == 1 and rc.counts[1] == 0:
+        return option(interpreter, result, Address(rc.cell))
+    return option(interpreter, result)
+
+
+def Rc__make_mut(interpreter, result, this):
+    rc = this.read()
+    if rc.counts[0] != 1:
+        rc.counts[0] -= 1
+        rc = RcValue(Binding(interpreter.clone_value(rc.cell.value), True), [1, 0])
+        this.write(rc)
+    return Address(rc.cell)
+
+
+def Weak__new(interpreter, result):
+    return WeakValue(None, [0, 1])
+
+
+def Weak__upgrade(interpreter, result, this):
+    weak = map_of(this)
+    if weak.cell is None or weak.counts[0] == 0:
+        return option(interpreter, result)
+    weak.counts[0] += 1
+    return option(interpreter, result, RcValue(weak.cell, weak.counts))
+
+
+def Weak__strong_count(interpreter, result, this):
+    weak = map_of(this)
+    return 0 if weak.cell is None else weak.counts[0]
+
+
+def Weak__weak_count(interpreter, result, this):
+    weak = map_of(this)
+    return 0 if weak.cell is None or weak.counts[0] == 0 else weak.counts[1]
+
+
+for _function in (Rc__new, Rc__clone, Rc__strong_count, Rc__weak_count, Rc__ptr_eq, Rc__as_ptr, Rc__downgrade,
+                  Rc__try_unwrap, Rc__into_inner, Rc__unwrap_or_clone, Rc__get_mut, Rc__make_mut, Weak__new,
+                  Weak__upgrade, Weak__strong_count, Weak__weak_count):
+    intrinsic(_function)
+
+
+@intrinsic
+def rust_rc_deref(interpreter, result, this):
+    return Address(map_of(this).cell)
+
+
+@intrinsic
+def rust_cell_value(interpreter, result, cell):
+    return cell.child(Token("value", 0, 0))
+
+
+INTRINSICS["refcell_value"] = rust_cell_value
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
