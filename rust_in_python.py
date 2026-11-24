@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 import functools
+import itertools
 import json
 import math
 import operator
@@ -886,6 +887,9 @@ STD_ROOT = ("std",)
 STD_PRELUDE = ("std", "prelude")
 STD_CRATES = {"std", "core", "alloc"}
 STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8")
+ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
+INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
+LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -1543,6 +1547,7 @@ class Function:
     visible_from: tuple = ()
     captures: tuple = ()
     consumes_captures: bool = False
+    where_bounds: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1616,6 +1621,8 @@ class IteratorValue:
     reverse: bool = False
     mappers: tuple = ()
     string_mode: str | None = None
+    # A started iterator keeps its Python iterator in a one-element list.
+    cursor: list | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1961,7 +1968,30 @@ def match_types(template, actual, parameters, result):
             match_types(left, right, parameters, result)
             for left, right in zip(template.elements, actual.elements)
         )
+    if isinstance(template, ReferenceType) and isinstance(actual, ReferenceType):
+        return template.mutable == actual.mutable and match_types(template.inner, actual.inner, parameters, result)
+    if isinstance(template, SliceType) and isinstance(actual, SliceType):
+        return match_types(template.element, actual.element, parameters, result)
+    if isinstance(template, FunctionType) and isinstance(actual, FunctionType):
+        return len(template.parameters) == len(actual.parameters) and all(
+            match_types(left, right, parameters, result)
+            for left, right in zip((*template.parameters, template.result), (*actual.parameters, actual.result))
+        )
     return template == actual
+
+
+def bind_signature_parameters(parameters, result):
+    """Infer impl parameters that only appear in Fn-bound outputs, such as B in F: FnMut(T) -> B."""
+    for parameter in parameters:
+        if parameter in result or not isinstance(parameter, TypeParameter):
+            continue
+        for owner, actual in tuple(result.items()):
+            template = callable_signature(owner) if isinstance(owner, TypeParameter) else None
+            signature = callable_signature(actual) if template is not None else None
+            if signature is None or len(signature.parameters) != len(template.parameters):
+                continue
+            for left, right in zip((*template.parameters, template.result), (*signature.parameters, signature.result)):
+                match_types(left, right, parameters, result)
 
 
 def overlapping_types(first, second):
@@ -1992,6 +2022,28 @@ SUPERTRAITS = {
     "Ord": {"Eq", "PartialOrd", "PartialEq"}, "Fn": {"FnMut", "FnOnce"}, "FnMut": {"FnOnce"},
 }
 DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized", *CALLABLE_TRAITS}
+
+
+def type_leaves(annotation):
+    """Yield every type nested in an annotation, including the annotation itself."""
+    yield annotation
+    if isinstance(annotation, ReferenceType):
+        yield from type_leaves(annotation.inner)
+    elif isinstance(annotation, FunctionType):
+        for kind in (*annotation.parameters, annotation.result):
+            yield from type_leaves(kind)
+    elif isinstance(annotation, (AppliedType, OpaqueType)):
+        for kind in annotation.arguments:
+            yield from type_leaves(kind)
+    elif isinstance(annotation, TupleType):
+        for kind in annotation.elements:
+            yield from type_leaves(kind)
+    elif isinstance(annotation, (ArrayType, SliceType)):
+        yield from type_leaves(annotation.element)
+    elif isinstance(annotation, AssociatedType):
+        yield from type_leaves(annotation.owner)
+        for kind in annotation.arguments:
+            yield from type_leaves(kind)
 
 
 def callable_signature(annotation):
@@ -2107,6 +2159,10 @@ class Program:
                        if name in bounds and annotation.item in trait.associated]
             if len(matches) == 1:
                 return matches[0]
+        elif isinstance(annotation.owner, IteratorType) and annotation.item == "Item":
+            return self.traits.get(ITERATOR)
+        elif annotation.item == "IntoIter" and not isinstance(annotation.owner, TypeVariable):
+            return self.traits.get(INTO_ITERATOR)
         elif not isinstance(annotation.owner, TypeVariable):
             matches = [trait for name, trait in self.traits.items()
                        if annotation.item in trait.associated and self.implementation(annotation.owner, name)]
@@ -2126,6 +2182,16 @@ class Program:
                                  arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments))
             if isinstance(owner, DynType):
                 return dict(owner.bindings).get(annotation.item, annotation)
+            if isinstance(owner, IteratorType) and annotation.item == "Item":
+                return owner.item
+            if (annotation.item == "IntoIter" and annotation.trait in {None, INTO_ITERATOR}
+                    and not isinstance(owner, (TypeParameter, TypeVariable, AssociatedType, OpaqueType))
+                    and self.implementation(owner, INTO_ITERATOR) is None):
+                builtin = self.builtin_iterator_type(owner)
+                if builtin is not None:
+                    return builtin
+                if ITERATOR in self.traits and self.implements(owner, ITERATOR):
+                    return owner
             if annotation in seen:
                 return annotation
             trait = self.projection_trait(annotation)
@@ -2208,7 +2274,10 @@ class Program:
             if impl.trait != trait:
                 continue
             arguments = {}
-            if match_types(impl.target, annotation, impl.parameters, arguments) and all(
+            matched = match_types(impl.target, annotation, impl.parameters, arguments)
+            if matched:
+                bind_signature_parameters(impl.parameters, arguments)
+            if matched and all(
                 parameter in arguments for parameter in impl.parameters
             ) and all(
                 self.implements(arguments[parameter], bound, seen=(*seen, key))
@@ -2287,7 +2356,13 @@ class Program:
                     for capture in captures
                 )
             return trait in {"Copy", "Clone", "PartialEq", "Eq"}
+        if trait == INTO_ITERATOR and not isinstance(annotation, (TypeVariable, AssociatedType)) and (
+                iteration_item(annotation) is not None
+                or (ITERATOR in self.traits and self.implements(annotation, ITERATOR, assumed, seen=seen))):
+            return True
         if isinstance(annotation, IteratorType):
+            if trait == ITERATOR:
+                return True
             source = annotation.source[1] if annotation.source[0] in {"map", "rev"} else annotation.item
             return (trait == "Clone" and self.implements(source, "Clone", assumed)
                     and (annotation.source[0] != "map" or self.implements(annotation.source[3], "Clone", assumed)))
@@ -2347,6 +2422,42 @@ class Program:
     def is_copy(self, annotation):
         return self.implements(annotation, "Copy")
 
+    @staticmethod
+    def builtin_iteration_item(annotation):
+        return iteration_item(annotation)
+
+    @staticmethod
+    def builtin_iterator_type(annotation):
+        """The IteratorType that into_iter produces for a built-in iterable."""
+        if isinstance(annotation, IteratorType):
+            return annotation
+        item = iteration_item(annotation)
+        if item is None:
+            return None
+        borrowed = isinstance(annotation, ReferenceType)
+        base = annotation.inner if borrowed else annotation
+        if borrowed and (isinstance(base, (ArrayType, SliceType)) or is_vector(base)):
+            origin = ("slice", annotation.mutable)
+        elif isinstance(base, ArrayType):
+            origin = ("array", base.length)
+        else:
+            origin = (base.name, annotation.mutable if borrowed else None)
+        return IteratorType(item, origin, borrowed)
+
+    def iteration_item(self, annotation):
+        """The item type a for loop yields, through built-in collections or the Iterator traits."""
+        item = iteration_item(annotation)
+        if item is not None:
+            return item
+        owner = annotation
+        if isinstance(owner, ReferenceType) and owner.mutable and ITERATOR in self.traits:
+            owner = owner.inner
+        if ITERATOR in self.traits and self.implements(owner, ITERATOR):
+            return self.normalize(AssociatedType(owner, "Item", ITERATOR))
+        if INTO_ITERATOR in self.traits and self.implements(annotation, INTO_ITERATOR):
+            return self.normalize(AssociatedType(annotation, "Item", INTO_ITERATOR))
+        return None
+
 
 class Parser:
     def __init__(self, source, *, tokens=None, fragment=False, modules=None, unit=None, edition="2021"):
@@ -2366,6 +2477,8 @@ class Parser:
         self.type_parameters = {}
         self.argument_parameters = None
         self.lifetime_scope = {}
+        self.method_outer_parameters = set()
+        self.method_where_bounds = []
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
         if unit:
             self.trait_names.update(unit.trait_imports)
@@ -2664,7 +2777,11 @@ class Parser:
             else:
                 result = self.type_name(signature=lifetimes)
         self.sized_receiver = False
+        self.method_outer_parameters = set(outer_parameters) - set(parameters) if method else set()
+        self.method_where_bounds = []
         self.where_clause(lifetimes)
+        self.method_outer_parameters = set()
+        where_bounds = tuple(self.method_where_bounds)
         sized_receiver = self.sized_receiver
         if receiver and isinstance(params[0][2], ReferenceType) and isinstance(result, ReferenceType) and not result.lifetime:
             return_inputs = (0,)
@@ -2679,6 +2796,7 @@ class Parser:
         function = Function(name, params, result, body, return_inputs, tuple(self.type_parameters.values()),
                             method_parameters=tuple(parameters.values()) if method else (),
                             lifetimes=lifetimes, self_sized=sized_receiver)
+        function.where_bounds = where_bounds
         self.type_parameters = outer_parameters
         self.lifetime_scope = outer_lifetimes
         return function
@@ -3053,8 +3171,14 @@ class Parser:
                 self.sized_receiver = True
             elif parameter_name in self.type_parameters:
                 parameter = self.type_parameters[parameter_name]
-                parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
-                                                          signature=lifetimes, outer_lifetimes=quantified))
+                if parameter_name in self.method_outer_parameters:
+                    # A method's where clause on an impl parameter only holds inside that method.
+                    bindings = {}
+                    bounds = self.trait_bounds(bindings=bindings, signature=lifetimes, outer_lifetimes=quantified)
+                    self.method_where_bounds.append((parameter, bounds, bindings))
+                else:
+                    parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
+                                                              signature=lifetimes, outer_lifetimes=quantified))
             else:
                 raise lhs.error(f"unknown type parameter {lhs.text}")
             if not self.accept(","):
@@ -4732,6 +4856,8 @@ class Checker:
         self.indirect_calls = []
         self.callable_hints = {}
         self.callable_requirements = []
+        self.assumed_bounds = ()
+        self.obligation_assumptions = {}
 
     def check(self):
         for alias in self.program.type_aliases.values():
@@ -4787,7 +4913,20 @@ class Checker:
             function.return_inputs = concrete.return_inputs
             if function.body is None:
                 continue
-            result = self.type_of(function.body, scope, self.result)
+            added = []
+            for parameter, bounds, bindings in function.where_bounds:
+                added.append((parameter, bounds - parameter.bounds, bindings.keys() - parameter.associated_bindings.keys()))
+                parameter.bounds.update(bounds)
+                parameter.associated_bindings.update(bindings)
+            self.assumed_bounds = function.where_bounds
+            try:
+                result = self.type_of(function.body, scope, self.result)
+            finally:
+                self.assumed_bounds = ()
+                for parameter, bounds, keys in added:
+                    parameter.bounds.difference_update(bounds)
+                    for key in keys:
+                        del parameter.associated_bindings[key]
             if opaque and result == function.result:
                 result = NEVER
             self.require_argument(result, self.result, function.body.token)
@@ -4869,6 +5008,10 @@ class Checker:
                 if name in {OPTION, RESULT} or name not in self.program.types:
                     raise impl.token.error("Termination can only be implemented for a type defined in this crate")
             target_parameters = set(self.type_parts(impl.target))
+            for parameter in tuple(target_parameters):
+                signature = callable_signature(parameter) if isinstance(parameter, TypeParameter) else None
+                if signature is not None:
+                    target_parameters.update(type_leaves(signature))
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
             if impl.trait is None and impl.token.module[:1] != STD_ROOT and (
@@ -5084,6 +5227,8 @@ class Checker:
             self.require(actual, expected, token)
 
     def obligation(self, annotation, trait, token):
+        if self.assumed_bounds:
+            self.obligation_assumptions[len(self.obligations)] = self.assumed_bounds
         self.obligations.append((annotation, trait, token))
 
     def check_variable_binding(self, variable, value, token):
@@ -5123,7 +5268,10 @@ class Checker:
         for parameter, owner in arguments.items():
             for binding, expected in parameter.associated_bindings.items():
                 if binding.item == CALL_ITEM:
-                    self.require_callable(owner, substitute(expected, arguments), token)
+                    signature = substitute(expected, arguments)
+                    if not any(isinstance(part, TypeParameter) and part.name == "Self"
+                               for part in type_leaves(signature)):
+                        self.require_callable(owner, signature, token)
                     continue
                 trait = self.program.associated_trait(binding.bound, binding.item)
                 if trait is None:
@@ -5264,10 +5412,12 @@ class Checker:
                                       for capture in function.captures)
         for annotation, token in self.generic_arguments:
             annotation = self.resolve(annotation)
-            if borrowing_iterator(annotation):
-                raise token.error("borrowed iterators as generic type arguments are unsupported")
-        for annotation, trait, token in self.obligations:
+        for index, (annotation, trait, token) in enumerate(self.obligations):
             annotation = self.resolve(annotation)
+            assumed = self.obligation_assumptions.get(index, ())
+            if any(annotation is parameter and trait in self.program.trait_closure(bounds)
+                   for parameter, bounds, _ in assumed):
+                continue
             if annotation != NEVER and not self.implements(annotation, trait):
                 raise token.error(f"{annotation} does not implement {trait}")
         for annotation, expected, token in self.numeric_operands:
@@ -5428,8 +5578,6 @@ class Checker:
             self.check_associated_arguments(trait, annotation.item, annotation.arguments, token)
             return
         if isinstance(annotation, ReferenceType):
-            if borrowing_iterator(annotation.inner):
-                raise token.error("references to borrowed iterators are unsupported")
             if annotation.inner == "str":
                 return
             if isinstance(annotation.inner, DynType):
@@ -5865,7 +6013,7 @@ class Checker:
                     test = NEVER
             else:
                 annotation = self.type_of(iterable, scope)
-                item = iteration_item(annotation)
+                item = self.program.iteration_item(self.resolve(annotation))
                 if item is None:
                     raise iterable.token.error(f"cannot iterate over {annotation}")
             pattern, bindings = self.prepare_pattern(source, item)
@@ -5921,7 +6069,7 @@ class Checker:
     def type_of(self, expr, scope, expected=None):
         if id(expr) in self.program.call_functions or expr.kind in {
             "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
-            "string_iterator", "iterator_terminal"
+            "string_iterator", "iterator_terminal", "lazy_adapter"
         }:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
@@ -6480,6 +6628,20 @@ class Checker:
             elif (hint not in NUMBER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
                 hint = None
             left, right = self.operand_types(*args, scope, hint, same_type=token.text in COMPARE)
+            if token.text not in COMPARE and token.text not in {"&&", "||"}:
+                operands = list(args)
+                types = [left, right]
+                for index in range(2):
+                    while isinstance(types[index], ReferenceType) and self.numeric_like(types[index].inner):
+                        operands[index] = Expr("deref", operands[index].token, (operands[index], False))
+                        self.program.expr_types[id(operands[index])] = types[index].inner
+                        types[index] = self.resolve(types[index].inner)
+                if operands != list(args):
+                    expr.args = tuple(operands)
+                    args = expr.args
+                    left, right = types
+                    if isinstance(left, TypeVariable) or isinstance(right, TypeVariable):
+                        self.require(left, right, token)
             if left == STRING and token.text == "+":
                 right = self.coerce_reference(args[1], right, STR_REFERENCE)
                 self.program.expr_types[id(args[1])] = right
@@ -6602,12 +6764,21 @@ class Checker:
         left_literal, right_literal = self.unsuffixed_number(left), self.unsuffixed_number(right)
         if hint is None and left_literal and not right_literal:
             right_type = self.type_of(right, scope)
-            left_type = self.type_of(left, scope, right_type if right_type in NUMBER_TYPES else None)
+            peeled = self.peel_numeric_reference(right_type)
+            left_type = self.type_of(left, scope, peeled if peeled in NUMBER_TYPES else None)
         else:
             left_type = self.type_of(left, scope, hint if hint == "bool" or left_literal else None)
             right_hint = left_type if left_type != NEVER else hint
+            if right_literal and not same_type:
+                right_hint = self.peel_numeric_reference(right_hint)
             right_type = self.type_of(right, scope, right_hint if hint == "bool" or same_type or right_literal else None)
         return left_type, right_type
+
+    def peel_numeric_reference(self, annotation):
+        annotation = self.resolve(annotation)
+        while isinstance(annotation, ReferenceType) and self.numeric_like(annotation.inner):
+            annotation = self.resolve(annotation.inner)
+        return annotation
 
     @staticmethod
     def integer_pair(left, right):
@@ -6763,9 +6934,14 @@ class Checker:
             args = args[1:]
         if len(args) != len(params):
             raise token.error(f"{token.text} takes {len(params)} arguments")
-        defer_projection = isinstance(self.resolve(result), AssociatedType)
+        defer_projection = any(isinstance(part, AssociatedType) for part in type_leaves(self.resolve(result)))
         if expected is not None and arguments and not defer_projection:
             self.require_argument(result, expected, token)
+        for parameter, owner in arguments.items():
+            if isinstance(parameter, TypeParameter):
+                signature = callable_signature(parameter)
+                if signature is not None:
+                    self.require_callable(owner, substitute(signature, arguments), token)
         actual_types = []
         for index, (expr_arg, parameter) in enumerate(zip(args, params)):
             hint = self.resolve(parameter)
@@ -6878,8 +7054,28 @@ class Checker:
             return replace(actual, source=("rev", actual)) if name == "rev" else actual
         if isinstance(actual, IteratorType) and name == "map":
             return self.iterator_map(expr, scope, actual)
-        if isinstance(actual, IteratorType) and name in {"collect", "count", "sum"}:
+        if isinstance(actual, IteratorType) and name in {"collect", "count", "sum", "product"}:
             return self.iterator_terminal(expr, expected, actual)
+        if (name in {"cloned", "copied", "flatten"} and not rest and expr.type_arguments is None
+                and not isinstance(actual, ReferenceType) and ITERATOR in self.program.traits
+                and self.implements(self.resolve(base), ITERATOR)):
+            item = self.resolve(AssociatedType(base, "Item", ITERATOR))
+            if name == "flatten":
+                inner = self.program.iteration_item(item)
+                if inner is None:
+                    raise expr.token.error(f"cannot flatten items of type {item}")
+            else:
+                if not isinstance(item, ReferenceType):
+                    raise expr.token.error(f"{name} requires an iterator over references, found {item}")
+                inner = item.inner
+                self.obligation(inner, "Copy" if name == "copied" else "Clone", expr.token)
+            expr.kind, expr.args = "lazy_adapter", (original,)
+            return AppliedType(LAZY, (self.resolve(inner),))
+        if (name in {"collect", "sum", "product"} and not isinstance(base, IteratorType)
+                and not isinstance(actual, ReferenceType) and ITERATOR in self.program.traits
+                and self.implements(self.resolve(base), ITERATOR)):
+            item = self.resolve(AssociatedType(base, "Item", ITERATOR))
+            return self.iterator_terminal(expr, expected, IteratorType(item, ("trait",)))
         if base in {STRING, "str"} and name in {"chars", "bytes"} and not rest and expr.type_arguments is None:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", original.token, (original, False))
@@ -6932,8 +7128,13 @@ class Checker:
                 continue
             arguments = {}
             if match_types(impl.target, base, impl.parameters, arguments) and all(
-                self.implements(arguments[p], bound) for p in impl.parameters for bound in p.bounds
+                isinstance(self.resolve(arguments[p]), TypeVariable) or self.implements(self.resolve(arguments[p]), bound)
+                for p in impl.parameters if p in arguments for bound in p.bounds
             ):
+                for p in impl.parameters:
+                    if p in arguments and isinstance(self.resolve(arguments[p]), TypeVariable):
+                        for bound in p.bounds:
+                            self.obligation(arguments[p], bound, expr.token)
                 method = impl.methods[name]
                 if self.has_receiver(method):
                     self.visible_method(method, expr.token)
@@ -7125,7 +7326,7 @@ class Checker:
             resolved = self.resolve(result)
             if name == "collect" and is_vector(resolved):
                 self.require(iterator.item, resolved.arguments[0], token)
-            elif name == "sum" and resolved in INTEGER_TYPES:
+            elif name in {"sum", "product"} and resolved in NUMBER_TYPES:
                 item = iterator.item.inner if isinstance(iterator.item, ReferenceType) else iterator.item
                 self.require(item, resolved, token)
             self.iterator_results.append((name, iterator.item, result, token))
@@ -7146,8 +7347,8 @@ class Checker:
                 raise token.error(f"cannot collect items of type {item} into {target}")
         else:
             element = item.inner if isinstance(item, ReferenceType) else item
-            if target not in INTEGER_TYPES:
-                raise token.error(f"sum requires an integer result, found {target}")
+            if target not in NUMBER_TYPES:
+                raise token.error(f"{method} requires a numeric result, found {target}")
             self.require(element, target, token)
 
     def vector_method(self, expr, scope, expected, actual, base):
@@ -7275,6 +7476,12 @@ class Checker:
         if len(traits) == 1:
             return self.trait_call(expr, scope, expected, owner, traits[0], name)
         raise expr.token.error(f"unknown or ambiguous associated function {name!r} for {owner}")
+
+    def numeric_like(self, annotation):
+        annotation = self.resolve(annotation)
+        return (annotation in NUMBER_TYPES or annotation == "bool" or isinstance(annotation, ReferenceType)
+                and self.numeric_like(annotation.inner)
+                or isinstance(annotation, TypeVariable) and (annotation.integer_literal or annotation.float_literal))
 
     def binary_type(self, token, left, right):
         word = token.text
@@ -7696,6 +7903,10 @@ class Ownership:
 
     @staticmethod
     def referent(holder):
+        if holder.loan is None:
+            # The checker did not trace where this reference points, so its referent is untracked.
+            token = replace(holder.token, text=f"*{holder.token.text}")
+            return Place(Local(token, True, static=True))
         owner = holder.loan.place
         return Place(owner.local, owner.fields, holder)
 
@@ -7957,7 +8168,7 @@ class Ownership:
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
-        if kind == "iterator_terminal":
+        if kind in {"iterator_terminal", "lazy_adapter"}:
             source = args[0]
             if borrowing_iterator(self.annotation(source)):
                 cursor, loan = self.lower_iterator(source, scope, cursor)
@@ -8272,7 +8483,7 @@ class Ownership:
                 cursor = self.lower(stop, scope, self.lower(start, scope, cursor))
             else:
                 iterable_type = self.annotation(iterable)
-                item_type = iteration_item(iterable_type)
+                item_type = self.program.iteration_item(iterable_type)
                 if isinstance(iterable_type, ReferenceType):
                     cursor, loan = self.lower_reference(iterable, scope, cursor)
                 elif borrowing_iterator(iterable_type):
@@ -8789,6 +9000,10 @@ class Interpreter:
                     bindings[capture.name.key] = Binding(self.clone_value(binding.value), binding.mutable)
             return replace(value, environment=bindings)
         if isinstance(value, IteratorValue):
+            if value.cursor is not None:
+                first, second = itertools.tee(value.cursor[0])
+                value.cursor[0] = first
+                return replace(value, cursor=[second])
             collection = value.collection if value.borrowed else self.clone_value(value.collection)
             return replace(value, collection=collection, mappers=tuple(map(self.clone_value, value.mappers)))
         if isinstance(value, BoxValue):
@@ -8807,6 +9022,13 @@ class Interpreter:
 
     def iteration_values(self, collection, annotation, token):
         iterator = collection if isinstance(collection, IteratorValue) else None
+        if iterator and iterator.cursor is not None:
+            return iterator.cursor[0]
+        if iterator is None:
+            concrete = self.program.concrete_type(
+                self.program.normalize(substitute(annotation, self.type_arguments)))
+            if self.program.builtin_iteration_item(concrete) is None:
+                return self.trait_iteration(collection, concrete)
         if iterator:
             collection, borrowed = iterator.collection, iterator.borrowed
         else:
@@ -8832,6 +9054,50 @@ class Interpreter:
             values = self.mapped_items(values, iterator.mappers)
         return values
 
+    def trait_iteration(self, value, annotation):
+        """Drive any Iterator (or IntoIterator) implementation by calling its next method."""
+        if isinstance(annotation, ReferenceType) and annotation.mutable:
+            address, annotation = value, self.program.concrete_type(annotation.inner)
+            if isinstance(address.read(), IteratorValue):
+                yield from self.iteration_values(self.start_iterator(address), annotation, None)
+                return
+        else:
+            implementation = self.program.implementation(annotation, ITERATOR)
+            if implementation is None:
+                impl, arguments = self.program.implementation(annotation, INTO_ITERATOR)
+                value = self.call(impl.methods["into_iter"].name.text, (value,), arguments)
+                target = self.program.concrete_type(self.program.normalize(
+                    substitute(impl.associated["IntoIter"].body, arguments)))
+                yield from self.iteration_values(value, target, None)
+                return
+            address = Address(Binding(value, True))
+        impl, arguments = self.program.implementation(annotation, ITERATOR)
+        name = impl.methods["next"].name.text
+        while True:
+            result = self.call(name, (address,), arguments)
+            if result.constructor.path.endswith("::None"):
+                return
+            yield result.fields[0]
+
+    def iterate(self, value, type_index):
+        """Iterate a value whose type is the intrinsic's type argument at type_index."""
+        annotation = self.program.concrete_type(self.intrinsic_types[type_index])
+        return self.iteration_values(value, annotation, Token("0", 0, 0))
+
+    def start_iterator(self, address):
+        iterator = address.read()
+        if iterator.cursor is None:
+            values = self.iteration_values(iterator, None, Token("0", 0, 0))
+            iterator = replace(iterator, cursor=[iter(values)])
+            address.write(iterator)
+        return iterator
+
+    def iterator_next(self, address, result):
+        iterator = self.start_iterator(address)
+        sentinel = object()
+        item = next(iterator.cursor[0], sentinel)
+        return self.variant(result, "None") if item is sentinel else self.variant(result, "Some", item)
+
     def placeholder(self, annotation):
         # Wildcard patterns can inspect an aggregate's shape without reading
         # its fields. Ownership prevents an uninitialized field from escaping.
@@ -8849,6 +9115,7 @@ class Interpreter:
                                    for p, t in (arguments or {}).items()}
             try:
                 result = self.program.normalize(substitute(function.result, self.type_arguments))
+                self.intrinsic_types = [self.type_arguments.get(parameter) for parameter in function.type_parameters]
                 return INTRINSICS[name.rsplit(MODULE_SEPARATOR, 1)[-1]](self, result, *values)
             finally:
                 self.type_arguments = previous
@@ -9011,13 +9278,30 @@ class Interpreter:
                 return "".join(display(value, False) for value in values) if result == STRING else ArrayValue(tuple(values))
             if token.text == "count":
                 return checked(sum(1 for _ in values), token, "usize", runtime=True)
-            total = 0
+            product = token.text == "product"
+            total = int(product)
+            if result in FLOAT_TYPES:
+                total = rounded_float(float(total), result)
             for value in values:
                 element = value.read() if isinstance(value, Address) else value
-                total = binary("+", total, element, token, result, runtime=True)
+                if result in FLOAT_TYPES:
+                    total = rounded_float(total * element if product else total + element, result)
+                else:
+                    total = binary("*" if product else "+", total, element, token, result, runtime=True)
             return total
         if kind == "iterator":
             return IteratorValue(self.eval(args[0], scope), borrowing_iterator(self.program.expr_types[id(expr)]))
+        if kind == "lazy_adapter":
+            source = args[0]
+            annotation = self.program.normalize(substitute(self.program.expr_types[id(source)], self.type_arguments))
+            values = self.iteration_values(self.eval(source, scope), annotation, source.token)
+            if token.text == "flatten":
+                item = self.program.normalize(AssociatedType(self.program.concrete_type(annotation), "Item", ITERATOR))
+                values = (inner for value in values
+                          for inner in self.iteration_values(value, self.program.concrete_type(item), token))
+            else:
+                values = (self.clone_value(value.read()) for value in values)
+            return IteratorValue(None, False, cursor=[iter(values)])
         if kind == "string_iterator":
             return IteratorValue(self.eval(args[0], scope), True, string_mode=token.text)
         if kind == "reverse_iterator":
@@ -9354,7 +9638,14 @@ class Interpreter:
                 implementation = self.program.implementation(receiver, trait)
                 if implementation is None and trait == TERMINATION:
                     return ExitCodeValue(self.exit_status(values[0], receiver))
-                impl, specialized = implementation
+                if implementation is None and trait == INTO_ITERATOR and name == "into_iter":
+                    if isinstance(values[0], IteratorValue) or iteration_item(receiver) is None:
+                        return values[0]
+                    return IteratorValue(values[0], isinstance(receiver, ReferenceType))
+                if implementation is None and trait == ITERATOR and name == "next":
+                    result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+                    return self.iterator_next(values[0], result)
+                impl, specialized = implementation or (Implementation(token, receiver, trait, (), {}, {}), {})
                 if name in impl.methods:
                     prototype = function
                     function = impl.methods[name]
@@ -9635,16 +9926,55 @@ INTRINSICS = {}
 
 
 def intrinsic(function):
-    INTRINSICS[function.__name__] = function
+    INTRINSICS[function.__name__.removeprefix("rust_")] = function
     return function
 
 
 @intrinsic
-def vec_last(interpreter, result, vector):
+def rust_vec_last(interpreter, result, vector):
     items = vector.read().items
     if not items:
         return interpreter.variant(result, "None")
     return interpreter.variant(result, "Some", vector.child(Token(str(len(items) - 1), 0, 0)))
+
+
+@intrinsic
+def rust_replace(interpreter, result, destination, value):
+    previous = destination.read()
+    destination.write(value)
+    return previous
+
+
+@intrinsic
+def rust_swap(interpreter, result, first, second):
+    left, right = first.read(), second.read()
+    first.write(right)
+    second.write(left)
+
+
+@intrinsic
+def rust_compare(interpreter, result, left, right):
+    return interpreter.compare(left, right)
+
+
+@intrinsic
+def rust_iter_max(interpreter, result, iterator, last):
+    best = None
+    found = False
+    for item in interpreter.iterate(iterator, 0):
+        if not found or (interpreter.compare(item, best) >= 0 if last else interpreter.compare(item, best) < 0):
+            best, found = item, True
+    return interpreter.variant(result, "Some", best) if found else interpreter.variant(result, "None")
+
+
+@intrinsic
+def rust_iter_collect(interpreter, result, iterator):
+    return ArrayValue(tuple(interpreter.iterate(iterator, 0)))
+
+
+@intrinsic
+def rust_lazy_next(interpreter, result, address):
+    return interpreter.iterator_next(address, result)
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
