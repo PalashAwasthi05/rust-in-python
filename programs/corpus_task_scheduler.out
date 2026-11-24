@@ -1,0 +1,11 @@
+0
+by priority: parse(p5) compile(p5) docs(p5) test(p3) fetch(p2) lint(p1)
+topo order: fetch -> parse -> lint -> compile -> docs -> test
+  fetch    start  0 end  3
+  parse    start  3 end  5
+  lint     start  3 end  4
+  compile  start  5 end 11
+  docs     start  5 end  7
+  test     start 11 end 15
+makespan: 15
+Err("cycle detected after []")

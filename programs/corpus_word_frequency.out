@@ -1,0 +1,18 @@
+0
+total words: 48, distinct: 16
+top 6:
+  it        8 ########
+  of        8 ########
+  the       8 ########
+  was       8 ########
+  age       2 ##
+  epoch     2 ##
+appear once: belief best darkness foolishness incredulity light wisdom worst
+len 2: ["it", "of"]
+len 3: ["age", "the", "was"]
+len 4: ["best"]
+len 5: ["epoch", "light", "times", "worst"]
+len 6: ["belief", "season", "wisdom"]
+len 8: ["darkness"]
+len 11: ["foolishness", "incredulity"]
+longest word: foolishness

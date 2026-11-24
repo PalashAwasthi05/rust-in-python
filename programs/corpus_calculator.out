@@ -1,0 +1,10 @@
+0
+1 + 2 * 3              = 7
+(1 + 2) * 3            = 9
+10 / 4 - 1             = 1.5
+-(3 - 5) * 2.5         = 5
+2 * (3 + 4) * (5 - 1)  = 56
+1 / 0                  ! division by zero
+4 +                    ! unexpected token None
+7 $ 2                  ! unexpected char '$' at 2
+(1 + 2                 ! expected ')'

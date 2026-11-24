@@ -1112,6 +1112,7 @@ DEREF = MODULE_SEPARATOR.join(("std", "ops", "Deref"))
 DROP = MODULE_SEPARATOR.join(("std", "ops", "Drop"))
 RC = MODULE_SEPARATOR.join(("std", "rc", "Rc"))
 WEAK = MODULE_SEPARATOR.join(("std", "rc", "Weak"))
+POINTER_TYPES = {BOX, RC, WEAK}
 INDIRECT_TYPES = {VEC, BOX, RC, WEAK, *(MODULE_SEPARATOR.join(("std", "collections", name)) for name in (
     "HashMap", "BTreeMap", "HashSet", "BTreeSet", "VecDeque", "BinaryHeap"))}
 MAP_TYPES = {MODULE_SEPARATOR.join(("std", "collections", name)): name
@@ -1124,6 +1125,10 @@ OPERATOR_TRAITS = {
     ">>": ("Shr", "shr"),
 }
 UNARY_TRAITS = {"-": ("Neg", "neg"), "!": ("Not", "not")}
+BUILTIN_OPERATORS = {MODULE_SEPARATOR.join(("std", "ops", trait)): symbol
+                     for symbol, (trait, _) in {**OPERATOR_TRAITS, **UNARY_TRAITS}.items()}
+BUILTIN_OPERATORS.update({MODULE_SEPARATOR.join(("std", "ops", trait + "Assign")): symbol + "="
+                          for symbol, (trait, _) in OPERATOR_TRAITS.items()})
 
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
@@ -1224,6 +1229,7 @@ class Modules:
         self.type_aliases = {}
         self.alias_names = set()
         self.lazy_items = {}
+        self.enum_variants = {}
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
         self.units[STD_ROOT] = std
@@ -1382,6 +1388,12 @@ class Modules:
                         original = unit.symbols.get(identifier_text(name.text))
                         if not expanded or not original or original.token is not name:
                             self.register(unit, name, kind, boundary)
+                        if word == "enum":
+                            body = next((part for part in items[index + 2:end]
+                                         if isinstance(part, TokenGroup) and tree_text(part) == "{"), None)
+                            if body is not None:
+                                symbol = unit.symbols[identifier_text(name.text)]
+                                self.enum_variants[symbol.name] = self.variant_names(body.items)
                 if expanded and word in {"const", "static", "type"}:
                     unit.declarations.append(items[index:end])
                 else:
@@ -1399,6 +1411,24 @@ class Modules:
             output.append(items[index])
             index += 1
         return tuple(output)
+
+    @staticmethod
+    def variant_names(items):
+        names = []
+        expect_name = True
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if expect_name and tree_text(item) == "#" and index + 1 < len(items):
+                index += 2
+                continue
+            if expect_name and isinstance(item, Token) and is_identifier(item.text):
+                names.append(identifier_text(item.text))
+                expect_name = False
+            elif tree_text(item) == ",":
+                expect_name = True
+            index += 1
+        return names
 
     INNER_ITEMS = {"fn", "struct", "enum", "impl", "trait", "use", "type", "static", "mod"}
 
@@ -1683,6 +1713,12 @@ class Modules:
                     if self.is_macro_import(unit, item):
                         continue
                     unresolved.append((unit, item, item.token.error(f"unresolved import {'::'.join(item.path)}")))
+                    continue
+                if item.alias == "*" and target.kind == "enum" and target.name in self.enum_variants:
+                    for variant in self.enum_variants[target.name]:
+                        symbol = ModuleSymbol((*target.path[:-1], f"{target.path[-1]}::{variant}"),
+                                              "associated", (), item.token)
+                        unit.glob_aliases.setdefault(variant, symbol)
                     continue
                 if item.alias == "*":
                     if target.kind != "module":
@@ -2313,6 +2349,9 @@ class Implementation:
 
 
 def match_types(template, actual, parameters, result):
+    if isinstance(actual, TypeVariable) and (
+            actual.integer_literal and template in INTEGER_TYPES or actual.float_literal and template in FLOAT_TYPES):
+        return True
     if template in parameters:
         if template in result:
             return result[template] == actual
@@ -2585,6 +2624,10 @@ class Program:
                 return dict(owner.bindings).get(annotation.item, annotation)
             if isinstance(owner, IteratorType) and annotation.item == "Item":
                 return owner.item
+            primitive = owner.inner if isinstance(owner, ReferenceType) else owner
+            if (annotation.item == "Output" and annotation.trait in BUILTIN_OPERATORS
+                    and (primitive in PRIMITIVES or primitive == STRING)):
+                return primitive
             if (annotation.item == "IntoIter" and annotation.trait in {None, INTO_ITERATOR}
                     and not isinstance(owner, (TypeParameter, TypeVariable, AssociatedType, OpaqueType))
                     and self.implementation(owner, INTO_ITERATOR) is None):
@@ -2763,6 +2806,17 @@ class Program:
     def implements(self, annotation, trait, assumed=(), *, seen=()):
         if trait in {"?Sized", "Send", "Sync", "Unpin"}:
             return True
+        if trait in BUILTIN_OPERATORS:
+            primitive = annotation.inner if isinstance(annotation, ReferenceType) else annotation
+            if isinstance(primitive, TypeVariable) and (primitive.integer_literal or primitive.float_literal):
+                return True
+            symbol = BUILTIN_OPERATORS[trait].removesuffix("=")
+            if primitive in NUMBER_TYPES and (symbol in FLOAT_OPERATORS or symbol == "-" or primitive in INTEGER_TYPES):
+                return True
+            if primitive == "bool" and symbol in {"!", "&", "|", "^"}:
+                return True
+            if primitive == STRING and symbol == "+":
+                return True
         if isinstance(annotation, TypeVariable) and (annotation.integer_literal or annotation.float_literal):
             annotation = "f64" if annotation.float_literal else "i32"
         if (trait in TRAIT_MODULES and trait in self.traits
@@ -2787,6 +2841,9 @@ class Program:
                 return (self.implements(result, TERMINATION, assumed, seen=seen)
                         and self.implements(error, "Debug", assumed, seen=seen))
         if annotation == EXIT_CODE and trait in {"Copy", "Clone", "Debug", "PartialEq"}:
+            return True
+        if isinstance(annotation, AppliedType) and trait == "Default" and (
+                annotation.name in MAP_TYPES or annotation.name in {DEQUE, HEAP}):
             return True
         if isinstance(annotation, AppliedType) and annotation.name in {RC, WEAK} and trait in TRAIT_MODULES:
             if trait == "Clone":
@@ -3258,7 +3315,11 @@ class Parser:
         self.method_outer_parameters = set()
         where_bounds = tuple(self.method_where_bounds)
         sized_receiver = self.sized_receiver
-        if receiver and isinstance(params[0][2], ReferenceType) and isinstance(result, ReferenceType) and not result.lifetime:
+        if (self.in_std and receiver and isinstance(params[0][2], ReferenceType) and not params[0][2].mutable
+                and isinstance(result, ReferenceType) and result.mutable):
+            # Interior mutability (RefCell, Cell): a &mut from &self is checked at runtime in Rust, not here.
+            return_inputs = ()
+        elif receiver and isinstance(params[0][2], ReferenceType) and isinstance(result, ReferenceType) and not result.lifetime:
             return_inputs = (0,)
         else:
             return_inputs = self.return_inputs(name, params, result, lifetimes)
@@ -3314,7 +3375,12 @@ class Parser:
         self.type_parameters = parameters
         self.where_clause(lifetimes)
         self.expect("=")
-        target = self.type_name(signature=lifetimes)
+        outer_lifetimes = self.lifetime_scope
+        self.lifetime_scope = {**outer_lifetimes, **lifetimes}
+        try:
+            target = self.type_name(signature=lifetimes)
+        finally:
+            self.lifetime_scope = outer_lifetimes
         if isinstance(target, ReferenceType) and target.lifetime is None:
             raise name.error("a reference type alias requires an explicit lifetime")
         self.expect(";")
@@ -3946,7 +4012,7 @@ class Parser:
                 left = Expr("field", dot, (left, name))
         if statement and left.kind in BLOCK_EXPRESSIONS:
             return left
-        while minimum <= PRECEDENCE["*"] and (cast := self.accept("as")):
+        while minimum <= PRECEDENCE["*"] + 1 and (cast := self.accept("as")):
             left = Expr("cast", cast, (left, self.type_name()))
         compared = False
         while True:
@@ -4129,10 +4195,10 @@ class Parser:
                 value = self.expression(allow_record=allow_record)
             return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
-            return Expr("unary", token, (self.expression(PRECEDENCE["*"] + 1, allow_record=allow_record),))
+            return Expr("unary", token, (self.expression(PRECEDENCE["*"] + 2, allow_record=allow_record),))
         if word in {"&", "*"}:
             mutable = bool(self.accept("mut")) if word == "&" else False
-            operand = self.expression(PRECEDENCE["*"] + 1, allow_record=allow_record)
+            operand = self.expression(PRECEDENCE["*"] + 2, allow_record=allow_record)
             return Expr("borrow" if word == "&" else "deref", token, (operand, mutable))
         if word == "(":
             if self.accept(")"):
@@ -4623,6 +4689,10 @@ class Parser:
 
     def simple_pattern(self):
         token = self.advance()
+        if token.text == "&&":
+            self.lookahead.appendleft(self.current)
+            self.current = replace(token, text="&", column=token.column + 1)
+            token = replace(token, text="&")
         if token.text == "_":
             return Expr("wild", token)
         if token.text == "&":
@@ -4695,7 +4765,7 @@ class Parser:
             pattern = self.pattern()
             guard = self.expression(allow_record=False) if self.accept("if") else None
             self.expect("=>")
-            body = self.expression()
+            body = self.expression(statement=self.current.text == "{")
             arms.append((pattern, guard, body))
             if not self.accept(",") and body.kind not in BLOCK_EXPRESSIONS:
                 break
@@ -5002,22 +5072,24 @@ class MapValue:
 class RcValue:
     """An Rc or Arc: clones share one cell and one pair of strong and weak counts."""
 
-    __slots__ = ("cell", "counts")
+    __slots__ = ("cell", "counts", "concrete")
 
-    def __init__(self, cell, counts):
+    def __init__(self, cell, counts, concrete=None):
         self.cell = cell
         self.counts = counts
+        self.concrete = concrete
 
     def read(self):
         return self.cell.value
 
 
 class WeakValue:
-    __slots__ = ("cell", "counts")
+    __slots__ = ("cell", "counts", "concrete")
 
-    def __init__(self, cell, counts):
+    def __init__(self, cell, counts, concrete=None):
         self.cell = cell
         self.counts = counts
+        self.concrete = concrete
 
 
 class MapSlot:
@@ -5117,6 +5189,7 @@ class SlicePattern:
     annotation: SliceType
     prefix: int
     suffix: int | None
+    rest_binding: object = field(default=None, compare=False)
 
     @property
     def fields(self):
@@ -5163,8 +5236,17 @@ class Pattern:
         elif isinstance(self.tag, SlicePattern):
             positions = self.tag.positions(len(value.items))
             if positions is not None:
-                yield from self.field_bindings(tuple(value.items[index] for index in positions),
-                                               address, tuple(map(str, positions)))
+                extra = {}
+                if self.tag.rest_binding is not None:
+                    start, stop = self.tag.prefix, len(value.items) - (self.tag.suffix or 0)
+                    if isinstance(address, SliceAddress):
+                        extra = {self.tag.rest_binding: SliceAddress(address.address, address.start + start,
+                                                                     address.start + stop)}
+                    else:
+                        extra = {self.tag.rest_binding: SliceAddress(address, start, stop)}
+                for matched in self.field_bindings(tuple(value.items[index] for index in positions),
+                                                   address, tuple(map(str, positions))):
+                    yield matched | extra
         elif isinstance(self.tag, (IntegerRange, FloatRange)):
             if self.tag.contains(value):
                 yield {}
@@ -5874,6 +5956,10 @@ class Checker:
             if actual.source == expected.source and actual.borrowed == expected.borrowed:
                 self.require(actual.item, expected.item, token)
                 return
+        if isinstance(actual, IteratorType) and isinstance(expected, AppliedType) and expected.name == LAZY:
+            # Built-in iterators share Lazy's runtime representation, so std names like Chars accept them.
+            self.require(actual.item, expected.arguments[0], token)
+            return
         if isinstance(actual, AppliedType) and isinstance(expected, AppliedType):
             if actual.name == expected.name and len(actual.arguments) == len(expected.arguments):
                 for left, right in zip(actual.arguments, expected.arguments):
@@ -6150,16 +6236,13 @@ class Checker:
         for function in self.closures:
             function.params = [(name, mutable, self.resolve(kind)) for name, mutable, kind in function.params]
             function.result = self.resolve(function.result)
-            for capture in function.captures:
-                kind = capture.annotation
-                if isinstance(kind, FunctionType) and kind.closure:
-                    raise capture.name.error("capturing another capturing closure is unsupported")
-                if borrowing_iterator(kind):
-                    raise capture.name.error("capturing a borrowed iterator is unsupported")
             if isinstance(function.result, ReferenceType):
-                if function.captures:
-                    raise function.name.error("reference results from capturing closures are unsupported")
-                function.return_inputs = Parser.return_inputs(function.name, function.params, function.result, {})
+                try:
+                    function.return_inputs = Parser.return_inputs(function.name, function.params,
+                                                                  function.result, {})
+                except RustError:
+                    # Closures infer their result lifetime; leave results the checker cannot tie untracked.
+                    function.return_inputs = ()
         for expr in self.pointers:
             name, arguments = expr.args
             expr.args = (name, {parameter: self.resolve(kind) for parameter, kind in arguments.items()})
@@ -6309,8 +6392,10 @@ class Checker:
                 if parameter.const_type:
                     self.check_const(argument, parameter.const_type, token)
                     continue
-                if is_box(annotation) and isinstance(argument, DynType):
-                    self.check_dyn(argument, token)
+                if annotation.name in POINTER_TYPES and isinstance(argument, (DynType, SliceType)) or (
+                        annotation.name in POINTER_TYPES and argument == "str"):
+                    if isinstance(argument, DynType):
+                        self.check_dyn(argument, token)
                     continue
                 self.check_type(argument, token)
                 self.generic_arguments.append((argument, token))
@@ -6620,13 +6705,22 @@ class Checker:
                 self.require(inferred, annotation, token)
                 annotation = inferred
             if isinstance(annotation, SliceType):
-                rest = [index for index, child in enumerate(args) if child.kind == "rest"]
+                def is_rest(child):
+                    return child.kind == "rest" or (child.kind == "pattern_binding" and child.args[1].kind == "rest")
+                rest = [index for index, child in enumerate(args) if is_rest(child)]
                 if len(rest) > 1:
                     raise args[rest[1]].token.error("a slice pattern can contain only one '..'")
                 prefix = rest[0] if rest else len(args)
                 suffix = len(args) - prefix - 1 if rest else None
-                ctor = SlicePattern(annotation, prefix, suffix)
-                assignments = enumerate(child for child in args if child.kind != "rest")
+                rest_binding = None
+                rest_bindings = {}
+                if rest and args[rest[0]].kind == "pattern_binding":
+                    name = args[rest[0]].args[0].token
+                    rest_binding = name.key
+                    view = ReferenceType(annotation, bool(borrowed))
+                    rest_bindings = {name.key: (view, False)}
+                ctor = SlicePattern(annotation, prefix, suffix, rest_binding)
+                assignments = enumerate(child for child in args if not is_rest(child))
             elif not isinstance(annotation, ArrayType):
                 raise token.error(f"expected an array pattern target, found {annotation}")
             else:
@@ -6675,6 +6769,7 @@ class Checker:
             for annotation, _ in bindings.values():
                 if not isinstance(annotation, ReferenceType):
                     self.obligation(annotation, "Copy", token)
+            bindings.update(rest_bindings)
         return Pattern(tag=ctor, children=tuple(children)), bindings
 
     def match_type(self, expr, scope, expected=None):
@@ -6778,8 +6873,9 @@ class Checker:
             return self.pretyped.pop(id(expr))
         if id(expr) in self.program.call_functions or expr.kind in {
             "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
-            "string_iterator", "iterator_terminal", "lazy_adapter"
-        }:
+            "string_iterator", "iterator_terminal", "lazy_adapter", "enum_method", "string_method",
+            "vector_method", "to_string", "scalar_cast", "range_value", "chars_as_str"
+        } and id(expr) in self.program.expr_types:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
         elif expr.kind == "block" and expr.label:
@@ -6794,7 +6890,9 @@ class Checker:
             result = self.check_expr(expr, scope, expected)
         result = self.resolve(result)
         expected = self.resolve(expected)
-        if is_box(result) and is_box(expected) and result != expected and isinstance(expected.arguments[0], DynType):
+        if (isinstance(result, AppliedType) and isinstance(expected, AppliedType) and result.name == expected.name
+                and result.name in POINTER_TYPES and result != expected and isinstance(expected.arguments[0], DynType)
+                and (is_box(result) or not isinstance(self.resolve(result.arguments[0]), DynType))):
             self.check_dyn_conversion(result.arguments[0], expected.arguments[0], expr.token)
             result = expected
         result = self.coerce_reference(expr, result, expected)
@@ -6996,6 +7094,9 @@ class Checker:
                 return NEVER
             if not isinstance(actual, AppliedType) or actual.name not in {OPTION, RESULT}:
                 raise token.error("? requires Option or Result")
+            if hint is not None and hint.name == RESULT and actual.name == RESULT:
+                if isinstance(self.resolve(hint.arguments[1]), TypeVariable):
+                    self.require(hint.arguments[1], actual.arguments[1], token)
             if not isinstance(enclosing, AppliedType) or actual.name != enclosing.name:
                 raise token.error("? requires a function returning the same enum family")
             if actual.name == RESULT:
@@ -7042,6 +7143,13 @@ class Checker:
                       and (hint.float_literal or hint in self.deferred_binding_types)):
                     self.float_literals.append((hint, value, token))
                     return hint
+                elif expr.unsuffixed and (hint is None or isinstance(hint, TypeVariable)):
+                    variable = TypeVariable("float literal", token, float_literal=True)
+                    self.variables.append(variable)
+                    if isinstance(hint, TypeVariable):
+                        self.require(variable, hint, token)
+                    self.float_literals.append((variable, value, token))
+                    return variable
                 float_literal_value(value, annotation, token)
                 return annotation
             if expr.unsuffixed and hint in INTEGER_TYPES:
@@ -7050,6 +7158,14 @@ class Checker:
                   and (hint.integer_literal or hint in self.deferred_binding_types)):
                 self.integer_literals.append((hint, value, token))
                 return hint
+            elif expr.unsuffixed and annotation in INTEGER_TYPES and (hint is None or isinstance(hint, TypeVariable)):
+                # An unsuffixed literal is {integer} until inference settles it, defaulting to i32.
+                variable = TypeVariable("integer literal", token, integer_literal=True)
+                self.variables.append(variable)
+                if isinstance(hint, TypeVariable):
+                    self.require(variable, hint, token)
+                self.integer_literals.append((variable, value, token))
+                return variable
             if annotation in INTEGER_TYPES:
                 checked(value, token, annotation)
             return annotation
@@ -7086,7 +7202,7 @@ class Checker:
         if kind in {"index", "range_index"}:
             base, *bounds = args
             annotation = self.type_of(base, scope)
-            if isinstance(annotation, ReferenceType):
+            while isinstance(annotation, ReferenceType):
                 base = Expr("deref", base.token, (base, False))
                 expr.args = (base, *bounds)
                 annotation = self.type_of(base, scope)
@@ -7736,6 +7852,9 @@ class Checker:
         if len(args) != len(params):
             raise token.error(f"{token.text} takes {len(params)} arguments")
         defer_projection = any(isinstance(part, AssociatedType) for part in type_leaves(self.resolve(result)))
+        if expected is not None and any(isinstance(part, DynType) for part in type_leaves(self.resolve(expected))):
+            # Unsized coercions to trait objects happen after the call, in type_of.
+            expected = None
         if expected is not None and arguments and not defer_projection:
             self.require_argument(result, expected, token)
         for parameter, owner in arguments.items():
@@ -7892,6 +8011,14 @@ class Checker:
                 and self.implements(self.resolve(base), ITERATOR)):
             item = self.resolve(AssociatedType(base, "Item", ITERATOR))
             return self.iterator_terminal(expr, expected, IteratorType(item, ("trait",)))
+        if (isinstance(actual, IteratorType) or isinstance(base, IteratorType)) and name == "as_str" and not rest:
+            iterator = actual if isinstance(actual, IteratorType) else base
+            if iterator.source[:1] == ("chars",):
+                if isinstance(actual, ReferenceType):
+                    original = Expr("deref", original.token, (original, False))
+                    self.type_of(original, scope)
+                expr.kind, expr.args = "chars_as_str", (original,)
+                return STR_REFERENCE
         if base in {STRING, "str"} and name in {"chars", "bytes"} and not rest and expr.type_arguments is None:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", original.token, (original, False))
@@ -7981,6 +8108,12 @@ class Checker:
                           and self.trait_available(actual, trait.name.text, expr.token)]
             if candidates:
                 receiver = actual
+        if (candidates and isinstance(actual, ReferenceType) and actual.mutable and receiver is base
+                and not isinstance(candidates[0].methods[name].params[0][2], ReferenceType)
+                and self.implements(actual, candidates[0].name.text)
+                and not isinstance(base, (TypeParameter, OpaqueType))):
+            # Method lookup probes the receiver's own type first, so `iter.by_ref().take(n)` uses &mut I.
+            receiver = actual
         if len(candidates) > 1:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
@@ -8517,7 +8650,11 @@ class Checker:
             return NEVER if left == NEVER else "bool"
         if word in COMPARE:
             if left != NEVER and right != NEVER:
-                if word not in {"==", "!="} or {left, right} != {STRING, STR_REFERENCE}:
+                peeled_left, peeled_right = self.resolve(left), self.resolve(right)
+                while isinstance(peeled_left, ReferenceType) and isinstance(peeled_right, ReferenceType):
+                    peeled_left, peeled_right = self.resolve(peeled_left.inner), self.resolve(peeled_right.inner)
+                text_pair = {peeled_left, peeled_right} in ({STRING, STR_REFERENCE}, {STRING, "str"})
+                if word not in {"==", "!="} or not text_pair:
                     self.require(right, left, token)
                 self.obligation(left, "PartialEq" if word in {"==", "!="} else "PartialOrd", token)
             return NEVER if NEVER in {left, right} else "bool"
@@ -8778,6 +8915,13 @@ class Ownership:
                 local = Local(token, mutable, loan)
                 scope.bindings[token.key] = local
                 cursor = self.emit(cursor, "declare", Place(local), token)
+            if function.name.module[:1] == STD_ROOT:
+                # std bodies are trusted: lower them to record moves for drop tracking, but skip the checks.
+                try:
+                    self.lower_return(function.body, scope, cursor)
+                except RustError:
+                    pass
+                return
             self.lower_return(function.body, scope, cursor)
             self.check_graph(entry)
 
@@ -9132,7 +9276,9 @@ class Ownership:
                     expr, scope, cursor, reborrow=annotation, two_phase=annotation.mutable
                 )
                 cursor, holder = self.keep_loan(cursor, loan, expr.token)
-                if annotation.lifetime == "'static":
+                declared = function.params[index][2] if function and index < len(function.params) else None
+                if (annotation.lifetime == "'static" and isinstance(declared, ReferenceType)
+                        and declared.lifetime == "'static"):
                     cursor = self.emit(cursor, "static_reference", holder, expr.token)
                 temporaries.append((holder, expr.token))
                 passed[index] = loan
@@ -9258,7 +9404,7 @@ class Ownership:
             return None
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"length", "is_empty", "to_string", "float_method"}:
+        if kind in {"length", "is_empty", "to_string", "float_method", "chars_as_str"}:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "range_value":
             for item in args[:2]:
@@ -9281,7 +9427,8 @@ class Ownership:
                     expected = annotation.arguments[0]
                 else:
                     expected = None
-                cursor = self.lower_stored_value(item, expected, scope, cursor)
+                # Element types here come from inference, so their 'static lifetimes are not checked.
+                cursor = self.lower_stored_value(item, None, scope, cursor)
             return cursor
         if kind == "block":
             statements, tail = args
@@ -9414,8 +9561,10 @@ class Ownership:
             layout = self.program.layout(self.annotation(expr))
             ctor = next((ctor for ctor in layout[1] if ctor.path == token.text), None) if layout else None
             fields = dict(ctor.fields) if ctor else {}
+            template = self.program.constructors.get(token.text)
+            declared = dict(template.fields) if template else {}
             for name, value in explicit:
-                cursor = self.lower_stored_value(value, fields.get(name.text), scope, cursor)
+                cursor = self.lower_stored_value(value, declared.get(name.text), scope, cursor)
             if update:
                 cursor, place = self.lower_address(update, scope, cursor)
                 if place is None:
@@ -9436,6 +9585,7 @@ class Ownership:
         raise AssertionError(kind)
 
     def lower_stored_value(self, expr, expected, scope, cursor):
+        # Only a field declared as &'static str is checked; generic fields substituted with 'static are not.
         if is_static_str(expected) and self.annotation(expr) != NEVER:
             cursor, loan = self.lower_reference(expr, scope, cursor)
             cursor, holder = self.keep_loan(cursor, loan, expr.token)
@@ -10043,6 +10193,7 @@ class Interpreter:
         MAP_ORDER = self.map_order
         self.track_drops = any(impl.trait == DROP for impl in program.impls)
         self.implementations = {}
+        self.temporaries = []
         self.program = program
         self.functions = program.functions
         self.stdout = stdout
@@ -10105,10 +10256,10 @@ class Interpreter:
                              for key, item in value.entries.items()}, value.ordered)
         if isinstance(value, RcValue):
             value.counts[0] += 1
-            return RcValue(value.cell, value.counts)
+            return RcValue(value.cell, value.counts, value.concrete)
         if isinstance(value, WeakValue):
             value.counts[1] += 1
-            return WeakValue(value.cell, value.counts)
+            return WeakValue(value.cell, value.counts, value.concrete)
         if isinstance(value, ArrayValue):
             return ArrayValue(tuple(map(self.clone_value, value.items)))
         if isinstance(value, Value):
@@ -10160,6 +10311,38 @@ class Interpreter:
         if isinstance(receiver, ReferenceType):
             receiver = receiver.inner
         return INTEGER_WIDTHS[receiver]
+
+    def builtin_operator(self, symbol, values, receiver, result, token):
+        """Apply a std::ops trait method on primitive operands."""
+        def plain(value):
+            while isinstance(value, (Address, StringAddress)):
+                value = value.read()
+            return value
+        kind = receiver.inner if isinstance(receiver, ReferenceType) else receiver
+        if symbol.endswith("=") and len(symbol) > 1 and symbol not in {"==", "!=", "<=", ">="}:
+            address, right = values
+            current = address.read()
+            operator = symbol[:-1]
+            if kind == STRING:
+                address.write(current + display(plain(right), False))
+            elif kind in FLOAT_TYPES:
+                address.write(rounded_float(float_binary(operator, current, plain(right), kind), kind))
+            else:
+                address.write(binary(operator, current, plain(right), token, kind, runtime=True))
+            return None
+        if len(values) == 1:
+            value = plain(values[0])
+            if symbol == "-":
+                return rounded_float(-value, kind) if kind in FLOAT_TYPES else checked(-value, token, kind, runtime=True)
+            return (not value) if kind == "bool" else complement(value, kind)
+        left, right = map(plain, values)
+        if kind == STRING:
+            return left + display(right, False)
+        if kind in FLOAT_TYPES:
+            return rounded_float(float_binary(symbol, left, right, kind), kind)
+        if kind == "bool":
+            return BITWISE[symbol](left, right)
+        return binary(symbol, left, right, token, kind, runtime=True)
 
     def builtin_compare(self, name, left, right, result):
         if name == "eq":
@@ -10246,7 +10429,9 @@ class Interpreter:
                     key, item = map_of(value).fields
                     collected.entries[self.map_key(key)] = [key, item]
             return collected
-        items = ArrayValue(tuple(values))
+        element = collection_element(target)
+        items = ArrayValue(tuple(plain_item(self, value, element) if element is not None else value
+                                 for value in values))
         if name == DEQUE:
             return Value(self.program.layout(target)[1][0], (items,))
         if name == HEAP:
@@ -10280,6 +10465,17 @@ class Interpreter:
                     self.drop_value(item)
         elif isinstance(value, BoxValue):
             self.drop_value(value.read())
+
+    def drop_temporaries(self, mark, statement):
+        """Drop temporaries a statement created, except a borrowed initializer that a let extends."""
+        created = self.temporaries[mark:]
+        del self.temporaries[mark:]
+        if statement.kind == "let" and statement.args[2] is not None and ungroup(statement.args[2]).kind == "borrow":
+            return
+        for binding in reversed(created):
+            if not binding.moved:
+                binding.moved = True
+                self.drop_value(binding.value)
 
     def drop_scope(self, bindings):
         for binding in reversed(list(bindings.values())):
@@ -10431,6 +10627,9 @@ class Interpreter:
     def iterate(self, value, type_index):
         """Iterate a value whose type is the intrinsic's type argument at type_index."""
         annotation = self.program.concrete_type(self.intrinsic_types[type_index])
+        if isinstance(value, Address) and not isinstance(annotation, ReferenceType) and isinstance(
+                value.read(), (IteratorValue, Value)) and self.program.implements(annotation, ITERATOR):
+            return self.trait_iteration(value, ReferenceType(annotation, True))
         return self.iteration_values(value, annotation, Token("0", 0, 0))
 
     def start_iterator(self, address):
@@ -10662,7 +10861,10 @@ class Interpreter:
             if isinstance(root, SliceAddress):
                 return SliceAddress(root.address, root.start + start, root.start + stop)
             return SliceAddress(root, start, stop)
-        return Address(Binding(self.eval(expr, scope), True))
+        binding = Binding(self.eval(expr, scope), True)
+        if self.track_drops:
+            self.temporaries.append(binding)
+        return Address(binding)
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
@@ -10698,6 +10900,13 @@ class Interpreter:
             return total
         if kind == "iterator":
             return IteratorValue(self.eval(args[0], scope), borrowing_iterator(self.program.expr_types[id(expr)]))
+        if kind == "chars_as_str":
+            iterator = self.eval(args[0], scope)
+            if iterator.cursor is None:
+                return shared("".join(map(str, self.iteration_values(iterator, None, token))))
+            first, second = itertools.tee(iterator.cursor[0])
+            iterator.cursor[0] = first
+            return shared("".join(map(str, second)))
         if kind == "range_value":
             start, end, inclusive = args
             annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
@@ -10761,6 +10970,8 @@ class Interpreter:
             actual = value.constructor.path.rsplit("::", 1)[-1]
             supplied = [self.eval(item, scope) for item in arguments]
             if not consuming:
+                if self.track_drops and ungroup(receiver).kind not in {"name", "field", "index", "deref"}:
+                    self.drop_value(value)
                 return actual == wanted
             if actual == wanted:
                 return value.fields[0]
@@ -10935,7 +11146,10 @@ class Interpreter:
             inner = Scope(scope)
             try:
                 for statement in statements:
+                    mark = len(self.temporaries)
                     self.eval(statement, inner)
+                    if self.track_drops and len(self.temporaries) > mark:
+                        self.drop_temporaries(mark, statement)
                 return self.eval(tail, inner) if tail else None
             except Break as signal:
                 if not expr.label or not handles_jump(expr, signal):
@@ -10957,8 +11171,6 @@ class Interpreter:
                 if otherwise:
                     self.eval(otherwise, scope)
                 raise AssertionError("type checker accepted a fall-through let pattern")
-            if self.track_drops and not bindings and ungroup(value).kind not in {"name", "field", "index", "deref"}:
-                self.drop_value(address.read())
             scope.bindings.update(bindings)
             return None
         if kind == "discard":
@@ -11101,6 +11313,10 @@ class Interpreter:
                 implementation = self.program.implementation(receiver, trait, arguments_wanted=wanted or None)
                 if implementation is None and trait == TERMINATION:
                     return ExitCodeValue(self.exit_status(values[0], receiver))
+                if implementation is None and trait in BUILTIN_OPERATORS:
+                    symbol = BUILTIN_OPERATORS[trait]
+                    result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+                    return self.builtin_operator(symbol, values, receiver, result, token)
                 if implementation is None and trait == "Clone" and name == "clone":
                     return self.clone_value(map_of(values[0]))
                 if implementation is None and trait == "Default" and name == "default":
@@ -13105,13 +13321,13 @@ def rust_lazy_range(interpreter, result, items, bounds):
 
 def Rc__new(interpreter, result, value):
     interpreter.track_drops = True
-    return RcValue(Binding(value, True), [1, 0])
+    return RcValue(Binding(value, True), [1, 0], interpreter.program.concrete_type(result.arguments[0]))
 
 
 def Rc__clone(interpreter, result, this):
     rc = map_of(this)
     rc.counts[0] += 1
-    return RcValue(rc.cell, rc.counts)
+    return RcValue(rc.cell, rc.counts, rc.concrete)
 
 
 def Rc__strong_count(interpreter, result, this):
@@ -13133,7 +13349,7 @@ def Rc__as_ptr(interpreter, result, this):
 def Rc__downgrade(interpreter, result, this):
     rc = map_of(this)
     rc.counts[1] += 1
-    return WeakValue(rc.cell, rc.counts)
+    return WeakValue(rc.cell, rc.counts, rc.concrete)
 
 
 def Rc__try_unwrap(interpreter, result, this):
@@ -13180,7 +13396,7 @@ def Weak__upgrade(interpreter, result, this):
     if weak.cell is None or weak.counts[0] == 0:
         return option(interpreter, result)
     weak.counts[0] += 1
-    return option(interpreter, result, RcValue(weak.cell, weak.counts))
+    return option(interpreter, result, RcValue(weak.cell, weak.counts, weak.concrete))
 
 
 def Weak__strong_count(interpreter, result, this):
@@ -13201,7 +13417,10 @@ for _function in (Rc__new, Rc__clone, Rc__strong_count, Rc__weak_count, Rc__ptr_
 
 @intrinsic
 def rust_rc_deref(interpreter, result, this):
-    return Address(map_of(this).cell)
+    rc = map_of(this)
+    if isinstance(result.inner, DynType):
+        return DynAddress(Address(rc.cell), rc.concrete)
+    return Address(rc.cell)
 
 
 @intrinsic
@@ -13281,6 +13500,104 @@ PROGRAM_ARGUMENTS = ["main"]
 @intrinsic
 def rust_hash_value(interpreter, result, value):
     return hash(repr(interpreter.map_key(value))) % (1 << 64)
+
+
+def plain_item(interpreter, item, annotation):
+    """Read through a reference when a collection of values receives borrowed items."""
+    if isinstance(item, (Address, SliceAddress)) and not isinstance(annotation, ReferenceType):
+        return interpreter.clone_value(item.read())
+    return item
+
+
+def collection_element(annotation):
+    if isinstance(annotation, AppliedType) and annotation.arguments:
+        return annotation.arguments[0]
+    return None
+
+
+@intrinsic
+def rust_iter_partition(interpreter, result, iterator, predicate):
+    target = result.elements[0]
+    left, right = [], []
+    for item in interpreter.iterate(iterator, 0):
+        (left if interpreter.call_value(predicate, shared(item)) else right).append(
+            plain_item(interpreter, item, collection_element(target)))
+    return make_tuple(interpreter, result, interpreter.collect(left, target), interpreter.collect(right, result.elements[1]))
+
+
+@intrinsic
+def rust_iter_unzip(interpreter, result, iterator):
+    first, second = [], []
+    for item in interpreter.iterate(iterator, 0):
+        pair = map_of(item)
+        a, b = pair.fields
+        first.append(plain_item(interpreter, a, collection_element(result.elements[0])))
+        second.append(plain_item(interpreter, b, collection_element(result.elements[1])))
+    return make_tuple(interpreter, result, interpreter.collect(first, result.elements[0]),
+                      interpreter.collect(second, result.elements[1]))
+
+
+def short_circuit(value):
+    name = value.constructor.path.rsplit("::", 1)[-1]
+    return name in {"None", "Err", "Break"}
+
+
+@intrinsic
+def rust_iter_try_fold(interpreter, result, iterator, accumulator, step):
+    for item in interpreter.iterate(iterator, 0):
+        outcome = interpreter.call_value(step, accumulator, item)
+        if short_circuit(outcome):
+            return outcome
+        accumulator = outcome.fields[0]
+    return interpreter.variant(result, "Some" if result.name == OPTION else "Ok", accumulator)
+
+
+@intrinsic
+def rust_iter_try_for_each(interpreter, result, iterator, step):
+    for item in interpreter.iterate(iterator, 0):
+        outcome = interpreter.call_value(step, item)
+        if short_circuit(outcome):
+            return outcome
+    return interpreter.variant(result, "Some" if result.name == OPTION else "Ok", None)
+
+
+@intrinsic
+def rust_iter_compare(interpreter, result, iterator, other, ordering):
+    left = list(interpreter.iterate(iterator, 0))
+    right = list(interpreter.iterate(other, 1))
+    for a, b in zip(left, right):
+        order = interpreter.compare(a, b, equality=not ordering)
+        if order:
+            return order
+    return len(left) - len(right)
+
+
+@intrinsic
+def rust_iter_is_sorted(interpreter, result, iterator):
+    items = list(interpreter.iterate(iterator, 0))
+    return all(interpreter.compare(a, b) <= 0 for a, b in zip(items, items[1:]))
+
+
+@intrinsic
+def rust_iter_cycle(interpreter, result, iterator):
+    items = list(interpreter.iterate(iterator, 0))
+    return lazy(interpreter.clone_value(item) for _ in itertools.count() if items for item in items)
+
+
+@intrinsic
+def rust_iter_chunks(interpreter, result, iterator, size):
+    items = list(interpreter.iterate(iterator, 0))
+    return lazy(ArrayValue(tuple(items[start:start + size])) for start in range(0, len(items), size))
+
+
+@intrinsic
+def method_split_at_mut(interpreter, result, items, middle):
+    count = len(items_of(items))
+    if middle > count:
+        raise RustPanic("mid > len")
+    root, offset = interpreter.slice_parts(items)
+    return make_tuple(interpreter, result, SliceAddress(root, offset, offset + middle),
+                      SliceAddress(root, offset + middle, offset + count))
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):

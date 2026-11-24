@@ -2786,7 +2786,7 @@ INVALID = [
     ("generic type mismatch across arguments", """
         fn choose<T>(first: T, _: T) -> T { first }
         fn main() { let _result = choose(1, false); }
-    """, "expected i32, found bool"),
+    """, "expected (i32|an integer), found bool"),
     ("generic default without context needs an annotation", """
         fn blank<T: Default>() -> T { T::default() }
         fn main() { println!("{}", blank()); }

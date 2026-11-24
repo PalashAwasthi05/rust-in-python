@@ -1,0 +1,33 @@
+0
+acquire outer
+  acquire a
+  acquire b
+  in scope with a and b
+  release b
+  release a
+  acquire work-lock
+    acquire inner
+    release inner
+  release work-lock
+work(false) = Ok(42)
+  acquire work-lock
+  release work-lock
+work(true) = Err("work failed")
+  acquire early
+  release early
+after explicit drop
+  acquire vec1
+  acquire vec2
+  acquire vec3
+dropping vec of 3
+  release vec1
+  release vec2
+  release vec3
+  acquire moved
+holder has moved
+tx: rolled back 2 pending writes
+tx: committed
+log: ["z=3"]
+end of main
+  release moved
+release outer

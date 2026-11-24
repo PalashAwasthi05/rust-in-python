@@ -1,0 +1,21 @@
+0
+warm day: Fri 21
+warm day: Sat 22
+warm day: Wed2 24
+deltas: [2, -1, 4, 4, 1, -3, -4, 1, 8]
+biggest jump at index 8: [16, 24]
+chunk 0 [12, 14, 13] avg 13.00
+chunk 1 [17, 21, 22] avg 20.00
+chunk 2 [19, 15, 16] avg 16.67
+chunk 3 [24] avg 24.00
+min 12 max 24
+running totals: [12, 26, 39, 56, 77, 99, 118, 133, 149, 173]
+before first 17+: [12, 14, 13]
+from first 20+: [21, 22, 19, 15, 16, 24]
+flat_map: ["HELLO", "WORLD", "RUST", "IS", "FUN", "ITERATORS"]
+reversed: desserts
+countdown: [5, 3, 1]
+rle: 3a1b2c5d1e
+sum even squares 220 any_neg false all_pos true pos22 Some(5)
+even [12, 14, 22, 16, 24] odd [13, 17, 21, 19, 15]
+last two [16, 24], count>15 6

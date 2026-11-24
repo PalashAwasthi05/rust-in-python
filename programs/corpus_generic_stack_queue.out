@@ -1,0 +1,10 @@
+0
+stack len 3 top Some("gamma")
+popped Some("gamma")
+stack Stack { items: ["alpha", "beta"] }
+dequeue Some(1)
+drain: 2 3 4 5 (remaining 0)
+(a[b]{c})  balanced=true
+((]        balanced=false
+{[()()]}   balanced=true
+((         balanced=false

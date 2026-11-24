@@ -1,0 +1,13 @@
+0
+method=POST path=/api/items
+  query page = "2"
+  query sort = "name"
+  query debug = ""
+  header Host           example.test
+  header Content-Type   application/json
+  header X-Trace        abc123
+content-type: Some("application/json")
+missing: None
+body: {"name": "widget"}
+longer of method/path: /api/items
+bad input: None

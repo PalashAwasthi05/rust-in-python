@@ -1,0 +1,8 @@
+0
+list: [50, 40, 30, 20, 10, 99] (len 6)
+reversed: [99, 10, 20, 30, 40, 50]
+popped: Some(99)
+popped: Some(10)
+now: [20, 30, 40, 50] sum=140
+20 30 40 50 
+empty pop: None, len 0

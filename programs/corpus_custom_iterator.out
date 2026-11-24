@@ -1,0 +1,14 @@
+0
+collatz(6): [6, 3, 10, 5, 16, 8, 4, 2, 1]
+collatz(27) steps: 111, peak: 9232
+longest chain under 30 starts at 27
+fib: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+even fib sum < 4M: 4613732
+fib terms before u64 overflow: 92
+first 10-digit fib: Some((45, 1134903170))
+5... 4... 3... 2... 1... liftoff
+zipped: [(3, 'a'), (2, 'b'), (1, 'c')]
+4>3 3>2 2>1 1 end
+cells: [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
+diagonal: [(0, 0), (1, 1)], sum of x*y: 3
+by_ref split: 1506

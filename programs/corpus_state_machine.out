@@ -1,0 +1,22 @@
+0
+  ignored Choose('A') in Idle
+Idle --Choose('A')--> Idle
+Idle --Coin(50)--> Selecting { credit: 50 }
+  need 25 more for A
+Selecting { credit: 50 } --Choose('A')--> Selecting { credit: 50 }
+Selecting { credit: 50 } --Coin(50)--> Selecting { credit: 100 }
+  unknown item Z
+Selecting { credit: 100 } --Choose('Z')--> Selecting { credit: 100 }
+Selecting { credit: 100 } --Choose('A')--> Dispensing { item: 'A', change: 25 }
+  vended A with change 25
+Dispensing { item: 'A', change: 25 } --Done--> Idle
+Idle --Coin(25)--> Selecting { credit: 25 }
+  refunding 25
+Selecting { credit: 25 } --Cancel--> Idle
+Idle --Coin(200)--> Selecting { credit: 200 }
+Selecting { credit: 200 } --Choose('C')--> Dispensing { item: 'C', change: 50 }
+  vended C with change 50
+Dispensing { item: 'C', change: 50 } --Done--> Idle
+Idle --Kick--> OutOfOrder
+OutOfOrder --Coin(100)--> OutOfOrder
+final: OutOfOrder, broken = true

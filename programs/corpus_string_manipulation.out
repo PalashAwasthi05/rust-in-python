@@ -1,0 +1,25 @@
+0
+trimmed: [Héllo, Wörld! 👋] bytes=20 chars=15
+upper: HÉLLO, WÖRLD! 👋 lower: héllo, wörld! 👋
+first char bytes: Some(1)
+emoji at byte Some(16), is boundary 2? false
+bytes of 'é': [195, 169]
+trim_start [22] trim_end [22]
+"A man, a plan, a canal: Panama" palindrome? true
+"racecar" palindrome? true
+"Rust" palindrome? false
+"No 'x' in Nixon" palindrome? true
+caesar: Dwwdfn dw Gdzq, cheud! -> Attack at Dawn, zebra!
+rot13 twice: Hello
+Ada is 36 in London (next year 37)
+Linus is 54 in Helsinki (next year 55)
+parse '12a': true
+title: The Quick Brown Fox
+camel: maxRetryCount
+replace: one 2 three 2 one
+find 'three': Some(8), rfind 'one': Some(18)
+splitn: ["one", "two", "three two one"]
+starts true ends false contains true
+initials: o-t-t-t-o
+rev words: one two three two one
+chars rev: ✓cba

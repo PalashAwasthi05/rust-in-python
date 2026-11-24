@@ -1,0 +1,9 @@
+0
+Alice deposited, balance 125
+Bob withdraw failed: insufficient funds: needed 80, available 50
+deposit failed: amount must be positive
+after transfer: alice=65 bob=110
+transfer failed: account is frozen
+alice=55 bob=110
+alice history: [100, 25, -60, -10]
+bob net: 110

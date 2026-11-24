@@ -1,0 +1,29 @@
+0
+-- as entered --
+ 101 Hammer       tools    $ 15.99 x12  
+ 205 Nails        hardware $  4.99 x0   (out)
+ 102 Wrench       tools    $ 15.99 x4   
+ 310 Paint        supplies $ 22.50 x7   
+ 206 Screws       hardware $  6.50 x40  
+ 103 Saw          tools    $ 28.99 x2   
+ 311 Brush        supplies $  3.50 x0   (out)
+-- by category, price desc, name --
+ 206 Screws       hardware $  6.50 x40  
+ 205 Nails        hardware $  4.99 x0   (out)
+ 310 Paint        supplies $ 22.50 x7   
+ 311 Brush        supplies $  3.50 x0   (out)
+ 103 Saw          tools    $ 28.99 x2   
+ 101 Hammer       tools    $ 15.99 x12  
+ 102 Wrench       tools    $ 15.99 x4   
+-- in stock first, by value desc --
+ 206 Screws       hardware $  6.50 x40  
+ 101 Hammer       tools    $ 15.99 x12  
+ 310 Paint        supplies $ 22.50 x7   
+ 102 Wrench       tools    $ 15.99 x4   
+ 103 Saw          tools    $ 28.99 x2   
+ 205 Nails        hardware $  4.99 x0   (out)
+ 311 Brush        supplies $  3.50 x0   (out)
+restock 205: true, restock 999: false
+total value: $1230.32
+out of stock: ["Brush"]
+cheapest tool: Some("Hammer")

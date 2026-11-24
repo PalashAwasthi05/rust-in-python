@@ -32,6 +32,15 @@ pub mod intrinsics {
 
     pub fn iter_max<I: crate::iter::Iterator>(iter: I, last: bool) -> Option<I::Item>;
     pub fn iter_collect<I: crate::iter::Iterator>(iter: I) -> Vec<I::Item>;
+    pub fn iter_partition<I, F, R>(iter: I, f: F) -> R;
+    pub fn iter_unzip<I, R>(iter: I) -> R;
+    pub fn iter_try_fold<I, B, F, R>(iter: &mut I, init: B, f: F) -> R;
+    pub fn iter_try_for_each<I, F, R>(iter: &mut I, f: F) -> R;
+    pub fn iter_compare<I, J>(iter: I, other: J, ordering: i32) -> i32;
+    pub fn iter_is_sorted<I>(iter: I) -> bool;
+    pub fn iter_collect_into<I, R>(iter: I) -> R;
+    pub fn iter_cycle<I, R>(iter: I) -> R;
+    pub fn iter_chunks<I, R>(iter: I, size: usize) -> R;
     pub fn range_next<A>(range: &mut crate::ops::Range<A>) -> Option<A>;
     pub fn range_inclusive_next<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
@@ -82,7 +91,7 @@ pub mod intrinsics {
     pub fn stdin_lines() -> crate::iter::Lazy<crate::io::Result<String>>;
     pub fn env_args() -> crate::iter::Lazy<String>;
     pub fn env_var(key: &str) -> Option<String>;
-    pub fn rc_deref<T>(rc: &crate::rc::Rc<T>) -> &T;
+    pub fn rc_deref<T: ?Sized>(rc: &crate::rc::Rc<T>) -> &T;
     pub fn refcell_value<'a, T>(cell: &'a crate::cell::RefCell<T>) -> &'a mut T;
     pub fn cell_value<'a, T>(cell: &'a crate::cell::Cell<T>) -> &'a mut T;
     pub fn lazy_range<C, B, R>(items: C, range: B) -> R;
@@ -275,16 +284,32 @@ pub mod iter {
         fn rev(self) -> Rev<Self::Item> where Self: Sized {
             Rev { items: crate::intrinsics::iter_collect(self) }
         }
-        fn partition<B, F>(self, f: F) -> (Vec<Self::Item>, Vec<Self::Item>) where Self: Sized, F: FnMut(&Self::Item) -> bool {
-            let mut iter = self;
-            let mut f = f;
-            let mut left = Vec::new();
-            let mut right = Vec::new();
-            while let Some(item) = iter.next() {
-                if f(&item) { left.push(item); } else { right.push(item); }
-            }
-            (left, right)
+        fn partition<B, F>(self, f: F) -> (B, B) where Self: Sized, F: FnMut(&Self::Item) -> bool {
+            crate::intrinsics::iter_partition(self, f)
         }
+        fn unzip<A, B, FromA, FromB>(self) -> (FromA, FromB) where Self: Sized {
+            crate::intrinsics::iter_unzip(self)
+        }
+        fn try_fold<B, F, R>(&mut self, init: B, f: F) -> R where Self: Sized, F: FnMut(B, Self::Item) -> R {
+            crate::intrinsics::iter_try_fold(self, init, f)
+        }
+        fn try_for_each<F, R>(&mut self, f: F) -> R where Self: Sized, F: FnMut(Self::Item) -> R {
+            crate::intrinsics::iter_try_for_each(self, f)
+        }
+        fn eq<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 0) == 0 }
+        fn ne<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 0) != 0 }
+        fn lt<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 1) < 0 }
+        fn le<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 1) <= 0 }
+        fn gt<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 1) > 0 }
+        fn ge<I: IntoIterator>(self, other: I) -> bool where Self: Sized { crate::intrinsics::iter_compare(self, other, 1) >= 0 }
+        fn cmp<I: IntoIterator>(self, other: I) -> crate::cmp::Ordering where Self: Sized {
+            let order = crate::intrinsics::iter_compare(self, other, 1);
+            if order < 0 { crate::cmp::Ordering::Less } else if order > 0 { crate::cmp::Ordering::Greater } else { crate::cmp::Ordering::Equal }
+        }
+        fn is_sorted(self) -> bool where Self: Sized { crate::intrinsics::iter_is_sorted(self) }
+        fn sum_by<B>(self) -> B where Self: Sized { crate::intrinsics::iter_collect_into(self) }
+        fn cycle(self) -> Lazy<Self::Item> where Self: Sized { crate::intrinsics::iter_cycle(self) }
+        fn array_chunks_vec(self, size: usize) -> Lazy<Vec<Self::Item>> where Self: Sized { crate::intrinsics::iter_chunks(self, size) }
     }
 
     pub trait IntoIterator {
@@ -485,6 +510,10 @@ pub mod iter {
     }
 
     pub struct Lazy<T> { items: Vec<T> }
+    impl<I: Iterator + ?Sized> Iterator for &mut I {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<I::Item> { (**self).next() }
+    }
     impl<T> Iterator for Lazy<T> {
         type Item = T;
         fn next(&mut self) -> Option<T> { crate::intrinsics::lazy_next(self) }
@@ -640,6 +669,11 @@ pub mod slice {
     use crate::iter::Lazy;
     use crate::cmp::Ordering;
 
+    pub type Iter<'a, T> = Lazy<&'a T>;
+    pub type IterMut<'a, T> = Lazy<&'a mut T>;
+    pub type Windows<'a, T> = Lazy<&'a [T]>;
+    pub type Chunks<'a, T> = Lazy<&'a [T]>;
+
     impl<T> [T] {
         pub fn first(&self) -> Option<&T>;
         pub fn last(&self) -> Option<&T>;
@@ -650,6 +684,7 @@ pub mod slice {
         pub fn split_first(&self) -> Option<(&T, &[T])>;
         pub fn split_last(&self) -> Option<(&T, &[T])>;
         pub fn split_at(&self, mid: usize) -> (&[T], &[T]);
+        pub fn split_at_mut(&mut self, mid: usize) -> (&mut [T], &mut [T]);
         pub fn contains(&self, x: &T) -> bool where T: PartialEq;
         pub fn starts_with(&self, needle: &[T]) -> bool where T: PartialEq;
         pub fn ends_with(&self, needle: &[T]) -> bool where T: PartialEq;
@@ -688,6 +723,8 @@ pub mod slice {
 
 pub mod vec {
     use crate::iter::Lazy;
+
+    pub type IntoIter<T> = Lazy<T>;
 
     impl<T> Vec<T> {
         pub fn with_capacity(capacity: usize) -> Vec<T> { Vec::new() }
@@ -1153,6 +1190,12 @@ pub mod hash {
 
 pub mod str {
     use crate::iter::Lazy;
+
+    pub type Lines<'a> = Lazy<&'a str>;
+    pub type SplitWhitespace<'a> = Lazy<&'a str>;
+    pub type Chars<'a> = Lazy<char>;
+    pub type CharIndices<'a> = Lazy<(usize, char)>;
+    pub type Bytes<'a> = Lazy<u8>;
 
     pub trait Pattern {}
     impl Pattern for char {}
@@ -1728,7 +1771,7 @@ pub mod rc {
     pub struct Rc<T: ?Sized> { value: Box<T> }
     pub struct Weak<T: ?Sized> { value: Option<Box<T>> }
 
-    impl<T> Rc<T> {
+    impl<T: ?Sized> Rc<T> {
         pub fn new(value: T) -> Rc<T>;
         pub fn clone(this: &Rc<T>) -> Rc<T>;
         pub fn strong_count(this: &Rc<T>) -> usize;
@@ -1742,7 +1785,7 @@ pub mod rc {
         pub fn make_mut(this: &mut Rc<T>) -> &mut T where T: Clone;
         pub fn as_ptr(this: &Rc<T>) -> usize;
     }
-    impl<T> Deref for Rc<T> {
+    impl<T: ?Sized> Deref for Rc<T> {
         type Target = T;
         fn deref(&self) -> &T { crate::intrinsics::rc_deref(self) }
     }
@@ -1752,7 +1795,7 @@ pub mod rc {
     impl<T> From<T> for Rc<T> {
         fn from(value: T) -> Rc<T> { Rc::new(value) }
     }
-    impl<T> Weak<T> {
+    impl<T: ?Sized> Weak<T> {
         pub fn new() -> Weak<T>;
         pub fn upgrade(&self) -> Option<Rc<T>>;
         pub fn strong_count(&self) -> usize;

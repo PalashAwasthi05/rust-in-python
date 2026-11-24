@@ -1,0 +1,34 @@
+0
+====================================
+            CORNER CAFE             
+------------- receipt --------------
+Item                Qty        Total
+Espresso              3         7.50
+Cappuccino            1         3.75
+Blueberry muffin      2         4.40
+Tea                  10        10.00
+                            --------
+Subtotal                       25.65
+Tax 8.25%                       2.12
+TOTAL                          27.77
+====================================
+dec=255 hex=ff HEX=FF oct=377 bin=11111111
+alt: 0xff 0o377 0b11111111 0b00000101
+padded: [00042] [+42] [-3.1] [7    ] [    7] [  7  ]
+fill: [ab******] [______cd] [...mid...]
+dynamic: [     2.718] [     6] [1.23]
+sci: 1.2345e3 3.21e-4
+3 3.14   3.1416|
+debug: "quote\"d" 'x' Some(1.5)
+pretty:
+[
+    (
+        1,
+        "one",
+    ),
+    (
+        2,
+        "two",
+    ),
+]
+{braces} and   99%

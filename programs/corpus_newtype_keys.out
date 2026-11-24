@@ -1,0 +1,15 @@
+0
+qty by product: {ProductId(3): 12, ProductId(7): 8, ProductId(9): 40}
+Sku("BOLT-M6") stored at {Location('A', 4), Location('B', 2)}
+Sku("NUT-M6") stored at {Location('A', 1), Location('C', 1)}
+Sku("WASHER") stored at {Location('B', 2)}
+A1: [ProductId(3)]
+A4: [ProductId(7)]
+B2: [ProductId(7), ProductId(9)]
+C1: [ProductId(3)]
+value by grade: {A: Cents(200), B: Cents(120), C: Cents(160)}
+distinct (product, grade): [(ProductId(3), B), (ProductId(7), A), (ProductId(9), C)]
+A9 < B1: true, max: Location('B', 1), eq: true
+Grade ordering: [A, B, C]
+total value: Cents(480) = $4.80
+clone eq: true, cmp: Less

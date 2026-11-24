@@ -1,0 +1,9 @@
+0
+Amber    0  via Amber
+Birch    7  via Amber -> Birch
+Cedar    9  via Amber -> Cedar
+Dale    20  via Amber -> Cedar -> Dale
+Elm     20  via Amber -> Cedar -> Fir -> Elm
+Fir     11  via Amber -> Cedar -> Fir
+Ghost  unreachable
+farthest reachable: Elm at 20

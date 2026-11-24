@@ -1,0 +1,8 @@
+0
+size: 8
+in-order: [20, 30, 40, 50, 60, 65, 70, 80]
+pre-order: [50, 30, 20, 40, 70, 60, 65, 80]
+height: 4
+contains 40? true
+contains 45? false
+contains 65? true

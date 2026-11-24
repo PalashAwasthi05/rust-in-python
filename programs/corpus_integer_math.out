@@ -1,0 +1,19 @@
+0
+gcd(84, 36)=12 lcm(4, 6)=12 lcm(1..=20)=232792560
+primes <= 60: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59]
+count < 10000: 1229
+fib(10)=55 fib(90)=2880067194370816120 fib(150)=9969216677189303386214405760200
+5! = 120
+20! = 2432902008176640000
+21! overflows u64
+checked_add Some(255) None
+wrapping_add 4 saturating_add 255 overflowing_add (4, true)
+wrapping_mul i32: 2147483645
+i8 neg wrap: -128, abs diff 7
+-7 / 2 = -3, -7 % 2 = -1, rem_euclid = 1, div_euclid = -4
+2^10=1024 3^4=81 pow_mod(2, 100, 1e9+7)=976371285
+digit_sum(2^40)=61
+bits: ones(255)=8 leading_zeros(1u32)=31 trailing_zeros(48)=4
+u64::MAX=18446744073709551615 i128::MIN=-170141183460469231731687303715884105728
+casts: 44 4294967295 3 0
+isqrt-ish: 31

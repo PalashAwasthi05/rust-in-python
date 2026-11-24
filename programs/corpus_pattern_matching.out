@@ -1,0 +1,27 @@
+0
+circle r=2
+invalid circle
+square side 3
+rect width 4
+stay put
+horizontal 9
+small step (2, -3)
+jump (20, 30)
+batch[say "hi"; quit]
+empty batch
+shout stop
+[] -> empty
+[7] -> one: 7
+[1, 2] -> pair: 1 2
+[4, 9, 4] -> bookends 4
+[1, 5, 3, 8] -> min-first 1 then 3 more
+[9, 1, 5, 3] -> long, penultimate 5
+0 -> newborn
+8 -> child
+15 -> teen
+40 -> milestone adult
+41 -> adult
+70 -> senior
+(3, -3) is anti-diagonal
+nested none
+let-else got hello

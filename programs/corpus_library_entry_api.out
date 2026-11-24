@@ -1,0 +1,22 @@
+0
+ana borrowed 111
+ben borrowed 111
+cy failed: 'Dune' unavailable
+ana borrowed 222
+ben failed: no such isbn 999
+cy borrowed 333
+  111 Dune                   Herbert    0/2
+  222 Neuromancer            Gibson     0/1
+  333 The Left Hand of Dark  Le Guin    0/1
+  ana has ["111", "222"]
+  ben has ["111"]
+  cy has ["333"]
+ana returns 111: true
+ana returns 111 again: false
+cy returns 333: true
+  111 Dune                   Herbert    1/2
+  222 Neuromancer            Gibson     0/1
+  333 The Left Hand of Dark  Le Guin    1/1
+  ana has ["222"]
+  ben has ["111"]
+copies by author: [("Herbert", 2), ("Gibson", 1), ("Le Guin", 1)]

@@ -1,0 +1,8 @@
+0
+0: ok Config { port: 8080, workers: 4 }
+1: error: missing key 'workers'
+2: error: key 'port' is not a number (invalid digit found in string)
+3: error: key 'port' = 70000 outside 1..=65535
+4: error: syntax error on line 1
+run: Ok(8)
+run: Err("missing key 'workers'")

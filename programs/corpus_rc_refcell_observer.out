@@ -1,0 +1,9 @@
+0
+2 observers while temp alive, temp is temp
+2 observers after temp dropped
+log: ["a=5", "b=7", "c=-2"]
+main total: 105
+logger strong=2 weak=1
+leaf parent = Some(5)
+children sum = 12, leaf strong = 2
+after drop, leaf parent = None

@@ -1,0 +1,11 @@
+0
+inventory check (retries=3, nine=9, day=86400s)
+target 9 at Some((2, 2)), target 7 at None
+inner x = shadowed in block
+outer x = 10!
+parsed input + 1 = 43
+loop broke with 30 after 3 attempts
+pairs: [(2, 2), (3, 1), (4, 4), (5, 3)]
+first composite: 4
+while ended at 127
+sum primes 41 grid ones 7 last prime 13
