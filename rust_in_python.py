@@ -1108,6 +1108,10 @@ INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
+MAP_TYPES = {MODULE_SEPARATOR.join(("std", "collections", name)): name
+             for name in ("HashMap", "BTreeMap", "HashSet", "BTreeSet")}
+DEQUE = MODULE_SEPARATOR.join(("std", "collections", "VecDeque"))
+HEAP = MODULE_SEPARATOR.join(("std", "collections", "BinaryHeap"))
 OPERATOR_TRAITS = {
     "+": ("Add", "add"), "-": ("Sub", "sub"), "*": ("Mul", "mul"), "/": ("Div", "div"), "%": ("Rem", "rem"),
     "&": ("BitAnd", "bitand"), "|": ("BitOr", "bitor"), "^": ("BitXor", "bitxor"), "<<": ("Shl", "shl"),
@@ -2596,7 +2600,7 @@ class Program:
                         break
             if matched and any(isinstance(value, (SliceType, DynType)) or value == "str"
                                for parameter, value in arguments.items() if isinstance(parameter, TypeParameter)
-                               and not parameter.const_type and not parameter.unsized):
+                               and not parameter.const_type and "?Sized" not in parameter.bounds):
                 matched = False
             if matched:
                 bind_signature_parameters(impl.parameters, arguments)
@@ -2646,6 +2650,8 @@ class Program:
                        fields=tuple((name, substitute(kind, arguments)) for name, kind in ctor.fields))
 
     def implements(self, annotation, trait, assumed=(), *, seen=()):
+        if trait == "?Sized":
+            return True
         if isinstance(annotation, TypeVariable) and (annotation.integer_literal or annotation.float_literal):
             annotation = "f64" if annotation.float_literal else "i32"
         if (trait in TRAIT_MODULES and trait in self.traits
@@ -2792,7 +2798,8 @@ class Program:
         if ITERATOR in self.traits and self.implements(owner, ITERATOR):
             return self.normalize(AssociatedType(owner, "Item", ITERATOR))
         if INTO_ITERATOR in self.traits and self.implements(annotation, INTO_ITERATOR):
-            return self.normalize(AssociatedType(annotation, "Item", INTO_ITERATOR))
+            iterator = self.normalize(AssociatedType(annotation, "IntoIter", INTO_ITERATOR))
+            return self.normalize(AssociatedType(iterator, "Item", ITERATOR))
         return None
 
 
@@ -3426,6 +3433,17 @@ class Parser:
         bounds = set()
         outer_signature = (signature or {}) | {lifetime.name: set() for lifetime in outer_lifetimes}
         while True:
+            if self.accept("?"):
+                self.expect("Sized")
+                bounds.add("?Sized")
+                if not self.accept("+"):
+                    break
+                continue
+            if is_lifetime(self.current.text):
+                self.advance()
+                if not self.accept("+"):
+                    break
+                continue
             local_lifetimes = self.bound_lifetimes(outer_signature) if self.accept("for") else ()
             lifetimes = (*outer_lifetimes, *local_lifetimes)
             bound_signature = (signature or {}) | {lifetime.name: set() for lifetime in lifetimes}
@@ -3601,8 +3619,9 @@ class Parser:
                 break
             permitted.update(longer)
         inputs = sorted(index for lifetime in permitted for index in regions.get(lifetime, ()))
-        if not inputs:
+        if not inputs and result.lifetime not in lifetimes:
             raise name.error("return lifetime must be tied to a reference input")
+        # A lifetime from an enclosing struct or impl ties the result to no tracked input.
         return tuple(inputs)
 
     def attributes(self):
@@ -4829,6 +4848,43 @@ class DynAddress:
         self.address.write(value)
 
 
+class MapValue:
+    """A HashMap, BTreeMap, HashSet, or BTreeSet: keys map to [key, value] pairs, sets store None values."""
+
+    __slots__ = ("entries", "ordered")
+
+    def __init__(self, entries=None, ordered=False):
+        self.entries = {} if entries is None else entries
+        self.ordered = ordered
+
+    def __eq__(self, other):
+        return isinstance(other, MapValue) and self.entries.keys() == other.entries.keys()
+
+    __hash__ = None
+
+
+class MapSlot:
+    """A binding-like view of one map value, so Address can read and write through it."""
+
+    __slots__ = ("map", "key")
+
+    def __init__(self, map_value, key):
+        self.map = map_value
+        self.key = key
+
+    @property
+    def value(self):
+        return self.map.entries[self.key][1]
+
+    @value.setter
+    def value(self, value):
+        self.map.entries[self.key][1] = value
+
+    @property
+    def mutable(self):
+        return True
+
+
 @dataclass(frozen=True)
 class BoxValue:
     address: Address
@@ -5398,7 +5454,7 @@ class Checker:
             if isinstance(parameter, LifetimeArgument):
                 continue
             for name in parameter.bounds:
-                if name not in TRAIT_MODULES and name not in self.program.traits:
+                if name not in TRAIT_MODULES and name not in self.program.traits and name != "?Sized":
                     raise token.error(f"unknown trait {name!r}")
             if isinstance(parameter, TypeParameter):
                 for binding, expected in parameter.associated_bindings.items():
@@ -6901,6 +6957,16 @@ class Checker:
             ctor = self.program.constructors.get(token.text)
             if ctor and ctor.style == "unit":
                 return self.constructor(expr, "unit", expected).annotation
+            arity = self.path_arity(expr, scope)
+            if arity is not None:
+                # A path to a constructor or associated function used as a value becomes a closure.
+                names = [replace(token, text=f"@argument{index}", context=(*token.context, "@path"))
+                         for index in range(arity)]
+                body = Expr("call", token, tuple(Expr("name", name) for name in names),
+                            type_arguments=expr.type_arguments, qualified=expr.qualified)
+                expr.kind, expr.args = "closure", ([(name, False, None) for name in names], None, body, False)
+                expr.type_arguments = expr.qualified = None
+                return self.closure_type(expr, scope, expected)
             if expr.type_arguments is not None:
                 if "::" not in token.text:
                     raise token.error("type arguments require a generic call or constructor")
@@ -7331,7 +7397,8 @@ class Checker:
         if hint is None and left_literal and not right_literal:
             right_type = self.type_of(right, scope)
             peeled = self.peel_numeric_reference(right_type)
-            left_type = self.type_of(left, scope, peeled if peeled in NUMBER_TYPES else None)
+            literal_variable = isinstance(peeled, TypeVariable) and (peeled.integer_literal or peeled.float_literal)
+            left_type = self.type_of(left, scope, peeled if peeled in NUMBER_TYPES or literal_variable else None)
         else:
             left_type = self.type_of(left, scope, hint if hint == "bool" or left_literal else None)
             right_hint = left_type if left_type != NEVER else hint
@@ -7944,19 +8011,31 @@ class Checker:
         if isinstance(target, TypeVariable):
             raise token.error(f"type annotations needed for {method}")
         if method == "collect":
-            if is_vector(target):
-                self.check_type(target, token)
-                self.require(item, target.arguments[0], token)
-            elif target == STRING and (item in {"char", STRING} or is_str_reference(item)
-                                       or isinstance(item, ReferenceType) and item.inner == "char"):
-                return
-            else:
-                raise token.error(f"cannot collect items of type {item} into {target}")
+            self.check_collect(item, target, token)
         else:
             element = item.inner if isinstance(item, ReferenceType) else item
             if target not in NUMBER_TYPES:
                 raise token.error(f"{method} requires a numeric result, found {target}")
             self.require(element, target, token)
+
+    def check_collect(self, item, target, token):
+        item, target = self.resolve(item), self.resolve(target)
+        name = target.name if isinstance(target, AppliedType) else target
+        if is_vector(target) or name in {DEQUE, HEAP} or MAP_TYPES.get(name, "").endswith("Set"):
+            self.check_type(target, token)
+            self.require(item, target.arguments[0], token)
+        elif name in MAP_TYPES:
+            self.check_type(target, token)
+            self.require(item, TupleType(target.arguments), token)
+        elif target == STRING and (item in {"char", STRING} or is_str_reference(item)
+                                   or isinstance(item, ReferenceType) and item.inner in {"char", STRING}):
+            return
+        elif name in {OPTION, RESULT} and isinstance(item, AppliedType) and item.name == name:
+            if name == RESULT:
+                self.require(item.arguments[1], target.arguments[1], token)
+            self.check_collect(item.arguments[0], target.arguments[0], token)
+        else:
+            raise token.error(f"cannot collect items of type {item} into {target}")
 
     def vector_method(self, expr, scope, expected, actual, base):
         name = expr.token.text
@@ -8072,6 +8151,13 @@ class Checker:
         if len(candidates) != 1:
             if owner in self.program.types and not self.program.type_parameters[owner]:
                 return self.call_on_type(expr, scope, expected, owner, name)
+            if not candidates and owner in self.program.type_parameters:
+                arguments = []
+                for parameter in self.program.type_parameters[owner]:
+                    variable = TypeVariable(parameter.name, expr.token, parameter.const_type)
+                    self.variables.append(variable)
+                    arguments.append(variable)
+                return self.call_on_type(expr, scope, expected, AppliedType(owner, tuple(arguments)), name)
             raise expr.token.error(f"unknown or ambiguous associated function {expr.token.text!r}")
         impl = candidates[0]
         method = impl.methods[name]
@@ -8079,6 +8165,43 @@ class Checker:
         explicit = None if method.method_parameters else expr.type_arguments
         arguments = self.specialize(impl.parameters, explicit, expr.token, callables=False)
         return self.function_call(expr, scope, expected, method, arguments)
+
+    def path_arity(self, expr, scope):
+        """The parameter count of a constructor or associated function named by a path, or None."""
+        text = expr.token.text
+        if self.local_binding(scope, expr.token) is not None:
+            return None
+        ctor = self.program.constructors.get(text)
+        if ctor is not None:
+            return len(ctor.fields) if ctor.style == "tuple" else None
+        if "::" not in text:
+            return None
+        builtin = {f"{VEC}::new": 0, f"{STRING}::new": 0, f"{STRING}::from": 1, f"{BOX}::new": 1}
+        if text in builtin:
+            return builtin[text]
+        owner, _, name = text.rpartition("::")
+        if expr.qualified:
+            owner_type, trait_name = expr.qualified
+            trait = self.program.traits.get(trait_name) if trait_name else None
+            if trait and name in trait.methods:
+                method = trait.methods[name]
+                return None if method.associated_const else len(method.params)
+            owner = owner_type.name if isinstance(owner_type, AppliedType) else owner_type
+        trait = self.program.traits.get(owner)
+        if trait and name in trait.methods:
+            method = trait.methods[name]
+            return None if method.associated_const else len(method.params)
+        for impl in self.program.impls:
+            target = impl.target.name if isinstance(impl.target, AppliedType) else impl.target
+            if impl.trait is None and name in impl.methods and target == owner:
+                method = impl.methods[name]
+                return None if method.associated_const else len(method.params)
+        if owner in self.parameters:
+            for bound in self.program.trait_closure(self.parameters[owner].bounds):
+                trait = self.program.traits.get(bound)
+                if trait and name in trait.methods and not trait.methods[name].associated_const:
+                    return len(trait.methods[name].params)
+        return None
 
     def constant_type(self, expr, scope, expected):
         if expr.qualified:
@@ -8634,7 +8757,11 @@ class Ownership:
             return self.lower_reference(original, scope, cursor, reborrow=reborrow,
                                         two_phase=two_phase, extend_to=extend_to)
         if expr.kind in {"call", "indirect_call", "vector_method", "string_method"}:
-            return self.lower_call(expr, scope, cursor)
+            cursor, loan = self.lower_call(expr, scope, cursor)
+            if loan is None and cursor is not None:
+                # A reference returned without a traceable input borrow is left untracked.
+                return self.static_loan(cursor, expr.token, annotation.mutable)
+            return cursor, loan
         if expr.kind == "byte_string" or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
             return self.static_loan(cursor, expr.token)
         if expr.kind == "clone":
@@ -8682,17 +8809,18 @@ class Ownership:
                                    two_phase=two_phase and expr.auto_borrow)
         if expr.kind != "name":
             # References copied out of places the checker does not model are not tracked.
-            return self.static_loan(self.lower(expr, scope, cursor, consume=False), expr.token)
+            return self.static_loan(self.lower(expr, scope, cursor, consume=False), expr.token,
+                                    isinstance(annotation, ReferenceType) and annotation.mutable)
         holder = scope.find(expr.token)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
                                    two_phase=two_phase)
         return self.lower(expr, scope, cursor), holder.loan
 
-    def static_loan(self, cursor, token):
-        place = Place(Local(token, False, static=True))
+    def static_loan(self, cursor, token, mutable=False):
+        place = Place(Local(token, mutable, static=True))
         cursor = self.emit(cursor, "declare", place, token)
-        return cursor, Loan(place, False)
+        return cursor, Loan(place, mutable)
 
     def promotable(self, expr):
         expr = ungroup(expr)
@@ -9557,6 +9685,13 @@ def pretty_debug(value, indent=0):
         text = USER_FORMAT(value, True, alternate=True)
         if text is not None:
             return text.replace("\n", "\n" + " " * indent)
+    if isinstance(value, MapValue) and value.entries:
+        entries = MAP_ORDER(value)
+        if all(item[1] is MAP_MEMBER for item in entries):
+            lines = [pretty_debug(key, indent + 4) for key, _ in entries]
+        else:
+            lines = [f"{pretty_debug(key, indent + 4)}: {pretty_debug(item, indent + 4)}" for key, item in entries]
+        return "{\n" + "".join(" " * (indent + 4) + line + ",\n" for line in lines) + " " * indent + "}"
     if isinstance(value, ArrayValue) and value.items:
         opening, closing = "[", "]"
         entries = [pretty_debug(item, indent + 4) for item in value.items]
@@ -9611,6 +9746,8 @@ def format_value(value, annotation, spec):
 
 
 USER_FORMAT = None
+MAP_ORDER = None
+MAP_MEMBER = object()
 FORMATTER = MODULE_SEPARATOR.join(("std", "fmt", "Formatter"))
 
 
@@ -9621,6 +9758,11 @@ def display(value, debug):
         text = USER_FORMAT(value, debug)
         if text is not None:
             return text
+    if isinstance(value, MapValue):
+        entries = MAP_ORDER(value) if MAP_ORDER else value.entries.values()
+        if all(item[1] is MAP_MEMBER for item in entries):
+            return "{" + ", ".join(display(key, True) for key, _ in entries) + "}"
+        return "{" + ", ".join(f"{display(key, True)}: {display(item, True)}" for key, item in entries) + "}"
     if isinstance(value, ArrayValue):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
     if isinstance(value, ExitCodeValue):
@@ -9676,8 +9818,9 @@ def handles_jump(expr, signal):
 
 class Interpreter:
     def __init__(self, program, stdout):
-        global USER_FORMAT
+        global USER_FORMAT, MAP_ORDER
         USER_FORMAT = self.user_format
+        MAP_ORDER = self.map_order
         self.implementations = {}
         self.program = program
         self.functions = program.functions
@@ -9726,6 +9869,9 @@ class Interpreter:
             return replace(value, collection=collection, mappers=tuple(map(self.clone_value, value.mappers)))
         if isinstance(value, BoxValue):
             return BoxValue(Address(Binding(self.clone_value(value.read()), True)), value.concrete)
+        if isinstance(value, MapValue):
+            return MapValue({key: [self.clone_value(item[0]), self.clone_value(item[1])]
+                             for key, item in value.entries.items()}, value.ordered)
         if isinstance(value, ArrayValue):
             return ArrayValue(tuple(map(self.clone_value, value.items)))
         if isinstance(value, Value):
@@ -9816,6 +9962,60 @@ class Interpreter:
                     order = order.fields[0]
                 return ordering_number(order)
         return None
+
+    def map_key(self, value):
+        """A hashable stand-in for a key value, reading through references and boxes."""
+        while isinstance(value, (Address, StringAddress, SliceAddress, DynAddress, BoxValue)):
+            value = value.read()
+        if isinstance(value, Value):
+            return (value.constructor.path, tuple(map(self.map_key, value.fields)))
+        if isinstance(value, ArrayValue):
+            return ("[", tuple(map(self.map_key, value.items)))
+        if isinstance(value, MapValue):
+            return ("{", tuple(sorted(map(repr, value.entries))))
+        if isinstance(value, bool):
+            return ("bool", value)
+        if isinstance(value, str):
+            return str(value)
+        return value
+
+    def map_order(self, value):
+        entries = list(value.entries.values())
+        if value.ordered:
+            entries.sort(key=functools.cmp_to_key(lambda left, right: self.compare(left[0], right[0])))
+        return entries
+
+    def collect(self, values, target):
+        """Build a collection of the requested type from iterator items."""
+        name = target.name if isinstance(target, AppliedType) else target
+        if target == STRING:
+            return "".join(display(value, False) for value in values)
+        if name in {OPTION, RESULT}:
+            items = []
+            for value in values:
+                value = map_of(value)
+                variant = value.constructor.path.rsplit("::", 1)[-1]
+                if variant in {"None", "Err"}:
+                    return Value(next(ctor for ctor in self.program.layout(target)[1]
+                                      if ctor.path.endswith(f"::{variant}")), value.fields)
+                items.append(value.fields[0])
+            return self.variant(target, "Some" if name == OPTION else "Ok", self.collect(items, target.arguments[0]))
+        if name in MAP_TYPES:
+            collected = MapValue(ordered=MAP_TYPES[name].startswith("BTree"))
+            for value in values:
+                if MAP_TYPES[name].endswith("Set"):
+                    collected.entries.setdefault(self.map_key(value), [value, MAP_MEMBER])
+                else:
+                    key, item = map_of(value).fields
+                    collected.entries[self.map_key(key)] = [key, item]
+            return collected
+        items = ArrayValue(tuple(values))
+        if name == DEQUE:
+            return Value(self.program.layout(target)[1][0], (items,))
+        if name == HEAP:
+            ordered = sorted(items.items, key=functools.cmp_to_key(self.compare), reverse=True)
+            return Value(self.program.layout(target)[1][0], (ArrayValue(tuple(ordered)),))
+        return items
 
     def call_value(self, callee, *arguments):
         """Call a closure, function pointer, or reference to one from Python."""
@@ -10031,6 +10231,9 @@ class Interpreter:
                                     for _ in range(annotation.length.value)))
         if is_vector(annotation):
             return ArrayValue(())
+        name = annotation.name if isinstance(annotation, AppliedType) else annotation
+        if name in MAP_TYPES:
+            return MapValue(ordered=MAP_TYPES[name].startswith("BTree"))
         constructors = self.program.layout(annotation)[1]
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         path = self.program.default_variants.get(name)
@@ -10050,6 +10253,18 @@ class Interpreter:
                 return order
         if isinstance(left, ExitCodeValue):
             return left.status - right.status
+        if isinstance(left, MapValue):
+            if equality:
+                if left.entries.keys() != right.entries.keys():
+                    return 1
+                return 0 if all(self.compare(left.entries[key][1], right.entries[key][1], True) == 0
+                                for key in left.entries) else 1
+            mine, theirs = self.map_order(left), self.map_order(right)
+            for (a_key, a_item), (b_key, b_item) in zip(mine, theirs):
+                order = self.compare(a_key, b_key) or self.compare(a_item, b_item)
+                if order:
+                    return order
+            return len(mine) - len(theirs)
         if isinstance(left, ArrayValue):
             for a, b in zip(left.items, right.items):
                 result = self.compare(a, b, equality)
@@ -10162,7 +10377,7 @@ class Interpreter:
             values = self.iteration_values(self.eval(source, scope), annotation, source.token)
             result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
             if token.text == "collect":
-                return "".join(display(value, False) for value in values) if result == STRING else ArrayValue(tuple(values))
+                return self.collect(values, result)
             if token.text == "count":
                 return checked(sum(1 for _ in values), token, "usize", runtime=True)
             product = token.text == "product"
@@ -12213,6 +12428,321 @@ def method_from_bits(interpreter, result, bits):
     if result == "f32":
         return Float32(struct.unpack("<f", struct.pack("<I", bits))[0])
     return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+def map_of(value):
+    while isinstance(value, (Address, DynAddress, BoxValue)):
+        value = value.read()
+    return value
+
+
+def map_tuple(interpreter, annotation, *values):
+    return make_tuple(interpreter, annotation, *values)
+
+
+def map_entries(interpreter, value):
+    return interpreter.map_order(map_of(value))
+
+
+@intrinsic
+def rust_map_new(interpreter, result):
+    return MapValue(ordered=MAP_TYPES[result.name].startswith("BTree"))
+
+
+@intrinsic
+def rust_map_len(interpreter, result, value):
+    return len(map_of(value).entries)
+
+
+@intrinsic
+def rust_map_clear(interpreter, result, value):
+    map_of(value).entries.clear()
+
+
+@intrinsic
+def rust_map_insert(interpreter, result, value, key, item):
+    entries = map_of(value).entries
+    normalized = interpreter.map_key(key)
+    previous = entries.get(normalized)
+    if previous is not None:
+        old = previous[1]
+        previous[1] = item
+        return option(interpreter, result, old)
+    entries[normalized] = [key, item]
+    return option(interpreter, result)
+
+
+@intrinsic
+def rust_map_get(interpreter, result, value, key):
+    target = map_of(value)
+    normalized = interpreter.map_key(key)
+    if normalized not in target.entries:
+        return option(interpreter, result)
+    return option(interpreter, result, Address(MapSlot(target, normalized)))
+
+
+@intrinsic
+def rust_map_get_key_value(interpreter, result, value, key):
+    target = map_of(value)
+    normalized = interpreter.map_key(key)
+    if normalized not in target.entries:
+        return option(interpreter, result)
+    stored, item = target.entries[normalized]
+    return option(interpreter, result, map_tuple(interpreter, element_type(result), shared(stored),
+                                                 Address(MapSlot(target, normalized))))
+
+
+@intrinsic
+def rust_map_has(interpreter, result, value, key):
+    return interpreter.map_key(key) in map_of(value).entries
+
+
+@intrinsic
+def rust_map_remove(interpreter, result, value, key):
+    removed = map_of(value).entries.pop(interpreter.map_key(key), None)
+    return option(interpreter, result) if removed is None else option(interpreter, result, removed[1])
+
+
+@intrinsic
+def rust_map_remove_entry(interpreter, result, value, key):
+    removed = map_of(value).entries.pop(interpreter.map_key(key), None)
+    if removed is None:
+        return option(interpreter, result)
+    return option(interpreter, result, map_tuple(interpreter, element_type(result), *removed))
+
+
+@intrinsic
+def rust_map_or_insert(interpreter, result, value, key, item):
+    target = map_of(value)
+    normalized = interpreter.map_key(key)
+    if normalized not in target.entries:
+        target.entries[normalized] = [key, item]
+    return Address(MapSlot(target, normalized))
+
+
+@intrinsic
+def rust_map_slot(interpreter, result, value, key):
+    return Address(MapSlot(map_of(value), interpreter.map_key(key)))
+
+
+def borrowed(value):
+    return isinstance(value, (Address, DynAddress))
+
+
+@intrinsic
+def rust_map_keys(interpreter, result, value):
+    entries = map_entries(interpreter, value)
+    if borrowed(value):
+        return lazy(shared(key) for key, _ in entries)
+    return lazy(key for key, _ in entries)
+
+
+@intrinsic
+def rust_map_values(interpreter, result, value):
+    target = map_of(value)
+    keys = [normalized for normalized, _ in sorted(target.entries.items(), key=functools.cmp_to_key(
+        lambda left, right: interpreter.compare(left[1][0], right[1][0])))] if target.ordered else list(target.entries)
+    if borrowed(value):
+        return lazy(Address(MapSlot(target, key)) for key in keys)
+    return lazy(target.entries[key][1] for key in keys)
+
+
+@intrinsic
+def rust_map_items(interpreter, result, value):
+    target = map_of(value)
+    pair = element_type(result)
+    ordered = interpreter.map_order(target)
+    if borrowed(value):
+        return lazy(map_tuple(interpreter, pair, shared(key), Address(MapSlot(target, interpreter.map_key(key))))
+                    for key, _ in ordered)
+    return lazy(map_tuple(interpreter, pair, key, item) for key, item in ordered)
+
+
+@intrinsic
+def rust_map_drain(interpreter, result, value):
+    target = map_of(value)
+    ordered = interpreter.map_order(target)
+    target.entries.clear()
+    pair = element_type(result)
+    return lazy(map_tuple(interpreter, pair, key, item) for key, item in ordered)
+
+
+@intrinsic
+def rust_map_retain(interpreter, result, value, keep):
+    target = map_of(value)
+    for normalized in list(target.entries):
+        key = target.entries[normalized][0]
+        if not interpreter.call_value(keep, shared(key), Address(MapSlot(target, normalized))):
+            del target.entries[normalized]
+
+
+@intrinsic
+def rust_map_extend(interpreter, result, value, items):
+    target = map_of(value)
+    for pair in interpreter.iterate(items, 1):
+        pair = map_of(pair)
+        key, item = (field.read() if isinstance(field, Address) else field for field in pair.fields)
+        target.entries[interpreter.map_key(key)] = [key, item]
+
+
+@intrinsic
+def rust_map_end(interpreter, result, value, last):
+    target = map_of(value)
+    ordered = interpreter.map_order(target)
+    if not ordered:
+        return option(interpreter, result)
+    key, _ = ordered[-1 if last else 0]
+    return option(interpreter, result, map_tuple(interpreter, element_type(result), shared(key),
+                                                 Address(MapSlot(target, interpreter.map_key(key)))))
+
+
+@intrinsic
+def rust_map_pop(interpreter, result, value, last):
+    target = map_of(value)
+    ordered = interpreter.map_order(target)
+    if not ordered:
+        return option(interpreter, result)
+    key, item = ordered[-1 if last else 0]
+    del target.entries[interpreter.map_key(key)]
+    return option(interpreter, result, map_tuple(interpreter, element_type(result), key, item))
+
+
+def in_range(interpreter, key, bounds):
+    name = bounds.constructor.path.rsplit(MODULE_SEPARATOR, 1)[-1]
+    fields = dict(zip((field for field, _ in bounds.constructor.fields), bounds.fields))
+    if "start" in fields and interpreter.compare(key, fields["start"]) < 0:
+        return False
+    if "end" in fields:
+        order = interpreter.compare(key, fields["end"])
+        return order <= 0 if name in {"RangeInclusive", "RangeToInclusive"} else order < 0
+    return True
+
+
+@intrinsic
+def rust_map_range(interpreter, result, value, bounds):
+    target = map_of(value)
+    pair = element_type(result)
+    return lazy(map_tuple(interpreter, pair, shared(key), Address(MapSlot(target, interpreter.map_key(key))))
+                for key, _ in interpreter.map_order(target) if in_range(interpreter, key, bounds))
+
+
+@intrinsic
+def rust_map_debug(interpreter, result, value, formatter):
+    return interpreter.builtin_fmt(map_of(value), formatter, True, result)
+
+
+@intrinsic
+def rust_set_insert(interpreter, result, value, item):
+    entries = map_of(value).entries
+    normalized = interpreter.map_key(item)
+    if normalized in entries:
+        return False
+    entries[normalized] = [item, MAP_MEMBER]
+    return True
+
+
+@intrinsic
+def rust_set_remove(interpreter, result, value, item):
+    return map_of(value).entries.pop(interpreter.map_key(item), None) is not None
+
+
+@intrinsic
+def rust_set_get(interpreter, result, value, item):
+    stored = map_of(value).entries.get(interpreter.map_key(item))
+    return option(interpreter, result) if stored is None else option(interpreter, result, shared(stored[0]))
+
+
+@intrinsic
+def rust_set_take(interpreter, result, value, item):
+    stored = map_of(value).entries.pop(interpreter.map_key(item), None)
+    return option(interpreter, result) if stored is None else option(interpreter, result, stored[0])
+
+
+@intrinsic
+def rust_set_drain(interpreter, result, value):
+    target = map_of(value)
+    ordered = interpreter.map_order(target)
+    target.entries.clear()
+    return lazy(key for key, _ in ordered)
+
+
+@intrinsic
+def rust_set_retain(interpreter, result, value, keep):
+    target = map_of(value)
+    for normalized in list(target.entries):
+        if not interpreter.call_value(keep, shared(target.entries[normalized][0])):
+            del target.entries[normalized]
+
+
+@intrinsic
+def rust_set_extend(interpreter, result, value, items):
+    target = map_of(value)
+    for item in interpreter.iterate(items, 1):
+        if isinstance(item, Address) and not isinstance(interpreter.intrinsic_types[0].arguments[0], ReferenceType):
+            item = interpreter.clone_value(item.read())
+        target.entries.setdefault(interpreter.map_key(item), [item, MAP_MEMBER])
+
+
+@intrinsic
+def rust_set_combine(interpreter, result, value, other, mode):
+    first, second = map_of(value), map_of(other)
+    if mode == 0:
+        keys = [*first.entries.values(), *(item for key, item in second.entries.items() if key not in first.entries)]
+    elif mode == 1:
+        keys = [item for key, item in first.entries.items() if key in second.entries]
+    elif mode == 2:
+        keys = [item for key, item in first.entries.items() if key not in second.entries]
+    else:
+        keys = [*(item for key, item in first.entries.items() if key not in second.entries),
+                *(item for key, item in second.entries.items() if key not in first.entries)]
+    if first.ordered:
+        keys.sort(key=functools.cmp_to_key(lambda left, right: interpreter.compare(left[0], right[0])))
+    return lazy(shared(item[0]) for item in keys)
+
+
+@intrinsic
+def rust_set_relation(interpreter, result, value, other, mode):
+    first, second = map_of(value), map_of(other)
+    if mode == 0:
+        return first.entries.keys() <= second.entries.keys()
+    return not (first.entries.keys() & second.entries.keys())
+
+
+@intrinsic
+def rust_set_end(interpreter, result, value, last):
+    ordered = interpreter.map_order(map_of(value))
+    return option(interpreter, result, shared(ordered[-1 if last else 0][0])) if ordered else option(interpreter, result)
+
+
+@intrinsic
+def rust_set_pop(interpreter, result, value, last):
+    target = map_of(value)
+    ordered = interpreter.map_order(target)
+    if not ordered:
+        return option(interpreter, result)
+    key = ordered[-1 if last else 0][0]
+    del target.entries[interpreter.map_key(key)]
+    return option(interpreter, result, key)
+
+
+@intrinsic
+def rust_set_range(interpreter, result, value, bounds):
+    return lazy(shared(key) for key, _ in interpreter.map_order(map_of(value)) if in_range(interpreter, key, bounds))
+
+
+@intrinsic
+def rust_lazy_elements(interpreter, result, items):
+    if isinstance(items, (Address, SliceAddress)):
+        return lazy(child(items, index) for index in range(len(items_of(items))))
+    return lazy(items.items)
+
+
+@intrinsic
+def rust_lazy_range(interpreter, result, items, bounds):
+    start, stop = interpreter.range_bounds(bounds, len(items_of(items)))
+    if start is None:
+        raise RustPanic("range out of bounds")
+    return lazy(child(items, index) for index in range(start, stop))
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
