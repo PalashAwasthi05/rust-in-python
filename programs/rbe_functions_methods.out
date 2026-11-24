@@ -1,0 +1,12 @@
+0
+1 2 fizz 4 buzz fizz 7 8 fizz buzz 11 fizz 13 14 fizzbuzz
+rectangle perimeter: 14
+rectangle area: 12
+diagonal: 5
+square moved to (1, 1)-(2, 2), area still 1
+destroying Pair(1, 2)
+sum from destroy: 3
+swap_and_sum 12 -> (9, 3)
+apply double 10 times to 1: 1024
+Point::distance via path: 5.000
+method as fn pointer: 12

@@ -1,0 +1,21 @@
+0
+closure_annotated: 43
+closure_inferred: 43
+closure returning one: 1
+`color`: green
+`color`: green
+`count`: 1
+`count`: 2
+count after closure is done: 2
+`movable`: 3
+contains 1: true, contains 4: false
+I said hello.
+Then I screamed goodbye!!!.
+3 doubled: 6
+tally [0, 10, 20, 30]
+I'm a closure!
+I'm a function!
+same closure type, many captures: [11, 12, 13]
+different closure types boxed: [8, 49]
+size of non-capturing closure: 0
+size of closure capturing a u64: 8

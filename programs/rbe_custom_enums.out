@@ -1,0 +1,23 @@
+0
+zero is 0
+one is 1
+two as u8 is 2
+roses are #ff0000
+violets are #0000ff
+green as i64 65280
+Trace = 1
+Debug = 2
+Info = 10
+Warn = 11
+Error = 50
+Warn > Info: true, Debug < Trace: false
+from_u8(11) = Some(Warn), from_u8(3) = None
+size of Level: 1 byte
+pressed 'x'
+pasted "my text"
+clicked at x=20, y=80
+page loaded
+page unloaded
+alias add 12 subtract 2
+Two is double
+equal? true

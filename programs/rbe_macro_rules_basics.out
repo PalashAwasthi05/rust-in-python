@@ -1,0 +1,18 @@
+0
+Hello!
+You called "foo"()
+You called "bar"()
+"1u32 + 1" = 2
+"{ let x = 1u32; x * x + 2 * x - 1 }" = 2
+"1i32 + 1 == 2i32" and "2i32 * 2 == 4i32" is true
+"true" or "false" is true
+min of 1 = 1
+min of 1 + 2, 2 = 2
+min of 5, 2 * 3, 4 = 4
+Config { host: "localhost", port: 8080, verbose: false } fields ["host", "port", "verbose"]
+{"one": 1, "three": 3, "two": 2}
+squares [1, 4, 9, 16]
+type names: alloc::vec::Vec<core::option::Option<u8>> &str
+token count: 5
+block doubled: 10
+pattern match: true false

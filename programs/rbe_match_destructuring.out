@@ -1,0 +1,23 @@
+0
+(0, -2, 3): first is 0, y = -2, z = 3
+(3, -2, 0): it doesn't matter what they are
+(1, 5, 2): first is 1 and the rest doesn't matter
+(2, 1, 2): last is 2 and the rest doesn't matter
+[0, 2, 3] -> 0, 2, 3
+[1, -7, 9] -> 1, _, 9
+[-1, 2, 4] -> -1, 2, ...
+[5, 5, 5] -> 5 then [5, 5]
+first 3 middle [4, 5, 6] last 7
+red 122, green 17, and blue 40
+cyan 1, magenta 2, yellow 3, key 4
+the color is Green!
+got a value via destructuring: 4
+got a value via dereferencing: 4
+got a reference to a value: 5
+we added 10. `mut_value`: 16
+is_a_reference 3 mut_value now 16
+box destructured 7 seven
+first of x is 1, b = 2, y = 3
+let-destructured 9 8 7
+name release has 2 tags, first Some("stable")
+closure param destructuring: a1b2c3

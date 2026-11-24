@@ -1,0 +1,29 @@
+0
+Point occupies 16 bytes on the stack
+Rectangle occupies 32 bytes on the stack
+Boxed point occupies 8 bytes on the stack
+Boxed rectangle occupies 8 bytes on the stack
+Boxed box occupies 8 bytes on the stack
+Unboxed point occupies 16 bytes on the stack, x=0
+bottom right via box: Point { x: 3.0, y: -4.0 }
+collected (0..10) into: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+initial vector: [1, 2, 3]
+vector: [1, 2, 3, 4], length 4, second 2
+pop last element: Some(4)
+after insert/extend/retain: [0, 1, 3, 7, 8]
+0:0 1:1 2:3 3:7 4:8 
+updated vector: [0, 3, 9, 21, 24]
+removed 3, truncated [0, 9, 21], capacity >= len: true
+sorted+dedup [1, 4, 5, 9], windows sums [5, 9, 14]
+drained [4, 5] left [1, 9]
+pangram: the quick brown fox jumps over the lazy dog
+words in reverse
+dog lazy the over jumps fox brown quick the 
+used characters: a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z
+alice says: I like dogs
+bob says: I like cats
+I'm writing Rust! / ℝ / Escapes don't work here: \x3F \u{211D} / And then I said: "There is no escape!"
+a byte string: [116, 104, 105, 115, 32, 105, 115, 32, 97, 32, 98, 121, 116, 101, 32, 115, 116, 114, 105, 110, 103]
+as str: Ok("this is a byte string")
+invalid utf8: true
+¡héllo has 8 bytes and 6 chars, upper ¡HÉLLO

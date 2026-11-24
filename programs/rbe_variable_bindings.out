@@ -1,0 +1,19 @@
+0
+integer 1 boolean true unit () copy 1
+before mutation: 1
+after mutation: 20
+inner short: 2
+inner can see outer: 1
+outer long: 1
+before being shadowed: 1
+shadowed in inner block: abc
+outside inner block: 1
+shadowed in outer block: 2
+spaces is now a number: 3
+a binding: 4
+another binding: big
+score 73 -> C
+frozen copy: 7
+unfrozen again: 3
+left 30 right 20 first 1 second 2 total 53
+vec frozen by shadowing: [1]

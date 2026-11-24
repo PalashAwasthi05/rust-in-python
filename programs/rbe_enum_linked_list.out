@@ -1,0 +1,10 @@
+0
+linked list has length: 3
+3, 2, 1, Nil
+sum = 6
+doubled: 6, 4, 2, Nil
+reversed: 1, 2, 3, Nil
+nth(0)=Some(1) nth(2)=Some(3) nth(5)=None
+from slice: 10, 20, 30, 40, Nil (len 4)
+debug: Cons(7, Cons(8, Nil))
+empty: Nil len 0 sum 0

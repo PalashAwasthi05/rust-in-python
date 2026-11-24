@@ -1,0 +1,33 @@
+0
+Dublin: 53.348°N 6.260°W
+Oslo: 59.950°N 10.750°E
+Vancouver: 49.250°N 123.100°W
+RGB (128, 255, 90) 0x80FF5A / Color { red: 128, green: 255, blue: 90 }
+RGB (0, 3, 254) 0x0003FE / Color { red: 0, green: 3, blue: 254 }
+[0: 1, 1: 2, 2: 3]
+display: 3.3 - 7.2i
+debug: Complex { real: 3.3, imag: -7.2 }
+pretty: Complex {
+    real: 3.3,
+    imag: -7.2,
+}
+[     pad] [pad     ] [  pad   ]
+Matrix(1.1, 1.2, 2.1, 2.2)
+Scene { name: "demo", shapes: [Circle { r: 1.5 }, Square(2.0), Empty], origin: (0, -3) }
+Scene {
+    name: "demo",
+    shapes: [
+        Circle {
+            r: 1.5,
+        },
+        Square(
+            2.0,
+        ),
+        Empty,
+    ],
+    origin: (
+        0,
+        -3,
+    ),
+}
+to_string gives "3.3 - 7.2i" of length 10

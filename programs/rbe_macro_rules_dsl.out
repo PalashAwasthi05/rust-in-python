@@ -1,0 +1,16 @@
+0
+add_assign: [11, 22, 33]
+mul_assign: [22, 44, 66]
+sub_assign: [12, 24, 36]
+float mul_assign: [2.0, 6.0]
+1 + 2 = 3
+(1 + 2) * (3 / 4) = 0
+7 * 6 = 42
+(1 << 10) - 24 = 1000
+Closed --open--> Opened
+Opened ignores lock
+Opened --close--> Closed
+Closed --lock--> Locked
+Locked --unlock--> Closed
+Closed --open--> Opened
+<div><h1>Title</h1><p>Hello, <b>world</b>!</p></div>

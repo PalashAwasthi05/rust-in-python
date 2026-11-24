@@ -1,0 +1,15 @@
+0
+the first doubled is 84
+Error: invalid first item to double
+Error: invalid digit found in string
+the first doubled is 84
+Error: please use a vector with at least one element
+Error: the provided string could not be parsed as int (caused by: invalid digit found in string)
+nested: Ok(Some(84)) Ok(None) Err("invalid digit found in string")
+results: [Err("invalid digit found in string"), Ok(93), Ok(18)]
+filter_map ok: [93, 18]
+numbers [93, 18], 1 error(s) collected
+collect into Result: Err("invalid digit found in string")
+collect all good: Ok([1, 2])
+partition numbers: [93, 18]
+partition errors: ["invalid digit found in string"]

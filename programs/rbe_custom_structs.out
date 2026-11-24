@@ -1,0 +1,16 @@
+0
+Person { name: "Peter", age: 27 }
+Peter is now 28
+point (5.2, 0.4) another (10.3, 0.4)
+Rectangle { top_left: Point { x: 5.2, y: 5.4 }, bottom_right: Point { x: 8.2, y: 0.4 } }
+w=3.0 h=5.0 area=15.00
+square area 6.25, corners equal? false
+unit struct: Unit, equal to itself: true
+unit size: 0
+pair contains 1 and 0.1
+destructured 1 0.1
+pairs [Pair(1, 0.25), Pair(2, 0.5), Pair(3, 0.75)] weighted 3.5
+  Mo   31
+  Zoe  31
+  Al   19
+Al after birthday: Some(Person { name: "Al", age: 20 })

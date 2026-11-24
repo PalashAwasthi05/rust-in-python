@@ -1,0 +1,27 @@
+0
+n is 20
+Error: invalid digit found in string
+n is 20
+Error: invalid digit found in string
+n is 42
+n is -12
+Error: cannot parse integer from empty string
+parse_age("42") = Ok(42)
+parse_age(" 7 ") = Ok(7)
+parse_age("-3") = Err(Negative(-3))
+parse_age("200") = Err(TooOld(200))
+parse_age("abc") = Err(Parse("invalid digit found in string"))
+map: Ok(6) Err("boom")
+map_err: Err(4)
+unwrap_or: 3 0
+unwrap_or_else: -4
+or_else: Ok(99)
+ok(): Some(3) None, err(): Some("boom")
+is_ok true is_err true
+and: Ok("next")
+map_or: -1
+iter: [3]
+transpose: Some(Ok(5))
+sum of results: Ok(6)
+sum with bad: Err("invalid digit found in string")
+product: Ok(42)

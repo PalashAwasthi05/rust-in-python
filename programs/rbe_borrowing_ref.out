@@ -1,0 +1,20 @@
+0
+this int is: 5
+this int is: 6
+this int is: 5
+destroying box that contains 5
+I immutably borrowed Gödel, Escher, Bach - 1979 edition
+I immutably borrowed Gödel, Escher, Bach - 1979 edition
+I mutably borrowed Gödel, Escher, Bach - 2014 edition
+by Douglas Hofstadter
+point has coordinates: (0, 0)
+point has coordinates: (5, 2)
+point now has coordinates: (5, 2)
+ref_c1 equals ref_c2: true
+point is (0, 0), mutable_point is (0, 1)
+tuple is (5, 2)
+hello Alice
+still own Some("Alice")
+longest title: Gödel, Escher, Bach
+pushed [0, 1, 2, 3], first 0
+counts [10, 20, 30] total 60

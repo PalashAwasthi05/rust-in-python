@@ -1,0 +1,18 @@
+0
+Find the sum of all the numbers with odd squares under 1000
+imperative style: 5456
+functional style: 5456
+palindromes: ["bob", "kayak", "level", "noon"]
+longest: Some("apple")
+short/long counts: (3, 3)
+add over [3, 7, 2] = 12
+mul over [3, 7, 2] = 42
+max over [3, 7, 2] = 7
+sum of odd numbers up to 9 (excluding): 16
+parse_or_default: 17 0
+first word len: 5 0
+level 2 is low
+level 5 is mid
+level 9 is high
+diverging branch typechecks as u32: 7
+fallback 99

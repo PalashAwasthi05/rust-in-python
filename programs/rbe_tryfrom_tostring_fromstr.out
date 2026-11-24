@@ -1,0 +1,20 @@
+0
+try_from(8) = Ok(EvenNumber(8))
+try_from(5) = Err("5 is odd")
+8.try_into() = Ok(EvenNumber(8))
+5.try_into() = Err("5 is odd")
+0 -> MON (Mon)
+4 -> FRI (Fri)
+6 -> SUN (Sun)
+9 -> invalid day 9
+u16->u8 true Ok(255), i64->u32 err? true
+u64 -> usize: 42
+Circle of radius 6
+to_string concat: 3.5!true
+sum = 15
+Ok(3.75) Ok(0) true
+bool Ok(true) char Ok('z')
+Ok(Wed) Err("not a day: Funday")
+Ok(Rgb { r: 30, g: 144, b: 255 })
+Err("invalid digit found in string")
+Ok([Mon, Fri, Sun])

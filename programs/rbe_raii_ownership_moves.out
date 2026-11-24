@@ -1,0 +1,33 @@
+0
+make a
+make b
+make c
+leaving inner scope
+drop c
+drop b
+make moved
+ownership moved to moved
+drop moved
+dropped explicitly
+make first
+make second
+drop first
+replaced now holds second
+x is 5, and y is 5
+a contains: 5
+destroying a box that contains 5
+got back [1, 2, 99]
+mutable_box now contains 4
+the person's age is 20
+the person's name is Alice
+the person's age from person struct is 20
+took left, pair.1 still usable: right
+x y (borrowed loop)
+X Y (consuming loop)
+make v1
+make v2
+vec of 2 guards going out of scope
+drop v1
+drop v2
+drop second
+drop a

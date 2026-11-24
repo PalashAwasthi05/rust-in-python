@@ -1,0 +1,23 @@
+0
+35C is above 30 Celsius
+20C is equal to or below 30 Celsius
+100F is above 86 Fahrenheit
+40F is equal to or below 86 Fahrenheit
+greater than zero
+teen of age 15
+the answer: 42!
+found an id in range: 5
+found an id in another range
+some other id: 99
+short text "hi"
+other message Quit
+I don't like letters. let's go with an emoticon :)! None
+big value 8
+if-let sum 11
+"3:4" -> Some((3, 4))
+"10 : -2" -> Some((10, -2))
+"nope" -> None
+"1:x" -> None
+`i` is `0`. `i` is `1`. `i` is `2`. `i` is `3`. `i` is `4`. greater than 4, quit!
+c b a 
+[3][6][9]

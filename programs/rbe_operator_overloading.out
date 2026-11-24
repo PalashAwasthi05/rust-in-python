@@ -1,0 +1,14 @@
+0
+a + b = (1.50, 0.50)
+a - b = (0.50, 3.50)
+a * 3 = (3.00, 6.00), 2 * b = (1.00, -3.00)
+dot(a, b) = -2.5
+-a = (-1.00, -2.00)
+after 4 steps: (2.00, -6.00)
+equal: true
+> Foo.add(Bar) was called
+Foo + Bar = FooBar
+> Bar.add(Foo) was called
+Bar + Foo = BarFoo
+p = [1, 2, 0, 0, 7], p[10] = 0, sum = [1, 2, 3, 0, 7]
+!Flags(0b1010_0000) = Flags(95)

@@ -1,0 +1,26 @@
+0
+1..6 squared [1, 4, 9, 16, 25], 1..=6 [1, 2, 3, 4, 5, 6]
+letters abcde
+vV wW xX yY 
+greek ['α', 'β', 'γ', 'δ', 'ε']
+countdown [10, 7, 4, 1]
+step 4 [1, 5, 9, 13, 17]
+3... 2... 1... liftoff
+every fifth letter afkpuz
+negative range [-3, -2, -1, 0, 1, 2], len 6
+empty range count 0, contains true false
+hello Bob
+hello Frank
+there is a rustacean among us!
+names still usable: ["Bob", "Frank", "Ferris"]
+curved scores [75, 90, 97]
+Bob:human Frank:human Ferris:crab 
+0 => zero
+1 => one
+2 => two
+  1  2  3  4
+  2  4  6  8
+  3  6  9 12
+sum of multiples of 3 or 5 up to 100: 2418
+(2,6) (2,5) (1,4) (1,3) (0,2) (0,1) 
+0=104 1=101 2=121 

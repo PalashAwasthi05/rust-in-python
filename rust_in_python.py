@@ -9950,7 +9950,12 @@ class Ownership:
         if place.holder:
             return "deref_move"
         if place.local.shared_capture:
-            return "capture_move"
+            # Moving a captured variable makes a non-move closure capture it by value, as Rust infers.
+            key = place.local.token.key
+            self.function.captures = tuple(replace(capture, by_move=True) if capture.name.key == key else capture
+                                           for capture in self.function.captures)
+            self.function.consumes_captures = True
+            return "move"
         if place.local in self.owned_captures:
             self.function.consumes_captures = True
         if place.local in self.guarded or any(place.overlaps(item) for item in self.guard_borrows):
@@ -14392,6 +14397,14 @@ def rust_align_of(interpreter, result):
 @intrinsic
 def rust_size_of_val(interpreter, result, value):
     target = map_of(value)
+    if isinstance(target, FunctionValue):
+        if not target.name.startswith("@closure:"):
+            return 8
+        # A closure's size is its captures: values it owns, or one pointer per borrowed capture.
+        size = 0
+        for capture in interpreter.program.functions[target.name].captures:
+            size += rust_layout(interpreter, capture.annotation)[0] if capture.by_move else 8
+        return size
     if isinstance(target, str):
         return len(target.encode())
     if isinstance(target, ArrayValue):

@@ -1,0 +1,37 @@
+0
+31 days in January
+Alice, this is Bob. Bob, this is Alice.
+the quick brown fox jumps over the lazy dog
+Lisbon has 545923 people
+[     right]
+[left      ]
+[  center  ]
+[****star****]
+[------42] [42______]
+[   dyn] [      7]
+[  local  ]
+[+17] [-17] [00042] [00042]
+[2] [3.14] [   2.718] [10.0    ] [+0.3333]
+[1.235] [9.9]
+[1.5e3] [2.5E-4] [6.02e23]
+[fe] [FE] [0xfe] [10] [0o10] [101] [0b101]
+[0x00000bee] [00010011] [  0x1f]
+display: tab	here  debug: "tab\there"
+chars: q 'q' '\n'
+{literal braces} {inside}
+unicode "héllo" len 6
+(1, "two", 3.0, ['a', 'b'])
+(
+    1,
+    "two",
+    3.0,
+    [
+        'a',
+        'b',
+    ],
+)
+Some(5) None Ok(1)
+   1|2   | 3   (len 14)
+01. apple |02. fig   |03. kiwi  |
+print! without newline, then a newline
+3.142    3.14159 3.14      | 3.1415927

@@ -1,0 +1,17 @@
+0
+the longest string is long string is long
+first_of outlives temp: long string is long
+first word: "hello"
+after add_one: 4
+x is borrowed in Borrowed(18)
+x and y are borrowed in NamedBorrowed { x: 18, y: 15 }
+x is borrowed in Ref(18)
+y is *not* borrowed in Num(15)
+Borrowed describes itself as big
+found Some("brown") and long words ["quick", "brown", "jumps"] after highlighter dropped
+print_ref: t is Ref(7)
+the product is 6
+2 is the first
+static_string: I'm in read-only memory
+coerced_static: 18
+NUM: 18 stays accessible!

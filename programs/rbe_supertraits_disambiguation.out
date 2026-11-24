@@ -1,0 +1,14 @@
+0
+My name is Ada and I attend Cambridge. My favorite language is Rust. My Git username is ada-l
+username "rustacean", age 28
+via UFCS: rustacean 28
+*waving arms furiously*
+This is your captain speaking.
+Up!
+*waving arms furiously*
+ids: human pilot wizard
+Slab { w: 2.0, h: 3.0, d: 0.5 } has area 6.00
+volume 3
+string method via path: abc
+i32 via trait path: -12
+default via path: []

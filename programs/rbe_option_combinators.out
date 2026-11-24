@@ -1,0 +1,22 @@
+0
+Mmm. I love Cooked(Apple)
+Mmm. I love Cooked(Carrot)
+Oh no! It wasn't edible.
+Mmm. I love Cooked(Potato)
+Oh no. We don't get to eat CordonBleu.
+Yay! We get to eat Steak.
+Oh no. We don't get to eat Sushi.
+area code: Some(61)
+jobless area code: None
+number: Some(439222222)
+or: Some(Apple)
+or_else: Some(Carrot)
+get_or_insert: Steak, basket now Some(Steak)
+get_or_insert_with then mutate: Some(42)
+unwrap_or 5 unwrap_or_default 0 unwrap_or_else 4
+filter: Some(4) None
+zip: Some((1, 'a')) xor: Some(1) None
+ok_or: Ok(3) Err("none")
+map_or: 50 0
+parsed [Some(3), None, Some(7)] all None flattened [3, 7]
+as_ref/as_deref: Some(2) Some("yo")

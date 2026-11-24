@@ -1,0 +1,33 @@
+0
+u8 range 0..=255, i8 range -128..=127
+checked_add(5) = Some(255), checked_add(6) = None
+wrapping_add(10) = 4
+saturating_add(10) = 255
+overflowing_add(10) = (4, true)
+checked_sub from 0u8: None
+saturating_sub from 0u8: 0
+wrapping_sub from 0u8: 255
+i32::MAX = 2147483647
+wrapping_add 1 = -2147483648
+checked_mul 2 = None
+saturating_mul 2 = 2147483647
+overflowing_mul 2 = (-2, true)
+i32::MIN.checked_abs() = None
+i32::MIN.wrapping_abs() = -2147483648
+i32::MIN.checked_neg() = None
+i32::MIN / -1 checked = None
+10 / 0 checked = None
+checked_rem 0 = None
+pow: Some(2147483648) None 217
+shifts: Some(2147483648) None 2
+average safe? Some(1431655765)
+average ok: Some(20)
+average empty: None
+hash("") = 0x811c9dc5
+hash("a") = 0xe40c292c
+hash("rust") = 0x1d3fbde7
+hash("Rust") = 0x9d6c0a07
+254 255 0 1 2 
+Wrapping type: 4
+sum of fifth powers to 100 = 171708332500
+float overflow: inf -inf true

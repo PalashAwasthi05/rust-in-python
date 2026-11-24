@@ -1,0 +1,16 @@
+0
+String::from: hello
+My number is Number { value: 30 }
+Into gives Number { value: 5 }, equal to From? true
+Fahrenheit(212.0)
+Fahrenheit(98.6) -> 37.0
+temperature is -40.00 C
+temperature is 21.50 C
+Rgb(0, 128, 128)
+back to hex 0x008080
+from tuple Rgb(255, 128, 0) -> 0xff8000
+Tags(["rust", "systems", "webassembly"])
+widening sum: 2
+widening sum: 4294967296
+boxed "cba" bytes [99, 98, 97]
+f64 7 i64 -3 option Some(9)

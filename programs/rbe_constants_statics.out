@@ -1,0 +1,20 @@
+0
+This is Rust
+The threshold is 10
+5 is small
+10 is small
+16 is big
+GREETING_LEN = 5, CUBE_OF_SEVEN = 343, SECONDS_IN_WEEK = 604800
+         512 bytes = 512.0 B
+        2048 bytes = 2.0 KB
+     5000000 bytes = 4.8 MB
+  3221225472 bytes = 3.0 GB
+7 is in tier 0
+150 is in tier 1
+9999 is in tier 2
+50000 is in tier 3
+demo-service v1.4.2 allows 3 users
+Triangle: 3 sides; Hexagon: 6 sides
+total sides 9
+buffer sized from const: [0, 0, 0, 0, 0, 0]
+static ref lives forever: Rust (4 chars)

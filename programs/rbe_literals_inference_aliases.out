@@ -1,0 +1,18 @@
+0
+size of `x` in bytes: 1
+size of `y` in bytes: 4
+size of `z` in bytes: 4
+size of `i` in bytes: 4
+size of `f` in bytes: 8
+inferred Vec<u8>: [5], element size 1
+inferred value type via sum: 3
+turbofish parse 42 and collect ["a", "b", "c"]
+doubled [10]
+default float 0.6666666666666666 default int 3
+5 nanoseconds + 2 inches = 7 unit?
+...
+..#
+sensor-a -> [(1, 0.5), (2, 0.75)]
+sensor-b -> [(1, 9.0)]
+callback 42 and array [20, 9]
+type size of Callback: 8

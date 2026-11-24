@@ -1,0 +1,16 @@
+0
+one foot equals Inches(12)
+one foot is smaller than one meter.
+sorted: [Version { major: 0, minor: 0, patch: 0 }, Version { major: 0, minor: 9, patch: 9 }, Version { major: 1, minor: 2, patch: 3 }, Version { major: 1, minor: 10, patch: 0 }]
+max: Some(Version { major: 1, minor: 10, patch: 0 })
+clone equal: true
+unique versions: 4
+Dolly pauses briefly... baaaaah!
+Dolly gets a haircut!
+Dolly is already naked...
+Dolly pauses briefly... baaaaah?
+Dolly pauses briefly... baaaaah!
+Cow says moooo
+Cow says mooooooo
+loudest: Cow
+size of &dyn Animal: 2 words

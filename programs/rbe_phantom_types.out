@@ -1,0 +1,9 @@
+0
+same phantom types compare: true
+debug: PhantomTuple('Q', PhantomData<f32>)
+size of PhantomData: 0, of PhantomTuple<char, f64>: 4
+one foot + one foot = 24.0 in
+one meter + one meter = 2000.0 mm
+two feet in mm plus a meter = 1609.6 mm
+GET /status with 2 header(s)
+user #7 / order #7

@@ -1,0 +1,34 @@
+0
+calling Daniel: We're sorry, the call cannot be completed as dialed.
+calling Ashley: Hello, this is Mr. Awesome's Pizza. My name is Fred.
+calling Daniel: Hi! Who is this again?
+calling Katie: Hi! Who is this again?
+calling Robert: Hi! Who is this again?
+Username("j.everyman") -> John Everyman (login #1)
+Email("j@example.test") -> John Everyman (login #4)
+Username("nobody") -> login failed
+keys desc: [Email("j@example.test"), Username("j.everyman")]
+by length: [(1, ["a", "e"]), (2, ["bb", "cc"]), (3, ["ddd"])]
+insert 4 into a: true, insert 4 again: false
+A: [1, 2, 3, 4]
+B: [2, 3, 4, 5]
+union: [1, 2, 3, 4, 5]
+difference: [1]
+intersection: [2, 3, 4]
+symmetric difference: [1, 5]
+subset true disjoint false
+--- rc_a is created ---
+reference count of rc_a: 1
+reference count of rc_b: 2
+rc_a and rc_b are equal: true
+length of the value inside rc_a: 11
+value of rc_b: Rc examples
+reference count of rc_a after rc_b dropped: 1
+weak upgrade while alive: Some(11)
+weak upgrade after drop: None
+arc strong count: 4
+holder 0 sees "the same apple"
+holder 1 sees "the same apple"
+holder 2 sees "the same apple"
+after dropping holders: 1
+make_mut on unique Arc: [1, 2, 3], ptr_eq self true

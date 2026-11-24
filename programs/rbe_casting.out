@@ -1,0 +1,36 @@
+0
+casting: 65.4321 -> 65 -> A
+1000 as u16 is: 1000
+1000 as u8 is : 232
+  -1 as u8 is : 255
+1000 mod 256 is : 232
+ 128 as i16 is: 128
+ 128 as i8 is : -128
+1000 as u8 is : 232
+ 232 as i8 is : -24
+-1i32 as u32 = 4294967295, -1i64 as u64 = 18446744073709551615
+u32::MAX as i32 = -1, i64::MIN as i32 = 0
+-5i8 as i64 = -5 (sign extended), 251u8 as i64 = 251
+0xABCD_1234u32 as u16 = 0x1234
+ 300.0 as u8 is : 255
+-100.0 as u8 is : 0
+   nan as u8 is : 0
+  9.99 as i32 is: 9
+ -9.99 as i32 is: -9
+1e20 as i64 = 9223372036854775807, -1e20 as i64 = -9223372036854775808
+inf as u16 = 65535, -inf as i16 = -32768
+u64::MAX as f32 = 18446744000000000000
+16777217 as f32 = 16777216 (precision loss)
+0.1f32 as f64 = 0.10000000149011612
+1e40f64 as f32 = inf
+i8::MIN as f64 = -128
+true as i32 = 1, false as u8 = 0
+'A' as u32 = 65, 'é' as u8 = 233, '🦀' as u32 = 0x1f980
+97u8 as char = 'a'
+char::from_u32(0x1F980) = Some('🦀'), char::from_u32(0xD800) = None
+char::from_digit(7, 10) = Some('7'), 'f'.to_digit(16) = Some(15)
+u8::try_from(300) = true
+i8::try_from(-128i32) = Ok(-128)
+usize from u16: 65535
+mixed arithmetic needs casts: 5.5
+signed offset into index: 4

@@ -1,0 +1,14 @@
+0
+3, 3, 2.6 rounded 3
+Rectangle { length: 3.0, height: 4.0 }
+rectangle area: 12, triangle area: 6
+a cardinal is red, a blue jay is blue
+Debug: `"words"`
+Display: `words`
+t: `[1, 2, 3]`
+u: `[1, 2, 3]`
+Some([1, 2, 3])
+Some("text")
+largest Some(Rectangle { length: 3.0, height: 3.0 })
+total area 15
+triangles total 8

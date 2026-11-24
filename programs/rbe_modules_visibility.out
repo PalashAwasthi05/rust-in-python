@@ -1,0 +1,16 @@
+0
+called `function()`
+called `my_mod::function()`
+called `my_mod::indirect_access()`, that
+> called `my_mod::private_function()`
+called `my_mod::nested::function()`
+called `my_mod::nested::public_function_in_my_mod()`
+> called `my_mod::nested::public_function_in_super_mod()`
+called `my_mod::public_function_in_crate()`
+called `my_mod::nested::public_function_in_nested()` / called `my_mod::function()`
+called `deeply::nested::function()`
+shadowed in block: called `deeply::nested::function()`
+the open box contains: public information
+the closed box peeks: classified information
+square side 2.5 id 7 area 6.25
+Square { side: 1.0, id: 7 }
