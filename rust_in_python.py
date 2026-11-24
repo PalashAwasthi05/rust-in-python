@@ -41,8 +41,41 @@ class RustError(Exception):
     pass
 
 
+CONST_RUNTIME_ONLY = ("unsupported constant expression", "unsupported statement in a constant block",
+                      "constant bindings require an immutable scalar value", "constant block requires a result",
+                      "scalar constant conditionals require an else branch", "const functions currently require")
+
+
+def const_runtime_only(error):
+    """Whether constant folding failed only because the body is beyond what it can evaluate symbolically."""
+    return any(message in str(error) for message in CONST_RUNTIME_ONLY)
+
+
 class RustPanic(Exception):
-    pass
+    location = None
+
+
+PANIC_PREFIXES = {"panic": "explicit panic", "unreachable": "internal error: entered unreachable code",
+                  "todo": "not yet implemented", "unimplemented": "not implemented"}
+
+
+def located_panic(message, token):
+    """A panic reported at `token`, as `#[track_caller]` functions like unwrap report their caller."""
+    error = RustPanic(message)
+    site = token.expansion_site or token
+    if site.source_file is not None and not site.source_file.startswith("<"):
+        error.location = f"{site.source_file}:{site.line}:{site.column}"
+    return error
+
+
+def macro_panic(token, rendered=None):
+    """The panic a panic-family macro raises, worded and located as rustc reports it."""
+    prefix = PANIC_PREFIXES.get(token.text, "explicit panic")
+    if rendered is None:
+        message = prefix
+    else:
+        message = rendered if token.text == "panic" else f"{prefix}: {rendered}"
+    return located_panic(message, token)
 
 
 class ProcessExit(Exception):
@@ -740,7 +773,7 @@ class MacroExpander:
         if len(items) == 1 and isinstance(item, OpaqueFragment):
             return fragment == item.fragment or {fragment, item.fragment} <= {"expr", "expr_2021"} or (
                 fragment == "pat" and item.fragment == "pat_param"
-            )
+            ) or (item.fragment == "literal" and fragment in {"expr", "expr_2021", "pat", "pat_param"})
         if fragment == "ident":
             return isinstance(item, Token) and item.text != "_" and is_identifier(item.text)
         if fragment == "lifetime":
@@ -1167,7 +1200,7 @@ PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "St
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
 macro_rules! assert {
-    ($condition:expr $(,)?) => {{ if !$condition { panic!("assertion failed"); } }};
+    ($condition:expr $(,)?) => {{ if !$condition { panic!("assertion failed: {}", stringify!($condition)); } }};
     ($condition:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
         if !$condition { panic!($format $(,$argument)*); }
     }};
@@ -1176,19 +1209,34 @@ macro_rules! assert_eq {
     ($left:expr, $right:expr $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left != *right { panic!("assertion failed: left != right"); }
+        if !(*left == *right) {
+            panic!("assertion `left == right` failed\n  left: {:?}\n right: {:?}", left, right);
+        }
     }};
     ($left:expr, $right:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left != *right { panic!($format $(,$argument)*); }
+        if !(*left == *right) {
+            panic!("assertion `left == right` failed: {}\n  left: {:?}\n right: {:?}",
+                   format!($format $(,$argument)*), left, right);
+        }
     }};
 }
 macro_rules! assert_ne {
     ($left:expr, $right:expr $(,)?) => {{
         let left = &$left;
         let right = &$right;
-        if *left == *right { panic!("assertion failed: left == right"); }
+        if *left == *right {
+            panic!("assertion `left != right` failed\n  left: {:?}\n right: {:?}", left, right);
+        }
+    }};
+    ($left:expr, $right:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let left = &$left;
+        let right = &$right;
+        if *left == *right {
+            panic!("assertion `left != right` failed: {}\n  left: {:?}\n right: {:?}",
+                   format!($format $(,$argument)*), left, right);
+        }
     }};
 }
 macro_rules! debug_assert {
@@ -1216,6 +1264,18 @@ macro_rules! matches {
     ($value:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
         match $value { $pattern $(if $guard)? => true, _ => false }
     }};
+}
+macro_rules! dbg {
+    () => { eprintln!("[{}:{}:{}]", file!(), line!(), column!()) };
+    ($value:expr $(,)?) => {
+        match $value {
+            value => {
+                eprintln!("[{}:{}:{}] {} = {:#?}", file!(), line!(), column!(), stringify!($value), &value);
+                value
+            }
+        }
+    };
+    ($($value:expr),+ $(,)?) => { ($(dbg!($value)),+,) };
 }
 """
 
@@ -1978,7 +2038,8 @@ class Modules:
                 return declared[path]
             definitions = declared[path] = {}
             unit = self.units[path]
-            macros = builtins | expander.module_macros.get(unit.path, {})
+            # #[macro_export] macros live in the crate root's namespace, so bare names resolve there.
+            macros = builtins | (exports if not unit.path else {}) | expander.module_macros.get(unit.path, {})
             macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
                            for item in unit.imports if self.is_macro_import(unit, item)})
             previous = expander.qualified
@@ -2077,6 +2138,7 @@ class Function:
     visible_from: tuple = ()
     captures: tuple = ()
     consumes_captures: bool = False
+    const_value: object = None
     where_bounds: tuple = ()
 
 
@@ -3784,11 +3846,12 @@ class Parser:
                 self.expect(":")
                 annotation = self.type_name()
                 body = None
+                folded = None
                 if self.accept("="):
                     body = self.expression()
                     if annotation in CONST_VALUE_TYPES:
                         try:
-                            self.const_expression(body)
+                            folded = self.const_expression(body, annotation)
                         except RustError:
                             pass
                 elif not declaration:
@@ -3796,6 +3859,12 @@ class Parser:
                 self.expect(";")
                 function = Function(internal, [], annotation, body,
                                     type_parameters=tuple(self.type_parameters.values()), associated_const=True)
+                if isinstance(folded, ConstValue) and not self.type_parameters:
+                    # Folded so `Type::CONST` can be used as a pattern.
+                    function.const_value = ConstValue(folded.value, annotation)
+                elif body is not None and annotation in CONST_VALUE_TYPES and not self.type_parameters:
+                    # It may name constants of impls not yet parsed; fold it when a pattern needs it.
+                    function.const_value = functools.partial(self.const_expression, body, annotation)
             else:
                 function = self.function(internal, method=True, declaration=declaration or self.in_std)
             function.visible_from = visible
@@ -4413,8 +4482,8 @@ class Parser:
             return self.closure(token, self.advance().text if word == "move" else word)
         if word == "<":
             owner = self.type_name()
-            self.expect("as")
-            trait = self.trait_path()
+            # `<T>::member` names an inherent or trait member of T without naming the trait.
+            trait = self.trait_path() if self.accept("as") else None
             self.expect(">")
             self.expect("::")
             member = self.identifier()
@@ -4550,6 +4619,9 @@ class Parser:
                     raise self.current.error("expected a macro delimiter")
                 if word in {"panic", "unreachable", "unimplemented", "todo"}:
                     return Expr("panic", token, self.arguments(opening))
+                if word == "format_args":
+                    # fmt::Arguments is modelled by the String it would display as.
+                    word, token = "format", replace(token, text="format")
                 if word in {"println", "print", "eprintln", "eprint", "format"}:
                     return Expr("format" if word == "format" else "print", token, self.arguments(opening))
                 if not self.fragment:
@@ -4725,9 +4797,14 @@ class Parser:
         if (function.type_parameters or function.result not in CONST_VALUE_TYPES
                 or any(kind not in CONST_VALUE_TYPES or name.text.startswith("@param:")
                        for name, _, kind in function.params)):
-            raise function.name.error("const functions currently require scalar parameters and a scalar result")
+            # Beyond scalar constant folding, a const fn still runs as an ordinary function.
+            return
         arguments = tuple(TypeParameter(name.text, const_type=kind) for name, _, kind in function.params)
-        self.const_function_body(function, arguments)
+        try:
+            self.const_function_body(function, arguments)
+        except RustError as error:
+            if not const_runtime_only(error):
+                raise
 
     def const_function_body(self, function, arguments, *, defer_const=False):
         token = function.name
@@ -4768,7 +4845,11 @@ class Parser:
                 return self.statics[expr.token.text]
             owner, separator, member = expr.token.text.rpartition("::")
             program = getattr(self, "current_program", None)
-            if separator and program is not None:
+            if expr.qualified and expr.qualified[1] is None and not separator:
+                # `Self::LIMIT` inside an inherent impl.
+                target = expr.qualified[0]
+                owner, separator, member = target.name if isinstance(target, AppliedType) else target, "::", expr.token.text
+            if separator and program is not None and isinstance(owner, str):
                 # `Config::MAX_USERS` reads an associated constant of an inherent impl.
                 for impl in program.impls:
                     target = impl.target.name if isinstance(impl.target, AppliedType) else impl.target
@@ -4784,7 +4865,13 @@ class Parser:
                 raise expr.token.error("incompatible const function arguments")
             arguments = tuple(read(arg, kind)
                               for arg, (_, _, kind) in zip(expr.args, function.params))
-            return parser.const_function_body(function, arguments, defer_const=defer_const)
+            try:
+                return parser.const_function_body(function, arguments, defer_const=defer_const)
+            except RustError as error:
+                if not const_runtime_only(error):
+                    raise
+                # Loops and mutable locals are evaluated by running the function at first use.
+                raise expr.token.error("unsupported constant expression") from error
         if expr.kind == "block":
             statements, tail = expr.args
             if tail is None:
@@ -4985,12 +5072,13 @@ class Parser:
         separator = self.accept("..") or self.accept("..=")
         if separator is None:
             return first
-        if first is not None and first.kind != "literal":
+        # A `Type::CONST` bound is resolved to its value when the pattern is checked.
+        if first is not None and first.kind != "literal" and not (first.kind == "pattern_unit" and "::" in first.token.text):
             raise first.token.error("expected an integer range bound")
         last = None
         if self.current.text not in {",", ")", "]", "}", "=>", "if", "|", "=", ":"}:
             last = self.simple_pattern()
-        if last is not None and last.kind != "literal":
+        if last is not None and last.kind != "literal" and not (last.kind == "pattern_unit" and "::" in last.token.text):
             raise last.token.error("expected an integer range bound")
         if last is None and first is None and separator.text == "..":
             return Expr("rest", separator)
@@ -5050,7 +5138,7 @@ class Parser:
             path, type_arguments = replace(variant, text=f"{owner}::{variant.text}"), None
         elif token.text not in {"crate", "self", "super"} and (
             not is_identifier(token.text) or token.text in self.reserved
-        ):
+        ) and not (self.fragment and token.text == "Self" and self.current.text == "::"):
             raise token.error("expected a pattern")
         else:
             path, type_arguments = self.expression_path(token)
@@ -6871,6 +6959,25 @@ class Checker:
         else:
             yield annotation
 
+    def associated_constant(self, path):
+        """The folded scalar value of an inherent `Type::CONST`, for use as a pattern."""
+        owner, separator, member = path.rpartition("::")
+        if not separator:
+            return None
+        for impl in self.program.impls:
+            target = impl.target.name if isinstance(impl.target, AppliedType) else impl.target
+            method = impl.methods.get(member)
+            if impl.trait is None and target == owner and method is not None and method.associated_const:
+                if callable(method.const_value):
+                    try:
+                        folded = method.const_value()
+                    except RustError:
+                        folded = None
+                    method.const_value = (ConstValue(folded.value, method.result)
+                                          if isinstance(folded, ConstValue) else None)
+                return method.const_value
+        return None
+
     def constructor(self, expr, style, expected=None):
         token = expr.token
         ctor = self.program.constructors.get(token.text)
@@ -6934,6 +7041,11 @@ class Checker:
 
     def prepare_pattern(self, expr, annotation, *, borrowed=None):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "pattern_unit" and token.text not in self.program.constructors:
+            constant = self.associated_constant(token.text)
+            if constant is not None:
+                return self.prepare_pattern(Expr("literal", token, (constant.kind, constant.value)), annotation,
+                                            borrowed=borrowed)
         annotation = self.resolve(annotation)
         unit = self.program.constructors.get(token.text) if kind == "bind" else None
         structural = kind not in {"bind", "wild", "or"} or (unit and unit.style == "unit")
@@ -6994,6 +7106,15 @@ class Checker:
             return Pattern(tag=(actual, value)), {}
         if kind == "pattern_range":
             first, last, inclusive = args
+            endpoints = []
+            for endpoint in (first, last):
+                if endpoint is not None and endpoint.kind == "pattern_unit":
+                    constant = self.associated_constant(endpoint.token.text)
+                    if constant is None:
+                        raise endpoint.token.error("expected an integer range bound")
+                    endpoint = Expr("literal", endpoint.token, (constant.kind, constant.value))
+                endpoints.append(endpoint)
+            first, last = endpoints
             scalar = self.resolve(annotation)
             if scalar in FLOAT_TYPES or (isinstance(scalar, TypeVariable) and any(
                 endpoint and endpoint.args[0] in FLOAT_TYPES for endpoint in (first, last)
@@ -7874,6 +7995,16 @@ class Checker:
             actual = self.type_of(operand, scope, hint)
             if actual == NEVER:
                 return NEVER
+            if isinstance(self.resolve(actual), ReferenceType):
+                # `-n` and `!flag` on a borrowed scalar use the `Neg`/`Not` impls for references.
+                peeled, wrapped = self.resolve(actual), operand
+                while isinstance(peeled, ReferenceType) and self.numeric_like(peeled.inner):
+                    wrapped = Expr("deref", wrapped.token, (wrapped, False))
+                    self.program.expr_types[id(wrapped)] = peeled.inner
+                    peeled = self.resolve(peeled.inner)
+                if wrapped is not operand:
+                    operand, actual = wrapped, peeled
+                    expr.args = (operand, *args[1:])
             if self.overloadable(actual):
                 trait, method = UNARY_TRAITS[token.text]
                 return self.operator_call(expr, scope, expected, trait, method, (operand,), actual)
@@ -9152,6 +9283,13 @@ class Checker:
                   and self.trait_available(owner, trait.name.text, expr.token)]
         if len(traits) == 1:
             return self.trait_call(expr, scope, expected, owner, traits[0], name)
+        if not traits and expr.kind == "call" and expr.args and isinstance(owner, (SliceType, ArrayType)):
+            # `<[T]>::len(&items)` calls a built-in slice method with an explicit receiver.
+            receiver = self.type_of(expr.args[0], scope, ReferenceType(owner, False))
+            self.require(receiver, ReferenceType(owner, False), expr.token)
+            self.pretyped[id(expr.args[0])] = receiver
+            expr.kind, expr.qualified = "method", None
+            return self.check_expr(expr, scope, expected)
         raise expr.token.error(f"unknown or ambiguous associated function {name!r} for {owner}")
 
     def literal_variable(self, expr):
@@ -10612,8 +10750,9 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
         return BITWISE[word](left, right)
     if word in SHIFTS:
         if not 0 <= right < INTEGER_WIDTHS[integer]:
-            message = "shift amount is outside the integer width"
-            raise RustPanic(message) if runtime else token.error(message)
+            if runtime:
+                raise RustPanic(f"attempt to shift {'left' if word == '<<' else 'right'} with overflow")
+            raise token.error("shift amount is outside the integer width")
         if not runtime:
             checked(left, token, integer)
         return truncate_integer(left << right, integer) if word == "<<" else left >> right
@@ -10621,14 +10760,33 @@ def binary(word, left, right, token, integer="i32", *, runtime=False):
         checked(left, token, integer)
         checked(right, token, integer)
     if word in ARITHMETIC:
-        return checked(ARITHMETIC[word](left, right), token, integer, runtime=runtime)
+        value = ARITHMETIC[word](left, right)
+        if runtime and integer in INTEGER_BOUNDS and not INTEGER_BOUNDS[integer][0] <= value < INTEGER_BOUNDS[integer][1]:
+            raise RustPanic(f"attempt to {RUNTIME_OPERATIONS.get(word, 'compute')} with overflow")
+        return checked(value, token, integer, runtime=runtime)
     if right == 0:
-        raise RustPanic("division by zero") if runtime else token.error("division by zero")
+        if runtime:
+            raise RustPanic("attempt to divide by zero" if word == "/" else
+                            "attempt to calculate the remainder with a divisor of zero")
+        raise token.error("division by zero")
     quotient = abs(left) // abs(right)
     if (left < 0) != (right < 0):
         quotient = -quotient
+    if runtime and integer in INTEGER_BOUNDS and quotient >= INTEGER_BOUNDS[integer][1]:
+        raise RustPanic("attempt to divide with overflow" if word == "/" else
+                        "attempt to calculate the remainder with overflow")
     checked(quotient, token, integer, runtime=runtime)
     return quotient if word == "/" else left - quotient * right
+
+
+RUNTIME_OPERATIONS = {"+": "add", "-": "subtract", "*": "multiply"}
+
+
+def negated(value, integer):
+    lower, upper = INTEGER_BOUNDS[integer]
+    if not lower <= -value < upper:
+        raise RustPanic("attempt to negate with overflow")
+    return -value
 
 
 def decimal_float(value):
@@ -10973,7 +11131,7 @@ class Interpreter:
         if len(values) == 1:
             value = plain(values[0])
             if symbol == "-":
-                return rounded_float(-value, kind) if kind in FLOAT_TYPES else checked(-value, token, kind, runtime=True)
+                return rounded_float(-value, kind) if kind in FLOAT_TYPES else negated(value, kind)
             return (not value) if kind == "bool" else complement(value, kind)
         left, right = map(plain, values)
         if kind == STRING:
@@ -11515,6 +11673,12 @@ class Interpreter:
             start = self.eval(first, scope) if first else 0
             stop = self.eval(last, scope) + int(inclusive) if last else length
             if not 0 <= start <= stop <= length:
+                if utf8 is None and start > stop:
+                    raise RustPanic(f"slice index starts at {start} but ends at {stop}")
+                if utf8 is None and last is None:
+                    raise RustPanic(f"range start index {start} out of range for slice of length {length}")
+                if utf8 is None:
+                    raise RustPanic(f"range end index {stop} out of range for slice of length {length}")
                 raise RustPanic(f"slice range {start}..{stop} is out of bounds for length {length}")
             if utf8 is not None:
                 if any(offset < length and utf8[offset] & 0xC0 == 0x80 for offset in (start, stop)):
@@ -11662,10 +11826,15 @@ class Interpreter:
                 return value.fields[0]
             if token.text == "unwrap_or":
                 return supplied[0]
-            message = display(supplied[0], False) if token.text == "expect" else f"called {token.text} on {actual}"
+            if token.text == "expect":
+                message = display(supplied[0], False)
+            elif actual == "None":
+                message = "called `Option::unwrap()` on a `None` value"
+            else:
+                message = f"called `Result::{token.text}()` on an `{actual}` value"
             if actual == "Err":
                 message += f": {display(value.fields[0], True)}"
-            raise RustPanic(message)
+            raise located_panic(message, token)
         if kind == "vector_method":
             address = self.eval(args[0], scope)
             if token.text in {"as_slice", "as_mut_slice"}:
@@ -11953,7 +12122,7 @@ class Interpreter:
             if token.text == "-":
                 if annotation in FLOAT_TYPES:
                     return rounded_float(-value, annotation)
-                return checked(-value, token, annotation, runtime=True)
+                return negated(value, annotation)
             return complement(value, annotation)
         if kind == "scalar_cast":
             value, target = args
@@ -12064,7 +12233,7 @@ class Interpreter:
         if kind in {"print", "panic", "format"}:
             if not args:
                 if kind == "panic":
-                    raise RustPanic(token.text)
+                    raise macro_panic(token)
                 print(file=sys.stderr if token.text == "eprintln" else self.stdout)
                 return None
             template, *values = args
@@ -12088,7 +12257,7 @@ class Interpreter:
                     if ungroup(value_expr).kind not in {"name", "field", "index", "deref", "literal", "borrow"}:
                         self.drop_value(value)
             if kind == "panic":
-                raise RustPanic(rendered)
+                raise macro_panic(token, rendered)
             if kind == "format":
                 return rendered
             destination = sys.stderr if token.text in {"eprint", "eprintln"} else self.stdout
@@ -14597,7 +14766,8 @@ def main():
         print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
         return 1
     except RustPanic as error:
-        print(f"{label}: {error}", file=sys.stderr)
+        print(f"\nthread 'main' panicked at {error.location or label}:\n{error}\n"
+              "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace", file=sys.stderr)
         return 101
     except RecursionError:
         print(f"{label}: Python recursion limit reached", file=sys.stderr)

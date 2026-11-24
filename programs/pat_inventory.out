@@ -1,0 +1,24 @@
+0
+skip "tool:x:300": durability 300 too big
+skip "gem:ruby": unknown kind "gem"
+skip "coin:abc": abc: invalid digit found in string
+broken axe
+pristine sword
+worn pick (15%)
+hoe
+feast of pie
+apple (95 kcal)
+nothing
+1 small coin
+2 small coins
+40 coins
+empty bundle
+bundle of just 5 coins
+bundle 5 coins..7 coins [3]
+coins: 60
+foods: ["pie", "apple"]
+{"bundle": 3, "coin": 4, "food": 2, "tool": 4}
+deep 1 x
+worn tools 3
+6
+Some(3) None None

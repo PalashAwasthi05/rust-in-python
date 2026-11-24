@@ -1,0 +1,13 @@
+101
+checked: Some(255) None
+wrapping: 4
+saturating: 255
+overflowing: 4 true
+None
+-128
+None
+1! = 1
+2! = 2
+3! = 6
+4! = 24
+5! = 120

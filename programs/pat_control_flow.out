@@ -1,0 +1,15 @@
+0
+Some((1, 2))
+None
+collatz(1) = 0
+collatz(6) = 8
+collatz(7) = 16
+collatz(27) = 111
+[2, 11, 23, 97]
+block = 112
+Ok([2, 4, 6])
+Err("bad number \"x\"")
+Err("negative -3")
+count=75 i=16
+big
+[1, 2, 3, 4, 4, 6, 8, 9, 12, 16]

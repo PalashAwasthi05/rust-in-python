@@ -1,0 +1,16 @@
+0
+LIMIT=50 FIB_20=6765
+0 -> zero
+1 -> one
+2 -> two
+3 -> three
+4 -> many
+primes [2, 3, 5, 7, 11, 13] total 41 len 6
+hello world (5 chars)
+12 = 12 B
+2048 = 2.0 KB
+5000000 = 4.8 MB
+3221225472 = 3.0 GB
+v1.4.2 max=12
+local=-16 arr_len=5
+matched square 49

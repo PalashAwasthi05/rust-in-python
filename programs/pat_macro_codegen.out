@@ -1,0 +1,10 @@
+0
+Person { name: "Ada", age: 36, email: "" }
+["name", "age", "email"] / Ada 36
+["side"]
+red Red roundtrip=Some(Red)
+green Green roundtrip=Some(Green)
+blue Blue roundtrip=Some(Blue)
+None
+10 4 21 1
+total area 10.75

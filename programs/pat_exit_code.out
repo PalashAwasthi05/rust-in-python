@@ -1,0 +1,4 @@
+3
+valid: 2 users
+record 1: group 11 references unknown user 3
+Group(11, [1, 3])

@@ -2501,3 +2501,6 @@ pub mod env {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
     }
 }
+
+// exit, ExitCode and Termination are built in; the module exists so `use std::process;` resolves.
+pub mod process {}

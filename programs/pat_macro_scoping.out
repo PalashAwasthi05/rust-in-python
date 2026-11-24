@@ -1,0 +1,18 @@
+0
+49
+Server { host: "localhost", port: 9000, verbose: true }
+4 [North, West]
+[(1, 2), (1, 3), (4, 5)]
+3 -5 unknown op mul
+Some(3) None
+9
+true false
+(10, 20)
+a=vowel Z=upper k=consonant 7=digit !=other 
+single double many 
+1x 2y 
+local macro
+empty
+greet
+3
+5 five

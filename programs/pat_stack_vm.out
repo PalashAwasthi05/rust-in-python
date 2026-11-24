@@ -1,0 +1,6 @@
+0
+countdown: ok in 40 steps, output [5, 4, 3, 2, 1, 20], stack [0]
+underflow: underflow at 2 (Add)
+badjump: BadJump(99)
+swap: ok in 5 steps, output [5], stack []
+3 10 20 1 

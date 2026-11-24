@@ -1,0 +1,7 @@
+0
+11 tokens, 2 idents, 2 additive: [Ident("x"), Eq, Num(3.5), Op('+'), Ident("y_2"), Op('*'), LParen, Num(10.0), Op('-'), Num(4.0), RParen]
+5 tokens, 1 idents, 1 additive: [Ident("f"), Arrow, Str("hi\nthere"), EqEq, Num(1000.0)]
+3 tokens, 2 idents, 0 additive: [Ident("a"), EqEq, Ident("b")]
+error in "oops $": unexpected '$'
+error in "\"never ends": unterminated string
+n := 42

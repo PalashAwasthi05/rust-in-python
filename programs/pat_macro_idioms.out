@@ -1,0 +1,17 @@
+0
+5
+0
+10
+0
+byte 7
+long -3
+text hi
+float 2.5
+Point(x=1, y=5, label=p)
+a: a1 a2 a3
+b: b4
+102
+42
+1 | two | 3.5 | c
+1,2,Fizz,4,Buzz,Fizz,7,8,Fizz,Buzz,11,Fizz,13,14,FizzBuzz
+[1, 2, 3] [4, 5] [(), ()]

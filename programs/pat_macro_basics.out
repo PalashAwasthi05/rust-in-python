@@ -1,0 +1,20 @@
+0
+3
+9
+1.5
+[("a", 1), ("b", 2), ("c", 3)]
+empty len 0
+[1, 4, 9, 16]
+v.len() = 3
+v.iter().sum::<i32>() = 6
+"lit" = "lit"
+1 + 2 * 3 = 7
+ok: v.len() == 3
+check failed: emptiness
+[0, 0, 0, 0] ['a', 'b']
+answer 42
+(0, "", false)
+a12.5truec
+x + y * (z - 1)
+line is positive: true
+1-2

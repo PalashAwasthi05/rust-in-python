@@ -1,0 +1,15 @@
+0
+ 0   Push           -> locked
+ 1 * Code("0000")   -> locked (1 bad)
+ 2 * Code("1234")   -> closed
+ 3 * Push           -> OPEN
+ 4   Push           -> OPEN
+ 5 * Pull           -> closed
+ 6 * Code("lock")   -> locked
+ 7 * Code("1")      -> locked (1 bad)
+ 8 * Code("2")      -> locked (2 bad)
+ 9 * Code("3")      -> ALARM!
+10   Code("1234")   -> ALARM!
+11 * Reset          -> locked
+12 * Code("1234")   -> closed
+alarms=2 max_bad=2 final=Closed

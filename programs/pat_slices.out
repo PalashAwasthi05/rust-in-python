@@ -1,0 +1,21 @@
+0
+[] -> empty (sum 0)
+[5] -> one: 5 (sum 5)
+[1, 2] -> pair: 1 2 (sum 3)
+[7, 3, 7] -> bookends 7 (sum 17)
+[1, 2, 3, 4, 5] -> 1..5 (3 inside) (sum 15)
+three: 60
+[(1, 2), (3, 4), (5, 0)]
+[(9, 8)]
+                go north => going north
+    take lamp from table => taking lamp from table
+   say hello there world => saying 'hello there world'
+            dance wildly => unknown verb dance
+                         => nothing
+"racecar" palindrome? true
+"level" palindrome? true
+"rust" palindrome? false
+"a" palindrome? true
+"" palindrome? true
+1 2 4
+first=1 rest=[2, 3, 4]
