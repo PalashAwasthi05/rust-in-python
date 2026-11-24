@@ -49,12 +49,13 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
 - Const generic parameters and fixed-size arrays with length inference, indexing, repeat literals, and patterns
 - Scalar `const fn` calls, inline const blocks, and conditional constant expressions
+- Immutable scalar `static` items with shared borrows and macro-expanded initializers
 - Borrowed slices, array-to-slice coercion, range indexing, and patterns on dereferenced slices
 - `Vec<T>`, `vec!`, indexing, slice views, and basic vector mutation
 - Destructuring `for` loops over ranges, arrays, vectors, borrowed slices, `Option`, and `Result`
 - Collection iterators with `iter`, `iter_mut`, `into_iter`, `rev`, and lazy `map` with closures
 - Iterator `collect` into `Vec` and `String`, plus `count` and checked integer `sum`
-- Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
+- Declarative `macro_rules!` with multiple arms, fragment forwarding, repetitions, and matcher follow-set checks
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
 - Generic associated types and const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
@@ -236,6 +237,8 @@ python3 conformance.py --json src/main.rs examples/another_root.rs
 ```
 
 Pass each crate's root source file. The interpreter loads sibling modules from their `.rs` files or `mod.rs` directories. The conformance runner records the reference compiler version and checks acceptance before comparing standard output and exit status. It exits unsuccessfully on a mismatch, crash, or timeout. Exact diagnostic text is outside the comparison.
+
+Both commands accept `--edition`, which defaults to 2021 and selects the edition rules used for declarative macro matching. For example, 2024 adds top-level const blocks and underscores to `expr` fragments.
 
 ## Scope
 

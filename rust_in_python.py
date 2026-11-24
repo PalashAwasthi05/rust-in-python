@@ -31,6 +31,9 @@ import sys
 from tempfile import TemporaryDirectory
 
 
+RUST_EDITIONS = ("2015", "2018", "2021", "2024")
+
+
 class RustError(Exception):
     pass
 
@@ -215,7 +218,7 @@ def flatten_trees(trees):
             yield from flatten_trees(tree.items)
             yield tree.closing
         elif isinstance(tree, OpaqueFragment):
-            grouped = tree.fragment in {"expr", "pat"}
+            grouped = tree.fragment in {"expr", "expr_2021", "pat", "pat_param"}
             if grouped:
                 yield replace(tree.token, text="(")
             yield from flatten_trees(tree.items)
@@ -231,6 +234,14 @@ def tree_text(tree):
     return "@opaque" if isinstance(tree, OpaqueFragment) else tree.text
 
 
+def expose_fragments(trees, fragments):
+    for tree in trees:
+        if isinstance(tree, OpaqueFragment) and tree.fragment in fragments:
+            yield from expose_fragments(tree.items, fragments)
+        else:
+            yield tree
+
+
 @dataclass(frozen=True)
 class MacroCapture:
     name: Token
@@ -244,6 +255,69 @@ class MacroRepeat:
     count: str
 
 
+MACRO_FOLLOW = {
+    "expr": {"=>", ",", ";"},
+    "expr_2021": {"=>", ",", ";"},
+    "stmt": {"=>", ",", ";"},
+    "pat": {"=>", ",", "=", "if", "in"},
+    "pat_param": {"=>", ",", "=", "|", "if", "in"},
+    "path": {"=>", ",", "=", "|", ";", ":", ">", ">>", "[", "{", "as", "where", "$block"},
+    "ty": {"=>", ",", "=", "|", ";", ":", ">", ">>", "[", "{", "as", "where", "$block"},
+}
+
+
+def matcher_starts(nodes, following):
+    """Return every token or fragment that can begin this matcher suffix."""
+    choices = set()
+    for node in nodes:
+        if isinstance(node, MacroRepeat):
+            choices.update(matcher_starts(node.body, ()))
+            if node.count == "+":
+                return choices
+        elif isinstance(node, MacroCapture):
+            choices.add("$" + node.fragment)
+            if node.fragment != "vis":
+                return choices
+        else:
+            choices.add(tree_text(node))
+            return choices
+    return choices | set(following)
+
+
+def validate_matcher(nodes, token, edition, *, following=(), bound=None):
+    if bound is None:
+        bound = set()
+    for index, node in enumerate(nodes):
+        if isinstance(node, TokenGroup):
+            validate_matcher(node.items, token, edition, bound=bound)
+            continue
+        if not isinstance(node, (MacroCapture, MacroRepeat)):
+            continue
+        successors = matcher_starts(nodes[index + 1:], following)
+        if isinstance(node, MacroRepeat):
+            if node.separator is None and None in matcher_starts(node.body, (None,)):
+                raise token.error("macro repetition can match an empty token sequence")
+            if node.count != "?":
+                successors.update({tree_text(node.separator)} if node.separator
+                                  else matcher_starts(node.body, ()))
+            validate_matcher(node.body, token, edition, following=successors, bound=bound)
+            continue
+        if node.name.text in bound:
+            raise node.name.error(f"duplicate macro matcher binding {node.name.text!r}")
+        bound.add(node.name.text)
+        permitted = MACRO_FOLLOW.get(node.fragment)
+        if node.fragment == "pat" and edition < "2021":
+            permitted = MACRO_FOLLOW["pat_param"]
+        for successor in sorted(successors):
+            if node.fragment == "vis":
+                allowed = (successor in {",", "$ident", "$ty", "$path", "&", "*", "!", "[", "(", "<"}
+                           or (successor != "priv" and IDENT.fullmatch(successor)))
+            else:
+                allowed = permitted is None or successor in permitted
+            if not allowed:
+                raise node.name.error(f"{successor!r} cannot follow macro fragment {node.fragment!r}")
+
+
 def macro_sequence(items, *, matcher):
     result = []
     index = 0
@@ -253,7 +327,7 @@ def macro_sequence(items, *, matcher):
         if isinstance(tree, TokenGroup):
             result.append(replace(tree, items=macro_sequence(tree.items, matcher=matcher)))
             continue
-        if tree.text != "$":
+        if not isinstance(tree, Token) or tree.text != "$":
             result.append(tree)
             continue
         if index >= len(items):
@@ -275,29 +349,31 @@ def macro_sequence(items, *, matcher):
                 raise tree.error("optional repetition cannot have a separator")
             result.append(MacroRepeat(macro_sequence(next_item.items, matcher=matcher), separator, count))
             continue
-        if not IDENT.fullmatch(next_item.text):
-            raise next_item.error("invalid macro metavariable")
+        if not isinstance(next_item, Token) or not IDENT.fullmatch(next_item.text):
+            raise tree.error("invalid macro metavariable")
         fragment = ""
         if matcher:
             if index + 1 >= len(items) or tree_text(items[index]) != ":":
                 raise next_item.error("macro matcher requires a fragment specifier")
             fragment = tree_text(items[index + 1])
             index += 2
-            if fragment not in {"tt", "ident", "literal", "expr", "ty", "pat", "path", "block"}:
+            if fragment not in {"block", "expr", "expr_2021", "ident", "item", "lifetime", "literal",
+                                "meta", "pat", "pat_param", "path", "stmt", "tt", "ty", "vis"}:
                 raise next_item.error(f"unsupported macro fragment {fragment!r}")
         result.append(MacroCapture(next_item, fragment))
     return tuple(result)
 
 
 class MacroExpander:
-    def __init__(self):
+    def __init__(self, edition):
+        self.edition = edition
         self.steps = 0
         self.match_steps = 0
         self.definitions = 0
         self.qualified = {}
         self.module_macros = {}
 
-    def expand(self, items, inherited=None, depth=0):
+    def expand(self, items, inherited=None, depth=0, *, item_scope=False):
         if depth > 64:
             raise next(flatten_trees(items), Token("macro", 1, 1)).error("macro expansion recursion limit reached")
         macros = dict(inherited or {})
@@ -338,9 +414,16 @@ class MacroExpander:
                 definition, rules = macro
                 expanded = self.invoke(item, rules, items[argument].items, (definition, self.steps))
                 index = argument + 1
-                result.extend(self.expand(expanded, macros, depth + 1))
-                if (expanded and tree_text(expanded[0]) in {"#", "pub", "fn", "struct", "enum", "trait", "impl", "type", "const"}
-                        and index < len(items) and tree_text(items[index]) == ";"):
+                result.extend(self.expand(expanded, macros, depth + 1, item_scope=item_scope))
+                expanded_items = expose_fragments(expanded, {"item", "vis"})
+                first = next(expanded_items, None)
+                item_start = first and tree_text(first) in {
+                    "#", "pub", "fn", "struct", "enum", "trait", "impl", "type", "const", "static", "mod", "use",
+                }
+                if item_start and tree_text(first) == "const":
+                    second = next(expanded_items, None)
+                    item_start = second is not None and tree_text(second) != "{"
+                if (item_start or (item_scope and first is None)) and index < len(items) and tree_text(items[index]) == ";":
                     index += 1
                 continue
             if (tree_text(item) == "vec" and index + 2 < len(items) and tree_text(items[index + 1]) == "!"
@@ -356,8 +439,7 @@ class MacroExpander:
             index += 1
         return tuple(result)
 
-    @staticmethod
-    def rules(group):
+    def rules(self, group):
         items = group.items
         rules = []
         index = 0
@@ -367,8 +449,9 @@ class MacroExpander:
             matcher, arrow, body = items[index:index + 3]
             if not isinstance(matcher, TokenGroup) or tree_text(arrow) != "=>" or not isinstance(body, TokenGroup):
                 raise group.opening.error("expected a macro matcher and transcriber")
-            rules.append((macro_sequence(matcher.items, matcher=True),
-                          macro_sequence(body.items, matcher=False)))
+            pattern = macro_sequence(matcher.items, matcher=True)
+            validate_matcher(pattern, matcher.opening, self.edition)
+            rules.append((pattern, macro_sequence(body.items, matcher=False)))
             index += 3
             if index < len(items):
                 if tree_text(items[index]) not in {";", ","}:
@@ -406,7 +489,7 @@ class MacroExpander:
                         continue
                     start += 1
                 for end, found in self.match(node.body, items, start, stored, (*path, count)):
-                    if end > start:
+                    if end > cursor or (node.separator is not None and end == start):
                         matches.append((end, found))
                         stack.append((end, found, count + 1))
             if node.count == "+":
@@ -414,60 +497,142 @@ class MacroExpander:
             for end, found in sorted(matches, key=lambda match: -match[0]):
                 yield from self.match(rest, items, end, found, path)
             return
-        if pos == len(items):
-            return
-        item = items[pos]
         if isinstance(node, MacroCapture):
-            length = 1 if node.fragment in {"tt", "ident", "literal", "block"} else len(items) - pos
-            if node.fragment == "literal" and tree_text(item) == "-":
-                length = min(2, len(items) - pos)
-            for end in range(pos + length, pos, -1):
+            remaining = len(items) - pos
+            minimum = 0 if node.fragment == "vis" and remaining else 1
+            length = remaining
+            if node.fragment in {"tt", "ident", "literal", "block", "lifetime"}:
+                negative = remaining and node.fragment == "literal" and tree_text(items[pos]) == "-"
+                length = min(2 if negative else 1, remaining)
+            elif node.fragment == "vis":
+                length = min(2, remaining)
+            for end in range(pos + length, pos + minimum - 1, -1):
                 part = items[pos:end]
                 if self.fragment(node.fragment, part):
                     key = (node.name.text, path)
                     if key in captures:
                         raise node.name.error(f"duplicate macro matcher binding {node.name.text!r}")
                     yield from self.match(rest, items, end, captures | {key: (node.fragment, part)}, path)
-        elif isinstance(node, TokenGroup):
+            return
+        if pos == len(items):
+            return
+        item = items[pos]
+        if isinstance(node, TokenGroup):
             if isinstance(item, TokenGroup) and node.opening.text == item.opening.text:
                 for end, found in self.match(node.items, item.items, 0, captures, path):
                     if end == len(item.items):
                         yield from self.match(rest, items, pos + 1, found, path)
-        elif isinstance(item, Token) and node.text == item.text:
+        elif isinstance(node, Token) and isinstance(item, Token) and node.text == item.text:
             yield from self.match(rest, items, pos + 1, captures, path)
 
-    @staticmethod
-    def fragment(fragment, items):
+    def fragment(self, fragment, items):
+        if not items:
+            return fragment == "vis"
         item = items[0]
         if fragment == "tt":
             return True
         if len(items) == 1 and isinstance(item, OpaqueFragment):
-            return fragment == item.fragment
+            return fragment == item.fragment or {fragment, item.fragment} <= {"expr", "expr_2021"} or (
+                fragment == "pat" and item.fragment == "pat_param"
+            )
         if fragment == "ident":
-            return isinstance(item, Token) and bool(IDENT.fullmatch(item.text))
+            return isinstance(item, Token) and item.text != "_" and bool(IDENT.fullmatch(item.text))
+        if fragment == "lifetime":
+            return isinstance(item, Token) and bool(LIFETIME.fullmatch(item.text))
         if fragment == "literal":
-            if len(items) == 2:
-                return (tree_text(item) == "-" and isinstance(items[1], Token)
-                        and items[1].text[0].isdigit())
-            return isinstance(item, Token) and (item.text[0].isdigit() or item.text.startswith('"')
-                                               or item.text in {"true", "false"})
+            token = items[-1]
+            try:
+                return isinstance(token, Token) and Parser.literal(token, negative=len(items) == 2) is not None
+            except (ValueError, RustError):
+                return False
         if fragment == "block":
             return isinstance(item, TokenGroup) and item.opening.text == "{"
+        if fragment == "vis":
+            if tree_text(item) != "pub":
+                return False
+            if len(items) == 1:
+                return True
+            group = items[1]
+            return (isinstance(group, TokenGroup) and group.opening.text == "(" and bool(group.items)
+                    and tree_text(group.items[0]) in {"self", "super", "crate", "in"})
+        if fragment in {"item", "stmt"} and self.item_fragment(items):
+            return True
+        if fragment == "item":
+            return False
         tokens = list(flatten_trees(items))
+        if not tokens:
+            return False
         first = tokens[0]
-        parser = Parser("", tokens=(*tokens, Token("", first.line, first.column)), fragment=True)
+        end = replace(first, text="")
+        if fragment == "stmt" and first.text == "let":
+            if tokens[-1].text == ";":
+                return False
+            tokens = [replace(first, text="{"), *tokens, replace(end, text=";"), replace(end, text="}")]
+            first = tokens[0]
+        parser = Parser("", tokens=(*tokens, end), fragment=True)
         try:
-            if fragment == "expr":
+            if fragment in {"expr", "expr_2021"}:
+                modern = fragment == "expr" and self.edition >= "2024"
+                if first.text == "_":
+                    return modern and len(tokens) == 1
+                if first.text == "const" and not modern:
+                    return False
                 parser.expression()
             elif fragment == "ty":
                 parser.type_name()
-            elif fragment == "pat":
+            elif fragment == "pat" and self.edition >= "2021":
                 parser.pattern()
+            elif fragment in {"pat", "pat_param"}:
+                parser.range_pattern()
             elif fragment == "path":
+                word = parser.advance()
+                if not IDENT.fullmatch(word.text):
+                    return False
+                parser.expression_path(word)
+            elif fragment == "meta":
                 parser.expression_path(parser.identifier())
+                if parser.accept("="):
+                    parser.expression()
+                elif parser.current.text == "(":
+                    parser.skip_group()
+            elif fragment == "stmt":
+                if first.text == "{":
+                    parser.block()
+                elif not parser.accept(";"):
+                    parser.expression()
             return not parser.current.text
         except RustError:
             return False
+
+    @staticmethod
+    def item_fragment(items):
+        index = 0
+        while index + 1 < len(items) and tree_text(items[index]) == "#":
+            attribute = items[index + 1]
+            if not isinstance(attribute, TokenGroup) or attribute.opening.text != "[":
+                return False
+            index += 2
+        if index < len(items) and tree_text(items[index]) == "pub":
+            index += 1
+            if index < len(items) and tree_text(items[index]) == "(":
+                index += 1
+        if index == len(items):
+            return False
+        if (tree_text(items[index]) == "const" and index + 1 < len(items)
+                and tree_text(items[index + 1]) == "fn"):
+            index += 1
+        kind = tree_text(items[index])
+        if kind not in {"fn", "mod", "use", "struct", "enum", "trait", "const", "static", "type",
+                        "impl", "macro_rules"}:
+            return False
+        if index + 2 >= len(items):
+            return False
+        if kind == "macro_rules" and (tree_text(items[index + 1]) != "!" or index + 3 >= len(items)):
+            return False
+        closing = tree_text(items[-1])
+        return (closing == ";" or (closing == "{" and kind not in {"use", "type", "const", "static"})) and (
+            Modules.item_end(items, index, kind) == len(items)
+        )
 
     @staticmethod
     def variables(nodes):
@@ -492,7 +657,7 @@ class MacroExpander:
                     key = (node.name.text, path[:level])
                     if key in captures:
                         fragment, items = captures[key]
-                        if fragment not in {"ident", "tt"}:
+                        if fragment not in {"ident", "lifetime", "tt"}:
                             yield OpaqueFragment(node.name, fragment, items)
                         else:
                             yield from items
@@ -512,8 +677,10 @@ class MacroExpander:
                     if position and node.separator is not None:
                         yield node.separator
                     yield from self.render(node.body, captures, (*path, index_in_path), mark)
-            else:
+            elif isinstance(node, Token):
                 yield replace(node, context=(*node.context, mark))
+            else:
+                yield node
 
 
 MODULE_SEPARATOR = "§"
@@ -592,13 +759,15 @@ class ModuleUnit:
 
 
 class Modules:
-    def __init__(self, trees, source_path):
+    def __init__(self, trees, source_path, edition):
         directory = Path(source_path).resolve().parent if source_path is not None else None
         root = ModuleUnit((), directory)
         self.units = {(): root}
+        self.edition = edition
         self.exported = {}
         self.macro_paths = {}
         self.constants = {}
+        self.statics = {}
         self.const_functions = {}
         self.active_const_functions = set()
         self.type_aliases = {}
@@ -623,7 +792,7 @@ class Modules:
         for position in range(index + 1, len(items)):
             item = items[position]
             word = tree_text(item)
-            if kind != "const":
+            if kind not in {"const", "static"}:
                 if word == "<":
                     angles += 1
                 elif word in {">", ">="}:
@@ -631,11 +800,12 @@ class Modules:
             if angles == 0:
                 if word == ";":
                     return position + 1
-                if kind not in {"const", "type", "use"} and isinstance(item, TokenGroup) and word == "{":
+                if kind not in {"const", "static", "type", "use"} and isinstance(item, TokenGroup) and word == "{":
                     return position + 1
         return len(items)
 
     def scan(self, unit, items, *, expanded=False):
+        items = tuple(expose_fragments(items, {"item", "vis"}))
         output = []
         index = 0
         while index < len(items):
@@ -649,6 +819,7 @@ class Modules:
                 if position >= len(items) or not isinstance(items[position], TokenGroup):
                     break
                 attribute = items[position]
+                attribute = replace(attribute, items=tuple(expose_fragments(attribute.items, {"meta"})))
                 if not inner and len(attribute.items) == 1 and tree_text(attribute.items[0]) == "macro_export":
                     export = True
                 elif (not inner and len(attribute.items) == 3
@@ -720,7 +891,7 @@ class Modules:
                 unit.imports.extend(self.import_tree(items[index + 1:end - 1], (), boundary))
                 index = end
                 continue
-            if word in {"fn", "struct", "enum", "trait", "const", "type", "impl", "macro_rules"}:
+            if word in {"fn", "struct", "enum", "trait", "const", "static", "type", "impl", "macro_rules"}:
                 end = self.item_end(items, index, word)
                 if word not in {"impl", "macro_rules"} and index + 1 < len(items):
                     name = items[index + 1]
@@ -732,7 +903,7 @@ class Modules:
                         original = unit.symbols.get(name.text)
                         if not expanded or not original or original.token is not name:
                             self.register(unit, name, kind, boundary)
-                if word == "const" or (word == "type" and expanded):
+                if expanded and word in {"const", "static", "type"}:
                     unit.declarations.append(items[index:end])
                 else:
                     if export and word == "macro_rules":
@@ -1003,7 +1174,7 @@ class Modules:
     def name_token(self, unit, token, parts, *, bare=False, type_name=False):
         symbol = self.resolve(parts, unit, token)
         if symbol:
-            if bare and len(parts) == 1 and symbol.kind not in {"unit_struct", "associated", "const"}:
+            if bare and len(parts) == 1 and symbol.kind not in {"unit_struct", "associated", "const", "static"}:
                 return token
             return replace(token, text=symbol.name)
         if len(parts) > 1:
@@ -1013,7 +1184,7 @@ class Modules:
         return token
 
     def expand(self):
-        expander = MacroExpander()
+        expander = MacroExpander(self.edition)
         builtin_items, _ = token_trees(lex(PRELUDE_MACROS))
         builtins = {}
         for index in range(0, len(builtin_items), 4):
@@ -1039,7 +1210,7 @@ class Modules:
             macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
                            for item in unit.imports if self.is_macro_import(unit, item)})
             expander.qualified = self.macro_qualifiers(unit)
-            expanded = expander.expand(unit.items, macros)
+            expanded = expander.expand(unit.items, macros, item_scope=True)
             unit.items = self.scan(unit, expanded, expanded=True)
             pending.extend(path for path in self.units if path not in visited)
         self.link_imports()
@@ -1058,6 +1229,8 @@ class Modules:
                 try:
                     if parser.accept("const"):
                         parser.constant_item()
+                    elif parser.accept("static"):
+                        parser.constant_item(static=True)
                     else:
                         parser.expect("type")
                         alias = parser.type_alias()
@@ -1550,6 +1723,7 @@ class Program:
     traits_in_scope: dict = field(default_factory=dict)
     values_in_scope: dict = field(default_factory=dict)
     constants_in_scope: dict = field(default_factory=dict)
+    statics: dict = field(default_factory=dict)
     formats: dict = field(default_factory=dict)
 
     def add_prelude(self):
@@ -1762,6 +1936,7 @@ class Parser:
         self.modules = modules
         self.unit = unit
         self.constants = modules.constants if modules else {}
+        self.statics = modules.statics if modules else {}
         self.current = next(self.tokens)
         self.type_parameters = {}
         self.argument_parameters = None
@@ -2047,9 +2222,12 @@ class Parser:
         self.type_parameters = outer_parameters
         return function
 
-    def constant_item(self):
+    def constant_item(self, *, static=False):
+        if static and (mutable := self.accept("mut")):
+            raise mutable.error("mutable static items are unsupported")
         name = self.declare_token(self.identifier())
-        if name.text in self.constants:
+        values = self.statics if static else self.constants
+        if name.text in values:
             raise name.error(f"duplicate constant {name.text!r}")
         self.expect(":")
         annotation = self.type_name()
@@ -2066,7 +2244,7 @@ class Parser:
         if annotation in INTEGER_TYPES:
             checked(value.value, name, annotation)
         self.expect(";")
-        self.constants[name.text] = ConstValue(value.value, annotation)
+        values[name.text] = ConstValue(value.value, annotation)
 
     def type_alias(self):
         name = self.declare_token(self.identifier())
@@ -2757,6 +2935,8 @@ class Parser:
             if path.text in self.constants:
                 constant = self.constants[path.text]
                 return Expr("literal", path, (constant.kind, constant.value))
+            if path.text in self.statics:
+                return Expr("static_item", path, (self.statics[path.text],))
             if allow_record and self.current.text == "{":
                 return Expr("record", path, (self.record_fields(self.expression, "name")[0],),
                             type_arguments=type_arguments)
@@ -2948,6 +3128,8 @@ class Parser:
                 return locals[expr.token.key]
             if expr.token.text in self.constants:
                 return self.constants[expr.token.text]
+            if expr.token.text in self.statics:
+                return self.statics[expr.token.text]
         if expr.kind == "call" and expr.qualified is None and expr.type_arguments is None:
             if self.modules is None or expr.token.text not in self.modules.const_functions:
                 raise expr.token.error("constant evaluation requires a const function")
@@ -3009,7 +3191,7 @@ class Parser:
             check_constant_kind(right, kind, no.token)
             choice = ConstExpression("if", (condition, left, right), kind, expr.token)
             return substitute(choice, {}, defer_const=defer_const)
-        if expr.kind == "const_value":
+        if expr.kind in {"const_value", "static_item"}:
             return expr.args[0]
         if expr.kind == "literal" and expr.args[0] in CONST_VALUE_TYPES:
             kind, value = expr.args
@@ -3142,6 +3324,7 @@ class Parser:
         return tuple(fields), rest
 
     def pattern(self, *, array_item=False):
+        self.accept("|")
         first = self.range_pattern(array_item=array_item)
         alternatives = [first]
         while self.accept("|"):
@@ -3221,6 +3404,8 @@ class Parser:
         if path.text in self.constants:
             constant = self.constants[path.text]
             return Expr("literal", path, (constant.kind, constant.value))
+        if path.text in self.statics:
+            raise path.error("a pattern binding cannot shadow a static item")
         if self.current.text == "{":
             return Expr("pattern_record", path, self.record_fields(self.pattern, "bind"),
                         type_arguments=type_arguments)
@@ -4968,6 +5153,10 @@ class Checker:
 
     def require_place(self, expr, *, write=False, allow_temporary=False):
         place = place_root(expr)
+        if place.kind == "static_item":
+            if write:
+                raise expr.token.error("cannot mutate an immutable static item")
+            return
         if place.kind == "deref":
             pointer = self.program.expr_types[id(place.args[0])]
             if pointer == NEVER:
@@ -5069,7 +5258,7 @@ class Checker:
                 value = replace(value, kind=annotation)
             expr.kind, expr.args = "const_value", (value,)
             return annotation
-        if kind == "const_value":
+        if kind in {"const_value", "static_item"}:
             return const_kind(args[0])
         if kind in {"array", "array_repeat", "vector", "vector_repeat"}:
             return self.sequence_type(expr, scope, expected)
@@ -6408,6 +6597,9 @@ class Ownership:
     def lower_address(self, expr, scope, cursor):
         if expr.kind == "group":
             return self.lower_address(expr.args[0], scope, cursor)
+        if expr.kind == "static_item":
+            place = Place(Local(expr.token, False, static=True))
+            return self.emit(cursor, "declare", place, expr.token), place
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
@@ -7446,6 +7638,7 @@ class Interpreter:
         self.functions = program.functions
         self.stdout = stdout
         self.type_arguments = {}
+        self.statics = {name: Binding(value.value, False) for name, value in program.statics.items()}
 
     def match_bindings(self, source, address):
         pattern, types = self.program.patterns[id(source)]
@@ -7607,6 +7800,8 @@ class Interpreter:
 
     def address(self, expr, scope):
         expr = ungroup(expr)
+        if expr.kind == "static_item":
+            return Address(self.statics[expr.token.text])
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
@@ -7770,6 +7965,8 @@ class Interpreter:
             return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
             return substitute(args[0], self.type_arguments).value
+        if kind == "static_item":
+            return self.statics[token.text].value
         if kind == "string":
             return display(self.eval(args[0], scope), False) if args else ""
         if kind == "to_string":
@@ -8021,7 +8218,7 @@ def render_source(trees):
     return " ".join(token.text for token in flatten_trees(trees))
 
 
-def rustc_source(source, libraries, source_path=None):
+def rustc_source(source, libraries, source_path=None, *, edition="2021"):
     # rustc's expanded text lowers standard derives and println into internal
     # library calls. Preserve those two interpreter entry points through it.
     prefix = "__rust_in_python_host"
@@ -8086,7 +8283,7 @@ def rustc_source(source, libraries, source_path=None):
     source = render_source(trees[:start]) + "\n" + macro + render_source(trees[start:])
     with TemporaryDirectory(prefix="rust-in-python-") as folder:
         directory = Path(source_path).resolve().parent if source_path is not None else folder
-        args = ["rustc", "--edition=2021", "--crate-name", "rust_in_python_input",
+        args = ["rustc", f"--edition={edition}", "--crate-name", "rust_in_python_input",
                 "--crate-type", "lib", "-Zunpretty=expanded", "-"]
         for name, library in libraries.items():
             args.extend(("--extern", f"{name}={library}"))
@@ -8159,14 +8356,17 @@ def proc_libraries(values):
     return libraries
 
 
-def compile_program(source, *, proc_extern=(), source_path=None):
+def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
+    if edition not in RUST_EDITIONS:
+        raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
-        source = rustc_source(source, proc_libraries(proc_extern), source_path)
+        source = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
     trees, end = token_trees(lex(source))
-    modules = Modules(trees, source_path)
+    modules = Modules(trees, source_path, edition)
     modules.expand()
-    program = Program(type_aliases=modules.type_aliases)
+    program = Program(type_aliases=modules.type_aliases, statics=modules.statics)
     program.add_prelude()
+    scalars = modules.constants | modules.statics
     for unit in modules.units.values():
         Parser("", tokens=(*flatten_trees(unit.items), end), modules=modules, unit=unit).parse(program)
         symbols = unit.glob_aliases | unit.aliases | unit.symbols
@@ -8175,15 +8375,15 @@ def compile_program(source, *, proc_extern=(), source_path=None):
         }
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
                                               if symbol and symbol.kind == "fn"}
-        program.constants_in_scope[unit.path] = {name: modules.constants[symbol.name] for name, symbol in symbols.items()
-                                                 if symbol and symbol.kind == "const"}
+        program.constants_in_scope[unit.path] = {name: scalars[symbol.name] for name, symbol in symbols.items()
+                                                 if symbol and symbol.kind in {"const", "static"}}
     Checker(program, modules).check()
     Ownership(program).check()
     return program
 
 
-def run(source, stdout=None, *, proc_extern=(), source_path=None):
-    program = compile_program(source, proc_extern=proc_extern, source_path=source_path)
+def run(source, stdout=None, *, proc_extern=(), source_path=None, edition="2021"):
+    program = compile_program(source, proc_extern=proc_extern, source_path=source_path, edition=edition)
     Interpreter(program, sys.stdout if stdout is None else stdout).call("main", ())
 
 
@@ -8192,6 +8392,7 @@ def main():
     parser.add_argument("source", nargs="?", help="Rust source file, or - for stdin")
     parser.add_argument("--demo", action="store_true", help="run a built-in Rust program")
     parser.add_argument("--check", action="store_true", help="check the source without running it")
+    parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for macro matching")
     parser.add_argument("--proc-extern", action="append", default=[], metavar="NAME=PATH",
                         help="load a compiled Rust procedural macro crate through rustc")
     args = parser.parse_args()
@@ -8207,7 +8408,7 @@ def main():
             source = Path(args.source).read_text(encoding="utf-8")
         source_path = None if args.demo or args.source == "-" else args.source
         operation = compile_program if args.check else run
-        operation(source, proc_extern=args.proc_extern, source_path=source_path)
+        operation(source, proc_extern=args.proc_extern, source_path=source_path, edition=args.edition)
     except (RustError, OSError, UnicodeError) as error:
         print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
         return 1

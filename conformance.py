@@ -42,7 +42,7 @@ def invoke(command, timeout, *, directory):
 
 def compare(source, *, rustc, edition, timeout):
     directory = source.parent
-    python = [sys.executable, str(INTERPRETER)]
+    python = [sys.executable, str(INTERPRETER), f"--edition={edition}"]
     report = {"source": str(source), "edition": edition}
     with TemporaryDirectory(prefix="rust-conformance-") as scratch:
         binary = Path(scratch) / "native"

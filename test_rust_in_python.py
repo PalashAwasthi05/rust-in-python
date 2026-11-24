@@ -14,6 +14,80 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("scalar statics have crate-wide storage and static borrow lifetime", """
+        macro_rules! bake { ($number:expr) => { $number + 2 }; }
+        macro_rules! block_value { () => { const { 3 } }; }
+        mod settings { pub static VALUE: u32 = bake!(40u32); }
+        use settings::VALUE;
+        const CACHED: u32 = VALUE;
+        static MIRROR: u32 = CACHED;
+        fn read() -> &'static u32 { &MIRROR }
+        fn main() {
+            let value: &'static u32 = &VALUE;
+            let adjustment = block_value!();
+            println!("{VALUE} {} {} {adjustment}", *value, read());
+        }
+    """, "42 42 42 3\n"),
+    ("macro item, visibility, and attribute fragments", """
+        macro_rules! declare {
+            ($access:vis $name:ident, $attribute:meta) => {
+                #[$attribute]
+                $access struct $name;
+            };
+        }
+        macro_rules! forward {
+            ($item:item) => { $item };
+        }
+        mod api {
+            declare!(pub(crate) Exported, derive(Debug));
+            declare!(Hidden, derive(Debug));
+            forward!(pub fn five() -> i32 { let _ = Hidden; 5 });
+        }
+        use api::{Exported, five};
+        fn main() { println!("{:?} {}", Exported, five()); }
+    """, "Exported 5\n"),
+    ("macro statement, lifetime, pattern parameter, and literal fragments", """
+        macro_rules! region {
+            ('static) => { 3 };
+            ($other:lifetime) => { 4 };
+        }
+        macro_rules! forward {
+            ($lt:lifetime) => { region!($lt) };
+        }
+        macro_rules! with_binding {
+            ($binding:stmt, $value:expr_2021) => {{ $binding; $value }};
+        }
+        macro_rules! either {
+            ($value:expr, $a:pat_param | $b:pat_param) => {
+                match $value { $a | $b => true, _ => false }
+            };
+        }
+        macro_rules! keep {
+            ($word:literal) => { $word };
+        }
+        fn main() {
+            let result = with_binding!(let n = 7, n + 1);
+            println!("{} {} {} {} {:?} {}", forward!('static), forward!('r), result,
+                     either!(2, 1 | 2), keep!(b"ok"), keep!('Ω'));
+        }
+    """, "3 4 8 true [111, 107] Ω\n"),
+    ("separated macro repetitions can capture empty visibility", """
+        macro_rules! visibility_items {
+            ($($visibility:vis),*) => {
+                $($visibility struct Unit;)*
+            };
+        }
+        macro_rules! definitions {
+            ($($visibility:vis $item:ident),*) => {
+                $($visibility struct $item;)*
+            };
+        }
+        macro_rules! tag { ($visibility:vis marker) => { 1 }; }
+        macro_rules! count { ($($visibility:vis),+) => { 0 $(+ tag!($visibility marker))+ }; }
+        visibility_items!();
+        definitions!(Open, pub Public);
+        fn main() { let _ = (Open, Public); println!("{}", count!(,pub)); }
+    """, "2\n"),
     ("numeric local types inferred from later uses", """
         fn byte(value: u8) -> u8 { value }
         fn signed(value: i8) -> i8 { value }
@@ -1805,6 +1879,38 @@ VALID = [
 ]
 
 INVALID = [
+    ("immutable statics cannot be assigned", """
+        static NUMBER: i32 = 4;
+        fn main() { NUMBER = 5; }
+    """, "cannot mutate an immutable static item"),
+    ("immutable statics cannot be mutably borrowed", """
+        static NUMBER: i32 = 4;
+        fn main() { let _ = &mut NUMBER; }
+    """, "cannot mutate an immutable static item"),
+    ("static bindings cannot be shadowed by patterns", """
+        static NUMBER: i32 = 4;
+        fn main() { let NUMBER = 5; }
+    """, "pattern binding cannot shadow a static item"),
+    ("expression fragments require a legal following token", """
+        macro_rules! next { ($value:expr [ , ]) => {}; }
+        fn main() {}
+    """, "cannot follow macro fragment 'expr'"),
+    ("macro definitions reject unseparated empty repetitions", """
+        macro_rules! definitions { ($($visibility:vis)*) => {}; }
+        fn main() {}
+    """, "can match an empty token sequence"),
+    ("macro definitions reject duplicate metavariable binding", """
+        macro_rules! same { ($name:ident, $name:ident) => {}; }
+        fn main() {}
+    """, "duplicate macro matcher binding"),
+    ("expr_2021 excludes top-level const blocks", """
+        macro_rules! pass { ($value:expr_2021) => { $value }; }
+        fn main() { println!("{}", pass!(const { 3 })); }
+    """, "no matching rule"),
+    ("ident fragments exclude the underscore placeholder", """
+        macro_rules! accept { ($value:ident) => {}; }
+        fn main() { accept!(_); }
+    """, "no matching rule"),
     ("range checking uses the inferred literal width", """
         fn byte(_: u8) {}
         fn main() { let value = 256; byte(value); }
@@ -2782,8 +2888,8 @@ class InterpreterTests(unittest.TestCase):
             ''', encoding="utf-8")
             unsupported = folder / "static_item.rs"
             unsupported.write_text('''
-                static NUMBER: i32 = 3;
-                fn main() { println!("{}", NUMBER); }
+                static NUMBERS: &[i32] = &[3];
+                fn main() { println!("{}", NUMBERS[0]); }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
@@ -2844,6 +2950,50 @@ class InterpreterTests(unittest.TestCase):
                 output = StringIO()
                 run(source, output)
                 self.assertEqual(output.getvalue(), expected)
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_macro_editions(self):
+        with TemporaryDirectory() as folder:
+            folder = Path(folder)
+            expressions = folder / "expressions.rs"
+            expressions.write_text("""
+                macro_rules! select {
+                    ($value:expr) => { 1 };
+                    (const $body:block) => { 2 };
+                    (_) => { 3 };
+                }
+                macro_rules! legacy {
+                    ($value:expr_2021) => { 4 };
+                    (const $body:block) => { 5 };
+                }
+                fn main() {
+                    println!("{} {} {}", select!(const { 3 }), select!(_), legacy!(const { 3 }));
+                }
+            """, encoding="utf-8")
+            patterns = folder / "patterns.rs"
+            patterns.write_text("""
+                macro_rules! either {
+                    ($a:pat | $b:pat) => {
+                        match 2 { $a | $b => true, _ => false }
+                    };
+                }
+                fn main() { println!("{}", either!(1 | 2)); }
+            """, encoding="utf-8")
+            runner = Path(__file__).with_name("conformance.py")
+            for edition, expected, pattern_outcome in (
+                ("2018", "2 3 5\n", "runtime_match"),
+                ("2021", "2 3 5\n", "both_rejected"),
+                ("2024", "1 1 5\n", "both_rejected"),
+            ):
+                with self.subTest(edition=edition):
+                    report = subprocess.run([sys.executable, runner, "--json", f"--edition={edition}",
+                                             expressions, patterns], text=True, capture_output=True,
+                                            timeout=15, check=False)
+                    self.assertEqual(report.returncode, 0, report.stderr or report.stdout)
+                    exprs, pats = json.loads(report.stdout)["cases"]
+                    self.assertEqual(exprs["outcome"], "runtime_match")
+                    self.assertEqual(exprs["run"]["python"]["stdout"], expected)
+                    self.assertEqual(pats["outcome"], pattern_outcome)
 
     def test_invalid_programs(self):
         for name, source, message in INVALID:
