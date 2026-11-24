@@ -57,7 +57,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Collection iterators with `iter`, `iter_mut`, `into_iter`, `rev`, and lazy `map` with closures
 - Iterator `collect` into `Vec` and `String`, plus `count` and checked integer `sum`
 - Declarative `macro_rules!` with multiple arms, fragment forwarding, repetitions, and matcher follow-set checks
-- Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
+- Shared, mutable, and boxed `dyn` objects with dynamic dispatch, associated-type bindings, supertrait upcasts, and consuming `Box<Self>` receivers
 - Generic associated types with specialized and higher-ranked equality constraints
 - Const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
@@ -250,7 +250,7 @@ Function signatures can tie reference returns, including string slices, to input
 
 Generic bodies are checked against their declared trait bounds. Const parameters support integer widths, `bool`, and `char`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax. Scalar constant evaluation supports immutable bindings, conditionals, and short-circuit boolean expressions. Recursion and mutation in constant evaluation remain open.
 
-Trait objects currently use shared or mutable references. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
+Trait objects support shared and mutable references and `Box` ownership. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
 Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual macro inheritance, `#[macro_export]`, crate-root paths, and macro re-exports work within a crate. Crate dependencies and cross-crate macro hygiene remain open.
 

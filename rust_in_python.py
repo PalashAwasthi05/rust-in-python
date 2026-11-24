@@ -687,8 +687,9 @@ MODULE_SEPARATOR = "§"
 OPTION = MODULE_SEPARATOR.join(("core", "option", "Option"))
 RESULT = MODULE_SEPARATOR.join(("core", "result", "Result"))
 VEC = MODULE_SEPARATOR.join(("alloc", "vec", "Vec"))
+BOX = MODULE_SEPARATOR.join(("alloc", "boxed", "Box"))
 STRING = MODULE_SEPARATOR.join(("alloc", "string", "String"))
-PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "String": STRING}
+PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
 macro_rules! assert {
@@ -1037,13 +1038,13 @@ class Modules:
             crate = head
             module, head, *tail = tail
             if (module, head) not in {("option", "Option"), ("result", "Result")}:
-                if crate != "std" or (module, head) not in {("vec", "Vec"), ("string", "String")}:
+                if crate != "std" or (module, head) not in {("vec", "Vec"), ("boxed", "Box"), ("string", "String")}:
                     return None
         if head in PRELUDE_TYPES and len(tail) <= 1:
             parts = tuple(PRELUDE_TYPES[head].split(MODULE_SEPARATOR))
             if tail:
                 return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{tail[0]}"), "associated", (), token)
-            return ModuleSymbol(parts, "struct" if head in {"Vec", "String"} else "enum", (), token)
+            return ModuleSymbol(parts, "struct" if head in {"Vec", "Box", "String"} else "enum", (), token)
         if head in PRELUDE_VARIANTS and not tail:
             parts = tuple(PRELUDE_VARIANTS[head].split(MODULE_SEPARATOR))
             return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{head}"), "associated", (), token)
@@ -1403,6 +1404,10 @@ class AppliedType:
 
 def is_vector(annotation):
     return isinstance(annotation, AppliedType) and annotation.name == VEC
+
+
+def is_box(annotation):
+    return isinstance(annotation, AppliedType) and annotation.name == BOX
 
 
 @dataclass(frozen=True)
@@ -1796,6 +1801,7 @@ class Program:
         self.derives[OPTION]["Default"] = self.types[OPTION][0]
         self.default_variants[OPTION] = f"{OPTION}::None"
         self.type_parameters[VEC] = (TypeParameter("T"),)
+        self.type_parameters[BOX] = (TypeParameter("T"),)
 
     def projection_trait(self, annotation):
         if annotation.trait:
@@ -1951,6 +1957,11 @@ class Program:
             return False
         if trait == "Sized":
             return not isinstance(annotation, SliceType)
+        if is_box(annotation):
+            if trait in {"Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord"}:
+                return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
+            if trait in {"Copy", "Default"}:
+                return False
         if isinstance(annotation, FunctionType):
             if annotation.closure:
                 captures = self.functions[annotation.closure].captures
@@ -2391,7 +2402,16 @@ class Parser:
         mutable = bool(self.accept("mut"))
         name = self.expect("self")
         annotation = self.self_type
-        if borrowed:
+        if self.accept(":"):
+            if borrowed:
+                raise name.error("an explicitly typed receiver cannot also use '&self' syntax")
+            annotation = self.type_name(signature=lifetimes)
+            allowed = (annotation == self.self_type
+                       or isinstance(annotation, ReferenceType) and annotation.inner == self.self_type
+                       or is_box(annotation) and annotation.arguments[0] == self.self_type)
+            if not allowed:
+                raise name.error("receiver type must be Self, a reference to Self, or Box<Self>")
+        elif borrowed:
             annotation = ReferenceType(annotation, mutable, lifetime.text if lifetime else None)
         return name, mutable and not borrowed, annotation
 
@@ -3853,6 +3873,15 @@ class DynAddress:
 
 
 @dataclass(frozen=True)
+class BoxValue:
+    address: Address
+    concrete: object
+
+    def read(self):
+        return self.address.read()
+
+
+@dataclass(frozen=True)
 class Value:
     constructor: Constructor
     fields: tuple
@@ -4967,6 +4996,9 @@ class Checker:
                 if parameter.const_type:
                     self.check_const(argument, parameter.const_type, token)
                     continue
+                if is_box(annotation) and isinstance(argument, DynType):
+                    self.check_dyn(argument, token)
+                    continue
                 self.check_type(argument, token)
                 self.generic_arguments.append((argument, token))
                 for trait in sorted(parameter.bounds):
@@ -5047,7 +5079,7 @@ class Checker:
     def type_parts(annotation, *, inline_only=False):
         if isinstance(annotation, AppliedType):
             yield annotation.name
-            if not (inline_only and annotation.name == VEC):
+            if not (inline_only and annotation.name in {VEC, BOX}):
                 for argument in annotation.arguments:
                     yield from Checker.type_parts(argument, inline_only=inline_only)
         elif isinstance(annotation, ArrayType):
@@ -5241,6 +5273,8 @@ class Checker:
                     return Pattern(binding=token.key, by_reference=True), {token.key: (reference, False)}
                 if isinstance(self.resolve(annotation), SliceType):
                     raise token.error("cannot bind an unsized slice value")
+                if isinstance(annotation, DynType):
+                    raise token.error("cannot bind an unsized trait object value")
                 if annotation == "str":
                     raise token.error("cannot bind an unsized str value")
                 return Pattern(binding=token.key), {token.key: (annotation, args[0])}
@@ -5404,7 +5438,11 @@ class Checker:
         else:
             result = self.check_expr(expr, scope, expected)
         result = self.resolve(result)
-        result = self.coerce_reference(expr, result, self.resolve(expected))
+        expected = self.resolve(expected)
+        if is_box(result) and is_box(expected) and result != expected and isinstance(expected.arguments[0], DynType):
+            self.check_dyn_conversion(result.arguments[0], expected.arguments[0], expr.token)
+            result = expected
+        result = self.coerce_reference(expr, result, expected)
         if isinstance(result, ReferenceType) and not reference_source(expr, result):
             raise expr.token.error(f"reference result from {expr.kind} is unsupported")
         self.program.expr_types[id(expr)] = result
@@ -5423,15 +5461,7 @@ class Checker:
             self.require(element, target.element, expr.token)
             conversion = "slice_reference"
         elif isinstance(target, DynType):
-            self.check_dyn(target, expr.token)
-            self.obligation(actual.inner, target.trait, expr.token)
-            traits = self.program.trait_closure({target.trait})
-            for name, kind in target.bindings:
-                owners = [trait for trait in traits if trait in self.program.traits
-                          and name in self.program.traits[trait].associated]
-                if len(owners) != 1:
-                    raise expr.token.error(f"ambiguous associated type {name!r}")
-                self.require(AssociatedType(actual.inner, name, owners[0]), kind, expr.token)
+            self.check_dyn_conversion(actual.inner, target, expr.token)
             conversion = "dyn_reference"
         else:
             return actual
@@ -5444,11 +5474,23 @@ class Checker:
         expr.args = (original, actual.inner)
         return expected
 
+    def check_dyn_conversion(self, actual, target, token):
+        self.check_dyn(target, token)
+        self.obligation(actual, target.trait, token)
+        for name, kind in target.bindings:
+            trait = self.program.associated_trait(target.trait, name)
+            if trait is None:
+                raise token.error(f"ambiguous associated type {name!r}")
+            self.require(AssociatedType(actual, name, trait.name.text), kind, token)
+
     def require_place(self, expr, *, write=False, allow_temporary=False):
         place = place_root(expr)
         if place.kind == "static_item":
             if write:
                 raise expr.token.error("cannot mutate an immutable static item")
+            return
+        if place.kind == "box_deref":
+            self.require_place(place.args[0], write=write, allow_temporary=allow_temporary)
             return
         if place.kind == "deref":
             pointer = self.program.expr_types[id(place.args[0])]
@@ -5472,8 +5514,10 @@ class Checker:
         if kind == "indirect_call":
             callee = self.type_of(args[0], scope)
             return self.indirect_type(expr, scope, expected, callee)
-        if kind in {"function_pointer", "closure_value"}:
+        if kind in {"function_pointer", "closure_value", "box"}:
             return self.program.expr_types[id(expr)]
+        if kind == "box_deref":
+            return self.type_of(args[0], scope).arguments[0]
         if kind == "try":
             value = args[0]
             enclosing = self.resolve(self.result)
@@ -5624,8 +5668,11 @@ class Checker:
             annotation = self.type_of(value, scope)
             if isinstance(annotation, ReferenceType):
                 value = Expr("deref", value.token, (value, False))
-                expr.args = (value, name)
                 annotation = self.type_of(value, scope)
+            while is_box(annotation):
+                value = Expr("box_deref", value.token, (value,))
+                annotation = self.type_of(value, scope)
+            expr.args = (value, name)
             return self.field_type(annotation, name)
         if kind == "borrow":
             value, mutable = args
@@ -5644,6 +5691,9 @@ class Checker:
             annotation = self.type_of(value, scope)
             if annotation == NEVER:
                 return NEVER
+            if is_box(annotation):
+                expr.kind, expr.args = "box_deref", (value,)
+                return annotation.arguments[0]
             if not isinstance(annotation, ReferenceType):
                 raise token.error(f"cannot dereference {annotation}")
             return annotation.inner
@@ -6029,6 +6079,8 @@ class Checker:
                 arguments = self.specialize(self.program.type_parameters[VEC], expr.type_arguments, token)
                 owner = AppliedType(VEC, tuple(arguments.values()))
             return self.vector_constructor(expr, scope, owner or expected)
+        if token.text == f"{BOX}::new":
+            return self.box_constructor(expr, scope, expected)
         if token.text in {f"{STRING}::new", f"{STRING}::from"}:
             return self.string_constructor(expr, scope, token.text.rsplit("::", 1)[-1])
         ctor = self.program.constructors.get(token.text)
@@ -6243,15 +6295,44 @@ class Checker:
                       if name in trait.methods and self.has_receiver(trait.methods[name])
                       and self.implements(base, trait.name.text)
                       and self.trait_available(base, trait.name.text, expr.token)]
+        receiver = base
+        if not candidates and is_box(base):
+            pointee = base.arguments[0]
+            candidates = [trait for trait in self.program.traits.values()
+                          if name in trait.methods and self.has_receiver(trait.methods[name])
+                          and is_box(trait.methods[name].params[0][2])
+                          and self.implements(pointee, trait.name.text)
+                          and self.trait_available(pointee, trait.name.text, expr.token)]
+            if candidates:
+                receiver = pointee
         if len(candidates) > 1:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
             trait = candidates[0]
-            if isinstance(base, DynType) and trait.methods[name].self_sized:
-                raise expr.token.error(f"method {name!r} requires Self: Sized")
-            self.program.dispatches[id(expr)] = (trait.name.text, base, name)
+            if isinstance(receiver, DynType):
+                method = trait.methods[name]
+                if method.self_sized:
+                    raise expr.token.error(f"method {name!r} requires Self: Sized")
+                if not isinstance(method.params[0][2], ReferenceType) and not is_box(method.params[0][2]):
+                    raise expr.token.error("cannot pass an unsized trait object by value")
+            self.program.dispatches[id(expr)] = (trait.name.text, receiver, name)
             return self.receiver_call(expr, scope, expected, trait.methods[name],
-                                      {trait.self_type: base}, actual)
+                                      {trait.self_type: receiver}, actual)
+        if is_box(base) and not (
+            name == "clone" and self.implements(base, "Clone")
+            or name == "to_string" and self.implements(base, "Display")
+        ):
+            if isinstance(actual, ReferenceType):
+                original = Expr("deref", original.token, (original, False))
+            item = Expr("box_deref", original.token, (original,))
+            if name in {"as_ref", "as_mut"}:
+                if rest or expr.type_arguments is not None:
+                    raise expr.token.error(f"{name} takes no arguments")
+                borrowed = Expr("borrow", expr.token, (item, name == "as_mut"))
+                expr.kind, expr.args = "group", (borrowed,)
+                return self.type_of(borrowed, scope, expected)
+            expr.args = (item, *rest)
+            return self.method_type(expr, scope, expected)
         if name == "clone" and not rest:
             expr.kind = "clone"
             return self.check_expr(expr, scope, expected)
@@ -6295,6 +6376,32 @@ class Checker:
             raise expr.token.error("Vec::new takes no arguments")
         expr.kind = "vector"
         return self.sequence_type(expr, scope, expected)
+
+    def box_constructor(self, expr, scope, expected):
+        token = expr.token
+        if len(expr.args) != 1:
+            raise token.error("Box::new takes one value argument")
+        hinted = self.resolve(expected)
+        inner = hinted.arguments[0] if is_box(hinted) else None
+        if expr.type_arguments is not None:
+            parameters = self.program.type_parameters[BOX]
+            if any(isinstance(argument, DynType) for argument in expr.type_arguments):
+                raise token.error("Box::new requires a sized value")
+            inner = self.specialize(parameters, expr.type_arguments, token)[parameters[0]]
+        if isinstance(inner, DynType):
+            inner = None
+        value = self.type_of(expr.args[0], scope, inner)
+        if inner is not None:
+            self.require(value, inner, token)
+        if value == NEVER:
+            expr.kind = "group"
+            return NEVER
+        if isinstance(value, DynType):
+            raise token.error("Box::new requires a sized value")
+        result = AppliedType(BOX, (self.resolve(value),))
+        self.check_type(result, token)
+        expr.kind = "box"
+        return result
 
     def string_constructor(self, expr, scope, name):
         count = int(name == "from")
@@ -6894,6 +7001,8 @@ class Ownership:
         if expr.kind == "static_item":
             place = Place(Local(expr.token, False, static=True))
             return self.emit(cursor, "declare", place, expr.token), place
+        if expr.kind == "box_deref":
+            return self.lower_address(expr.args[0], scope, cursor)
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
@@ -7218,7 +7327,7 @@ class Ownership:
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
             return cursor
-        if kind in {"group", "field", "unary", "deref", "scalar_cast"}:
+        if kind in {"group", "field", "unary", "deref", "scalar_cast", "box", "box_deref"}:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
@@ -7818,7 +7927,7 @@ def format_float(value, debug):
 
 
 def pretty_debug(value, indent=0):
-    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
         value = value.read()
     if isinstance(value, ArrayValue) and value.items:
         opening, closing = "[", "]"
@@ -7874,7 +7983,7 @@ def format_value(value, annotation, spec):
 
 
 def display(value, debug):
-    if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
+    if isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
         return display(value.read(), debug)
     if isinstance(value, ArrayValue):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
@@ -7956,6 +8065,8 @@ class Interpreter:
         if isinstance(value, IteratorValue):
             collection = value.collection if value.borrowed else self.clone_value(value.collection)
             return replace(value, collection=collection, mappers=tuple(map(self.clone_value, value.mappers)))
+        if isinstance(value, BoxValue):
+            return BoxValue(Address(Binding(self.clone_value(value.read()), True)), value.concrete)
         if isinstance(value, ArrayValue):
             return ArrayValue(tuple(map(self.clone_value, value.items)))
         if isinstance(value, Value):
@@ -8044,9 +8155,9 @@ class Interpreter:
         return Value(ctor, tuple(self.default_value(kind) for _, kind in ctor.fields))
 
     def compare(self, left, right):
-        while isinstance(left, (Address, DynAddress, SliceAddress, StringAddress)):
+        while isinstance(left, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
             left = left.read()
-        while isinstance(right, (Address, DynAddress, SliceAddress, StringAddress)):
+        while isinstance(right, (Address, DynAddress, SliceAddress, StringAddress, BoxValue)):
             right = right.read()
         if isinstance(left, ArrayValue):
             for a, b in zip(left.items, right.items):
@@ -8096,6 +8207,13 @@ class Interpreter:
         expr = ungroup(expr)
         if expr.kind == "static_item":
             return Address(self.statics[expr.token.text])
+        if expr.kind == "box_deref":
+            value = self.eval(expr.args[0], scope)
+            annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+            if isinstance(annotation, DynType):
+                concrete = self.program.concrete_type(value.concrete)
+                return DynAddress(value.address, concrete)
+            return value.address
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
@@ -8133,6 +8251,12 @@ class Interpreter:
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "box":
+            value = self.eval(args[0], scope)
+            concrete = self.program.normalize(substitute(self.program.expr_types[id(args[0])], self.type_arguments))
+            return BoxValue(Address(Binding(value, True)), concrete)
+        if kind == "box_deref":
+            return self.address(expr, scope).read()
         if kind == "iterator_terminal":
             source = args[0]
             annotation = self.program.expr_types[id(source)]
@@ -8454,7 +8578,8 @@ class Interpreter:
                 receiver = self.program.normalize(substitute(receiver, self.type_arguments))
                 if isinstance(receiver, DynType):
                     receiver = values[0].concrete
-                    values = (values[0].address, *values[1:])
+                    if isinstance(values[0], DynAddress):
+                        values = (values[0].address, *values[1:])
                 receiver = self.program.concrete_type(receiver)
                 impl, specialized = self.program.implementation(receiver, trait)
                 if name in impl.methods:

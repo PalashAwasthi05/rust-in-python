@@ -15,6 +15,54 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("boxed self receivers consume trait objects through dynamic dispatch", """
+        trait Drain { fn take(self: Box<Self>) -> String; }
+        struct Name { text: String }
+        impl Drain for Name {
+            fn take(self: Box<Self>) -> String { self.text }
+        }
+        fn boxed() -> Box<dyn Drain> { Box::new(Name { text: String::from("hello") }) }
+        fn generic<T: Drain>(value: Box<T>) -> String { value.take() }
+        fn main() {
+            let value = boxed();
+            let direct = Box::new(Name { text: String::from("world") });
+            println!("{} {}", value.take(), generic(direct));
+        }
+    """, "hello world\n"),
+    ("owned trait objects support mutable dispatch and supertrait upcasts", """
+        trait Measure { type Value; fn read(&self) -> Self::Value; }
+        trait Meter: Measure { fn change(&mut self, n: i32); }
+        struct Small(i32);
+        struct Big(i32);
+        impl Measure for Small { type Value = i32; fn read(&self) -> i32 { self.0 } }
+        impl Measure for Big { type Value = i32; fn read(&self) -> i32 { self.0 * 10 } }
+        impl Meter for Small { fn change(&mut self, n: i32) { self.0 = n; } }
+        impl Meter for Big { fn change(&mut self, n: i32) { self.0 = n; } }
+        fn make(choose: bool) -> Box<dyn Meter<Value = i32>> {
+            if choose { Box::new(Small(2)) } else { Box::new(Big(2)) }
+        }
+        fn report(value: &dyn Measure<Value = i32>) -> i32 { value.read() }
+        fn main() {
+            let mut gauge = make(false);
+            gauge.change(3);
+            gauge.as_mut().change(4);
+            let base: Box<dyn Measure<Value = i32>> = gauge;
+            println!("{} {}", base.read(), report(base.as_ref()));
+            let small: Box<dyn Measure<Value = i32>> = Box::new(Small(8));
+            println!("{}", report(&*small));
+        }
+    """, "40 40\n8\n"),
+    ("boxes own concrete values and clone their contents", """
+        use std::boxed::Box as Owner;
+        struct Node { value: i32, next: Option<Owner<Node>> }
+        fn main() {
+            let mut concrete = Owner::<u8>::new(7);
+            let clone = concrete.clone();
+            *concrete = 9;
+            let node = Node { value: 6, next: None };
+            println!("{} {:?} {} {} {}", concrete, clone, concrete == clone, node.value, node.next.is_none());
+        }
+    """, "9 7 false 6 true\n"),
     ("higher-ranked associated equalities preserve the receiver's borrow", """
         trait Lending {
             type Item<'a> where Self: 'a;
@@ -1999,6 +2047,39 @@ VALID = [
 ]
 
 INVALID = [
+    ("boxed self receivers move their owners", """
+        trait Drain { fn take(self: Box<Self>) -> i32; }
+        struct Unit;
+        impl Drain for Unit { fn take(self: Box<Self>) -> i32 { 3 } }
+        fn main() {
+            let value: Box<dyn Drain> = Box::new(Unit);
+            let first = value.take();
+            println!("{first} {}", value.take());
+        }
+    """, "moved"),
+    ("boxing a value cannot invent a trait implementation", """
+        struct Unit;
+        trait Marker {}
+        fn make() -> Box<dyn Marker> { Box::new(Unit) }
+        fn main() {}
+    """, "Unit does not implement Marker"),
+    ("borrowing box contents prevents moving their owner", """
+        fn main() {
+            let owned = Box::new(7);
+            let borrow = owned.as_ref();
+            let moved = owned;
+            println!("{borrow} {moved}");
+        }
+    """, "borrowed"),
+    ("dynamic box contents cannot move into a by-value receiver", """
+        trait Read { fn consume(self); }
+        struct Unit;
+        impl Read for Unit { fn consume(self) {} }
+        fn main() {
+            let value: Box<dyn Read> = Box::new(Unit);
+            value.consume();
+        }
+    """, "cannot pass an unsized trait object by value"),
     ("a static associated reference does not satisfy a higher-ranked equality", """
         trait Lending {
             type Item<'a> where Self: 'a;
