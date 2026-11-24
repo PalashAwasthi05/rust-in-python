@@ -28,6 +28,7 @@ import string
 import struct
 import subprocess
 import sys
+import unicodedata
 from tempfile import TemporaryDirectory
 
 
@@ -54,7 +55,8 @@ class Token:
 
     @property
     def key(self):
-        return (self.text, self.context) if self.context else self.text
+        name = identifier_text(self.text)
+        return (name, self.context) if self.context else name
 
     def binding(self, key):
         if isinstance(key, tuple):
@@ -105,21 +107,25 @@ TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|b?r(?P<hashes>#{0,255})"[\s\S]*?"(?P=hashes)|'
     r'b?"(?:(?:\\[\s\S])|[^"\\])*"|'
     r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|[^\r\n])|[^'\\\r\n\t])'|"
-    r"'[A-Za-z_][A-Za-z_0-9]*|"
+    r"(?P<lifetime>'[A-Za-z_][A-Za-z_0-9]*)|"
     rf'{FLOAT_TOKEN}|'
     rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
-    r'[A-Za-z_][A-Za-z_0-9]*|'
+    r'(?P<identifier>[A-Za-z_][A-Za-z_0-9]*)|'
     r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%&|^\-]=|[{}()[\]#$@?.:,;=!+*/%&<>|^\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
-IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
-LIFETIME = re.compile(r"'[A-Za-z_][A-Za-z_0-9]*\Z")
 RESERVED = set("""
     as async await break const continue crate dyn else enum extern false fn for
     gen if impl in let loop match mod move mut pub ref return self Self static
     struct super trait true type unsafe use where while abstract become box do
     final macro override priv try typeof unsized virtual yield _
 """.split())
+RESERVED_BY_EDITION = {
+    "2015": RESERVED - {"async", "await", "dyn", "gen", "try"},
+    "2018": RESERVED - {"gen"},
+    "2021": RESERVED - {"gen"},
+    "2024": RESERVED,
+}
 PRECEDENCE = {
     "=": 1, "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1, "&=": 1, "|=": 1, "^=": 1, "<<=": 1, ">>=": 1,
     "||": 2, "&&": 3, "==": 4, "!=": 4, "<": 4, "<=": 4, ">": 4, ">=": 4,
@@ -145,16 +151,50 @@ for _kind, _precision, _max_exponent in (("f32", 24, 128), ("f64", 53, 1024)):
     )})
 
 
-def lex(source):
+def is_identifier(text):
+    return identifier_text(text).isidentifier()
+
+
+def identifier_text(text):
+    if text.startswith("r#") and text[2:].isidentifier():
+        return text[2:]
+    return text
+
+
+def is_string_literal(text):
+    return text.startswith(('"', 'r"')) or text.startswith("r#") and '"' in text
+
+
+def is_lifetime(text):
+    return text.startswith("'") and is_identifier(text[1:])
+
+
+def lex(source, *, edition="2021"):
     offset, line, column = 0, 1, 1
     while offset < len(source):
         match = TOKEN.match(source, offset)
-        if not match:
-            raise Token(source[offset], line, column).error(
-                f"unexpected character {source[offset]!r}"
-            )
-        word = match.group()
-        end = match.end()
+        if match is None:
+            start = offset + int(source[offset] == "'")
+            if start == len(source) or not is_identifier(source[start]):
+                raise Token(source[offset], line, column).error(f"unexpected character {source[offset]!r}")
+            end = start + 1
+        else:
+            end = match.end()
+        identifier = match is None or match.lastgroup in {"identifier", "lifetime"}
+        name_start = offset + int(source[offset] == "'")
+        raw = (identifier and (name_start == offset or edition >= "2021")
+               and source.startswith("r#", name_start) and name_start + 2 < len(source)
+               and is_identifier(source[name_start + 2]))
+        if raw:
+            end = name_start + 3
+        if identifier:
+            while end < len(source) and is_identifier("_" + source[end]):
+                end += 1
+        word = source[offset:end]
+        if identifier:
+            word = unicodedata.normalize("NFC", word)
+            if raw and identifier_text(word[name_start - offset:]) in {"_", "crate", "self", "Self", "super"}:
+                raise Token(word, line, column).error(f"{word!r} is reserved")
         if word == "/*":
             depth = 1
             for edge in COMMENT_EDGE.finditer(source, end):
@@ -311,7 +351,7 @@ def validate_matcher(nodes, token, edition, *, following=(), bound=None):
         for successor in sorted(successors):
             if node.fragment == "vis":
                 allowed = (successor in {",", "$ident", "$ty", "$path", "&", "*", "!", "[", "(", "<"}
-                           or (successor != "priv" and IDENT.fullmatch(successor)))
+                           or (successor != "priv" and is_identifier(successor)))
             else:
                 allowed = permitted is None or successor in permitted
             if not allowed:
@@ -349,7 +389,7 @@ def macro_sequence(items, *, matcher):
                 raise tree.error("optional repetition cannot have a separator")
             result.append(MacroRepeat(macro_sequence(next_item.items, matcher=matcher), separator, count))
             continue
-        if not isinstance(next_item, Token) or not IDENT.fullmatch(next_item.text):
+        if not isinstance(next_item, Token) or not is_identifier(next_item.text):
             raise tree.error("invalid macro metavariable")
         fragment = ""
         if matcher:
@@ -360,7 +400,7 @@ def macro_sequence(items, *, matcher):
             if fragment not in {"block", "expr", "expr_2021", "ident", "item", "lifetime", "literal",
                                 "meta", "pat", "pat_param", "path", "stmt", "tt", "ty", "vis"}:
                 raise next_item.error(f"unsupported macro fragment {fragment!r}")
-        result.append(MacroCapture(next_item, fragment))
+        result.append(MacroCapture(replace(next_item, text=identifier_text(next_item.text)), fragment))
     return tuple(result)
 
 
@@ -390,19 +430,19 @@ class MacroExpander:
                 if tree_text(marker) != "!" or not isinstance(name, Token) or not isinstance(body, TokenGroup):
                     raise item.error("invalid macro_rules definition")
                 self.definitions += 1
-                macros[name.text] = (self.definitions, self.rules(body))
+                macros[identifier_text(name.text)] = (self.definitions, self.rules(body))
                 result.append(replace(name, text="@macro_definition", definition=self.definitions))
                 index += 4
                 if index < len(items) and tree_text(items[index]) == ";":
                     index += 1
                 continue
-            macro = macros.get(item.text) if isinstance(item, Token) else None
+            macro = macros.get(identifier_text(item.text)) if isinstance(item, Token) else None
             argument = index + 2
             if isinstance(item, Token) and index + 4 < len(items) and tree_text(items[index + 1]) == "::":
-                path = [item.text]
+                path = [identifier_text(item.text)]
                 position = index + 1
                 while position + 1 < len(items) and tree_text(items[position]) == "::":
-                    path.append(tree_text(items[position + 1]))
+                    path.append(identifier_text(tree_text(items[position + 1])))
                     position += 2
                 macro = self.qualified.get(tuple(path))
                 argument = position + 1
@@ -536,9 +576,9 @@ class MacroExpander:
                 fragment == "pat" and item.fragment == "pat_param"
             )
         if fragment == "ident":
-            return isinstance(item, Token) and item.text != "_" and bool(IDENT.fullmatch(item.text))
+            return isinstance(item, Token) and item.text != "_" and is_identifier(item.text)
         if fragment == "lifetime":
-            return isinstance(item, Token) and bool(LIFETIME.fullmatch(item.text))
+            return isinstance(item, Token) and bool(is_lifetime(item.text))
         if fragment == "literal":
             token = items[-1]
             try:
@@ -569,7 +609,7 @@ class MacroExpander:
                 return False
             tokens = [replace(first, text="{"), *tokens, replace(end, text=";"), replace(end, text="}")]
             first = tokens[0]
-        parser = Parser("", tokens=(*tokens, end), fragment=True)
+        parser = Parser("", tokens=(*tokens, end), fragment=True, edition=self.edition)
         try:
             if fragment in {"expr", "expr_2021"}:
                 modern = fragment == "expr" and self.edition >= "2024"
@@ -586,7 +626,7 @@ class MacroExpander:
                 parser.range_pattern()
             elif fragment == "path":
                 word = parser.advance()
-                if not IDENT.fullmatch(word.text):
+                if not is_identifier(word.text):
                     return False
                 parser.expression_path(word)
             elif fragment == "meta":
@@ -776,10 +816,13 @@ class Modules:
         root.items = self.scan(root, trees)
 
     def register(self, unit, token, kind, boundary):
-        if token.text in unit.symbols:
+        if not is_identifier(token.text) or token.text in RESERVED_BY_EDITION[self.edition]:
+            raise token.error("expected an item identifier")
+        name = identifier_text(token.text)
+        if name in unit.symbols:
             raise token.error(f"duplicate item {token.text!r}")
-        symbol = ModuleSymbol((*unit.path, token.text), kind, boundary, token)
-        unit.symbols[token.text] = symbol
+        symbol = ModuleSymbol((*unit.path, name), kind, boundary, token)
+        unit.symbols[name] = symbol
         return symbol
 
     @staticmethod
@@ -826,7 +869,7 @@ class Modules:
                 elif (not inner and len(attribute.items) == 3
                       and tuple(map(tree_text, attribute.items[:2])) == ("path", "=")
                       and isinstance(attribute.items[2], Token)):
-                    if not attribute.items[2].text.startswith(('"', 'r"', 'r#')):
+                    if not is_string_literal(attribute.items[2].text):
                         raise attribute.items[2].error("module path must be a string literal")
                     custom_path = decode_string(attribute.items[2])
                 else:
@@ -853,7 +896,7 @@ class Modules:
                 name = items[index + 2]
                 if not isinstance(name, Token):
                     raise items[index].error("expected a const function name")
-                original = unit.symbols.get(name.text)
+                original = unit.symbols.get(identifier_text(name.text))
                 if expanded and original and original.token is name:
                     symbol = original
                 else:
@@ -869,7 +912,7 @@ class Modules:
                 if not isinstance(token, Token):
                     raise items[index].error("expected a module name")
                 symbol = self.register(unit, token, "module", boundary)
-                directory = unit.directory / token.text if unit.directory is not None else None
+                directory = unit.directory / symbol.path[-1] if unit.directory is not None else None
                 if custom_path is not None and unit.directory is not None:
                     directory = (unit.directory / custom_path).resolve().parent
                 child = ModuleUnit(symbol.path, directory)
@@ -896,12 +939,14 @@ class Modules:
                 end = self.item_end(items, index, word)
                 if word not in {"impl", "macro_rules"} and index + 1 < len(items):
                     name = items[index + 1]
+                    if word == "static" and tree_text(name) == "mut" and index + 2 < len(items):
+                        name = items[index + 2]
                     if isinstance(name, Token):
                         kind = word
                         if word == "struct" and not any(isinstance(part, TokenGroup)
                                                         for part in items[index + 2:end]):
                             kind = "unit_struct"
-                        original = unit.symbols.get(name.text)
+                        original = unit.symbols.get(identifier_text(name.text))
                         if not expanded or not original or original.token is not name:
                             self.register(unit, name, kind, boundary)
                 if expanded and word in {"const", "static", "type"}:
@@ -909,9 +954,10 @@ class Modules:
                 else:
                     if export and word == "macro_rules":
                         name, body = items[index + 2:index + 4]
-                        if name.text in self.exported and not expanded:
+                        key = identifier_text(name.text)
+                        if key in self.exported and not expanded:
                             raise name.error(f"duplicate exported macro {name.text!r}")
-                        self.exported[name.text] = body
+                        self.exported[key] = body
                     output.extend(kept_attributes)
                     output.extend(items[index:end])
                 index = end
@@ -921,8 +967,7 @@ class Modules:
             index += 1
         return tuple(output)
 
-    @staticmethod
-    def load_module(unit, token, custom_path=None):
+    def load_module(self, unit, token, custom_path=None):
         if unit.directory is None:
             raise token.error("an external module requires a source file path")
         if custom_path is not None:
@@ -931,14 +976,17 @@ class Modules:
                 raise token.error(f"module {token.text!r} needs {filename}")
             filenames = (filename,)
         else:
-            filenames = (unit.directory / f"{token.text}.rs", unit.directory / token.text / "mod.rs")
+            name = identifier_text(token.text)
+            if not name.isascii():
+                raise token.error("a non-ASCII file-backed module requires a path attribute")
+            filenames = (unit.directory / f"{name}.rs", unit.directory / name / "mod.rs")
         found = [path for path in filenames if path.is_file()]
         if len(found) != 1:
             if found:
                 raise token.error(f"module {token.text!r} exists in both {filenames[0]} and {filenames[1]}")
             raise token.error(f"module {token.text!r} needs {filenames[0]} or {filenames[1]}")
         try:
-            return token_trees(lex(found[0].read_text(encoding="utf-8")))[0]
+            return token_trees(lex(found[0].read_text(encoding="utf-8"), edition=self.edition))[0]
         except RustError as error:
             raise RustError(f"{found[0]}: {error}") from error
 
@@ -974,7 +1022,7 @@ class Modules:
                 return entries
             if not isinstance(item, Token):
                 raise item.opening.error("invalid import path")
-            name = item.text
+            name = identifier_text(item.text)
             index += 1
             if name == "*":
                 return [Import(tuple(parts), "*", item, boundary)]
@@ -985,7 +1033,7 @@ class Modules:
                 continue
             alias = parts[-1]
             if index + 1 < len(items) and tree_text(items[index]) == "as":
-                alias = tree_text(items[index + 1])
+                alias = identifier_text(tree_text(items[index + 1]))
                 index += 2
             if index != len(items):
                 raise item.error("unexpected token in import")
@@ -994,7 +1042,7 @@ class Modules:
 
     def resolve(self, path, unit, token, *, origin=None):
         origin = unit.path if origin is None else origin
-        path = list(path)
+        path = list(map(identifier_text, path))
         root = unit
         absolute = False
         if path[0] in {"crate", "self", "super"}:
@@ -2032,9 +2080,11 @@ class Program:
 
 
 class Parser:
-    def __init__(self, source, *, tokens=None, fragment=False, modules=None, unit=None):
-        self.tokens = iter(lex(source) if tokens is None else tokens)
+    def __init__(self, source, *, tokens=None, fragment=False, modules=None, unit=None, edition="2021"):
+        self.edition = modules.edition if modules else edition
+        self.tokens = iter(lex(source, edition=self.edition) if tokens is None else tokens)
         self.fragment = fragment
+        self.reserved = RESERVED_BY_EDITION[self.edition]
         self.lookahead = deque()
         self.self_type = None
         self.current_trait = None
@@ -2074,9 +2124,17 @@ class Parser:
 
     def identifier(self):
         token = self.current
-        if IDENT.fullmatch(token.text) and token.text not in RESERVED:
-            return self.advance()
+        if is_identifier(token.text) and token.text not in self.reserved:
+            token = self.advance()
+            return replace(token, text=identifier_text(token.text)) if token.text.startswith("r#") else token
         raise token.error("expected an identifier")
+
+    def lifetime_token(self, token):
+        if token.text not in {"'static", "'_"} and token.text[1:] in self.reserved:
+            raise token.error("lifetimes cannot use keyword names")
+        if token.text.startswith("'r#"):
+            return replace(token, text="'" + identifier_text(token.text[1:]))
+        return token
 
     def qualified_token(self, token, parts, *, bare=False, type_name=False):
         if self.modules:
@@ -2168,7 +2226,7 @@ class Parser:
             self.expect("]")
             return ArrayType(element, length)
         if token.text == "&":
-            lifetime = self.advance() if LIFETIME.fullmatch(self.current.text) else None
+            lifetime = self.lifetime_token(self.advance()) if is_lifetime(self.current.text) else None
             if lifetime and lifetime.text == "'_":
                 lifetime = None
             mutable = bool(self.accept("mut"))
@@ -2200,14 +2258,15 @@ class Parser:
             return TupleType(tuple(kinds))
         if token.text == "!":
             return NEVER
-        if ((IDENT.fullmatch(token.text) and token.text not in RESERVED)
+        if ((is_identifier(token.text) and token.text not in self.reserved)
                 or token.text in {"crate", "self", "super"}):
-            if self.current.text == "::" and token.text in self.type_parameters:
+            name = identifier_text(token.text)
+            if self.current.text == "::" and name in self.type_parameters:
                 self.advance()
-                return self.associated_projection(self.type_parameters[token.text])
-            if token.text in self.type_parameters:
-                return self.type_parameters[token.text]
-            parts = [token.text]
+                return self.associated_projection(self.type_parameters[name])
+            if name in self.type_parameters:
+                return self.type_parameters[name]
+            parts = [name]
             while self.accept("::"):
                 parts.append(self.advance().text if self.current.text == "super" else self.identifier().text)
             name = self.qualified_token(token, parts, type_name=True).text
@@ -2389,15 +2448,15 @@ class Parser:
             return self.peek() == "self"
         if self.current.text != "&":
             return False
-        offset = int(LIFETIME.fullmatch(self.peek()) is not None)
+        offset = int(is_lifetime(self.peek()))
         if self.peek(offset) == "mut":
             offset += 1
         return self.peek(offset) == "self"
 
     def self_parameter(self, lifetimes):
         borrowed = self.accept("&")
-        lifetime = self.advance() if borrowed and LIFETIME.fullmatch(self.current.text) else None
-        if lifetime and lifetime.text not in lifetimes:
+        lifetime = self.lifetime_token(self.advance()) if borrowed and is_lifetime(self.current.text) else None
+        if lifetime and lifetime.text != "'static" and lifetime.text not in lifetimes:
             raise lifetime.error("undeclared receiver lifetime")
         mutable = bool(self.accept("mut"))
         name = self.expect("self")
@@ -2532,7 +2591,10 @@ class Parser:
         self.type_parameters = dict(outer)
         while self.current.text != ">":
             token = self.advance()
-            if LIFETIME.fullmatch(token.text) and token.text not in {"'static", "'_"}:
+            if is_lifetime(token.text) and token.text not in {"'static", "'_"}:
+                token = self.lifetime_token(token)
+                if token.text in {"'static", "'_"}:
+                    raise token.error(f"reserved lifetime name {token.text}")
                 if types:
                     raise token.error("lifetime parameters must precede type parameters")
                 if token.text in lifetimes:
@@ -2549,11 +2611,12 @@ class Parser:
                     raise token.error("unsupported const parameter type")
                 types[name.text] = TypeParameter(name.text, const_type=kind)
                 self.type_parameters[name.text] = types[name.text]
-            elif IDENT.fullmatch(token.text) and token.text not in RESERVED:
-                if token.text in types:
+            elif is_identifier(token.text) and token.text not in self.reserved:
+                name = identifier_text(token.text)
+                if name in types:
                     raise token.error(f"duplicate type parameter {token.text}")
-                parameter = TypeParameter(token.text)
-                types[token.text] = self.type_parameters[token.text] = parameter
+                parameter = TypeParameter(name)
+                types[name] = self.type_parameters[name] = parameter
                 if self.accept(":"):
                     parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
                                                             signature=lifetimes))
@@ -2626,7 +2689,10 @@ class Parser:
         lifetimes = {}
         while self.current.text != ">":
             token = self.advance()
-            if not LIFETIME.fullmatch(token.text) or token.text in {"'static", "'_"}:
+            if not is_lifetime(token.text):
+                raise token.error("expected a bound lifetime parameter")
+            token = self.lifetime_token(token)
+            if token.text in {"'static", "'_"}:
                 raise token.error("expected a bound lifetime parameter")
             if token.text in lifetimes or token.text in (signature or {}):
                 raise token.error(f"duplicate or shadowed lifetime {token.text}")
@@ -2640,8 +2706,9 @@ class Parser:
         bounds = set()
         while True:
             token = self.advance()
-            if not LIFETIME.fullmatch(token.text):
+            if not is_lifetime(token.text):
                 raise token.error("expected a lifetime bound")
+            token = self.lifetime_token(token)
             bounds.add(token)
             if not self.accept("+"):
                 break
@@ -2667,10 +2734,12 @@ class Parser:
                 continue
             quantified = self.bound_lifetimes(lifetimes) if self.accept("for") else ()
             lhs = self.advance()
+            parameter_name = identifier_text(lhs.text)
             self.expect(":")
-            if quantified and (lhs.text == "Self" or lhs.text not in self.type_parameters):
+            if quantified and (lhs.text == "Self" or parameter_name not in self.type_parameters):
                 raise lhs.error("a higher-ranked where bound requires a type parameter")
-            if LIFETIME.fullmatch(lhs.text):
+            if is_lifetime(lhs.text):
+                lhs = self.lifetime_token(lhs)
                 self.require_lifetimes((lhs,), lifetimes)
                 bounds = self.lifetime_bounds()
                 self.require_lifetimes(bounds, lifetimes)
@@ -2679,8 +2748,8 @@ class Parser:
                 if self.trait_bounds() != {"Sized"}:
                     raise lhs.error("method Self bounds currently support Sized")
                 self.sized_receiver = True
-            elif lhs.text in self.type_parameters:
-                parameter = self.type_parameters[lhs.text]
+            elif parameter_name in self.type_parameters:
+                parameter = self.type_parameters[parameter_name]
                 parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
                                                           signature=lifetimes, outer_lifetimes=quantified))
             else:
@@ -2890,8 +2959,9 @@ class Parser:
                 left = Expr("field", dot, (left, replace(name, text=first)))
                 dot = replace(name, text=".", column=name.column + len(first))
                 name = replace(name, text=second, column=dot.column + 1)
-            if not (IDENT.fullmatch(name.text) or re.fullmatch(r'0|[1-9][0-9]*', name.text)):
+            if not (is_identifier(name.text) or re.fullmatch(r'0|[1-9][0-9]*', name.text)):
                 raise name.error("expected a field name or tuple field index")
+            name = replace(name, text=identifier_text(name.text)) if name.text.startswith("r#") else name
             type_arguments = None
             if self.accept("::"):
                 self.expect("<")
@@ -3009,8 +3079,9 @@ class Parser:
             if self.current.text == "(":
                 return Expr("call", member, self.arguments(), qualified=(self.self_type, self.current_trait))
             return Expr("name", member, qualified=(self.self_type, self.current_trait))
-        if LIFETIME.fullmatch(word):
-            if word in {"'static", "'_"} or word[1:] in RESERVED:
+        if is_lifetime(word):
+            token = self.lifetime_token(token)
+            if token.text in {"'static", "'_"}:
                 raise token.error("invalid label")
             self.expect(":")
             if self.current.text not in {"{", "loop", "while", "for"}:
@@ -3048,8 +3119,8 @@ class Parser:
             return self.match_expression(token)
         if word in {"return", "break", "continue"}:
             label = None
-            if word != "return" and LIFETIME.fullmatch(self.current.text):
-                label = self.advance()
+            if word != "return" and is_lifetime(self.current.text):
+                label = self.lifetime_token(self.advance())
             value = None
             if word != "continue" and self.current.text not in {";", "}", ")", "]", ",", "=>", "else"}:
                 value = self.expression(allow_record=allow_record)
@@ -3087,7 +3158,7 @@ class Parser:
                 elements.append(self.expression())
             self.expect("]")
             return Expr("array", token, tuple(elements))
-        if (parameter := self.type_parameters.get(word)) and parameter.const_type:
+        if (parameter := self.type_parameters.get(identifier_text(word))) and parameter.const_type:
             return Expr("const_value", token, (parameter,))
         if word in self.constants:
             constant = self.constants[word]
@@ -3097,8 +3168,10 @@ class Parser:
             return literal
         if word == "self" and self.current.text != "::" and (self.self_type is not None or self.fragment):
             return Expr("name", token)
-        if (IDENT.fullmatch(word) and word not in RESERVED) or word in {"crate", "self", "super"}:
+        if (is_identifier(word) and word not in self.reserved) or word in {"crate", "self", "super"}:
             if self.accept("!"):
+                word = identifier_text(word)
+                token = replace(token, text=word)
                 opening = self.current.text
                 if opening not in DELIMITERS:
                     raise self.current.error("expected a macro delimiter")
@@ -3188,7 +3261,7 @@ class Parser:
             raise token.error("expected an integer after '-'")
         if word in {"true", "false"}:
             return Expr("literal", token, ("bool", word == "true"))
-        if word.startswith(('"', 'r"', 'r#')):
+        if is_string_literal(word):
             return Expr("literal", token, (STATIC_STR, decode_string(token)))
         if word.startswith(('b"', 'br"', 'br#')):
             value = decode_string(replace(token, text=word[1:]), byte=True)
@@ -3201,7 +3274,7 @@ class Parser:
         return None
 
     def expression_path(self, token, *, allow_record=True):
-        parts = [token.text]
+        parts = [identifier_text(token.text)]
         arguments = None
         while self.accept("::"):
             if self.accept("<"):
@@ -3221,11 +3294,11 @@ class Parser:
         arguments = []
         while self.current.text not in {">", ">="}:
             word = self.current.text
-            parameter = self.type_parameters.get(word)
+            parameter = self.type_parameters.get(identifier_text(word))
             if self.accept("_"):
                 arguments.append(None)
-            elif lifetimes and LIFETIME.fullmatch(word):
-                arguments.append(LifetimeArgument(self.advance().text))
+            elif lifetimes and is_lifetime(word):
+                arguments.append(LifetimeArgument(self.lifetime_token(self.advance()).text))
             elif (word in {"{", "-", "true", "false"} or self.unqualified_constant()
                   or word and word[0].isdigit()
                   or word.endswith("'") and word.startswith(("'", "b'"))
@@ -3240,7 +3313,7 @@ class Parser:
 
     def unqualified_constant(self):
         token = self.current
-        if self.constants and IDENT.fullmatch(token.text) and self.peek() != "::":
+        if self.constants and is_identifier(token.text) and self.peek() != "::":
             path = self.qualified_token(token, (token.text,), bare=True)
             return path.text in self.constants
         return False
@@ -3252,11 +3325,11 @@ class Parser:
             return value
         negative = self.accept("-")
         token = self.advance()
-        if not negative and self.constants and IDENT.fullmatch(token.text):
+        if not negative and self.constants and is_identifier(token.text):
             path = self.qualified_token(token, (token.text,), bare=True)
             if path.text in self.constants:
                 return self.constants[path.text]
-        parameter = self.type_parameters.get(token.text)
+        parameter = self.type_parameters.get(identifier_text(token.text))
         if parameter and parameter.const_type and not negative:
             return parameter
         literal = self.literal(token, negative=bool(negative))
@@ -3577,7 +3650,7 @@ class Parser:
             mutable = bool(self.accept("mut"))
             return Expr("bind", self.identifier(), (False, mutable))
         if token.text not in {"crate", "self", "super"} and (
-            not IDENT.fullmatch(token.text) or token.text in RESERVED
+            not is_identifier(token.text) or token.text in self.reserved
         ):
             raise token.error("expected a pattern")
         path, type_arguments = self.expression_path(token)
@@ -4147,8 +4220,8 @@ def show_missing(witness):
 FORMAT_SPECIFICATION = re.compile(
     r"(?:(?P<fill>[^{}])(?P<filled_alignment>[<^>])|(?P<alignment>[<^>]))?"
     r"(?P<sign>[+-])?(?P<alternate>#)?(?P<zero>0(?!\$))?"
-    r"(?P<width>(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]+)\$|[0-9]+)?"
-    r"(?:\.(?P<precision>(?:[A-Za-z_][A-Za-z_0-9]*|[0-9]+)\$|[0-9]+|\*))?(?P<kind>[?boxXeE])?"
+    r"(?P<width>[^\s$.:]+\$|[0-9]+)?"
+    r"(?:\.(?P<precision>[^\s$.:]+\$|[0-9]+|\*))?(?P<kind>[?boxXeE])?"
 )
 
 
@@ -4178,8 +4251,8 @@ class FormatField:
 
 def parse_format_field(text, token):
     argument, _, specification = text.partition(":")
-    argument = argument.rstrip()
-    if argument and not (IDENT.fullmatch(argument) or re.fullmatch(r"[0-9]+", argument)):
+    argument = unicodedata.normalize("NFC", argument.rstrip())
+    if argument and not (argument.isidentifier() or re.fullmatch(r"[0-9]+", argument)):
         raise token.error("unsupported format argument")
     match = FORMAT_SPECIFICATION.fullmatch(specification.rstrip())
     if not match:
@@ -4202,8 +4275,12 @@ def parse_format_count(value, default):
     if value == "*":
         return FormatCount(None)
     if value.endswith("$"):
-        argument = value[:-1]
-        return FormatCount(int(argument) if argument.isdecimal() else argument)
+        argument = unicodedata.normalize("NFC", value[:-1])
+        if re.fullmatch(r"[0-9]+", argument):
+            return FormatCount(int(argument))
+        if argument.isidentifier():
+            return FormatCount(argument)
+        raise ValueError("invalid format count")
     return int(value)
 
 
@@ -8658,7 +8735,7 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
     shims = {f"{prefix}_{name}": name for name in (*formats, "vec")}
     repeat_shim = f"{prefix}_vec_repeat"
     shims[repeat_shim] = "vec"
-    trees, _ = token_trees(lex(source))
+    trees, _ = token_trees(lex(source, edition=edition))
 
     def keep_derives(items):
         result = []
@@ -8712,7 +8789,7 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
                   "}")
     macro = " ".join((*declarations, *macros))
     # Inner attributes belong first in a crate.
-    trees, _ = token_trees(lex(source))
+    trees, _ = token_trees(lex(source, edition=edition))
     start = 0
     while (start + 2 < len(trees) and tree_text(trees[start]) == "#" and tree_text(trees[start + 1]) == "!"
            and isinstance(trees[start + 2], TokenGroup)):
@@ -8731,7 +8808,7 @@ def rustc_source(source, libraries, source_path=None, *, edition="2021"):
             raise RustError("procedural macro expansion exceeded 30 seconds") from error
         if compiler.returncode:
             raise RustError("rustc macro expansion failed\n" + compiler.stderr.strip())
-    output, end = token_trees(lex(compiler.stdout))
+    output, end = token_trees(lex(compiler.stdout, edition=edition))
     return strip_host_items(output, marker, shims, repeat_shim, libraries), end
 
 
@@ -8801,7 +8878,7 @@ def proc_libraries(values):
     libraries = {}
     for item in values:
         name, separator, file = item.partition("=")
-        if not separator or not IDENT.fullmatch(name) or not file:
+        if not separator or not name.isascii() or not name.isidentifier() or not file:
             raise RustError("expected a procedural macro library as NAME=PATH")
         path = Path(file).resolve()
         if not path.is_file():
@@ -8818,7 +8895,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     if proc_extern:
         trees, end = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
     else:
-        trees, end = token_trees(lex(source))
+        trees, end = token_trees(lex(source, edition=edition))
     modules = Modules(trees, source_path, edition)
     modules.expand()
     program = Program(type_aliases=modules.type_aliases, statics=modules.statics)

@@ -15,6 +15,28 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("Unicode names normalize across source positions and format arguments", """
+        fn 量(数量: i32) -> i32 { 数量 + 1 }
+        fn main() {
+            let cafe\u0301 = 量(6);
+            let 宽度 = 5;
+            let 结果 = '外: loop { break '外 café; };
+            println!("[{结果:>宽度$}]");
+        }
+    """, "[    7]\n"),
+    ("raw identifiers remain available in imports, fields, and macros", """
+        macro_rules! r#match { ($r#type:expr) => { $r#type }; }
+        mod r#impl { pub fn r#type(value: i32) -> i32 { value + 1 } }
+        use r#impl::r#type as r#fn;
+        struct Row { r#loop: i32 }
+        fn raw_lifetime<'r#type>(value: &'r#type i32) -> &'r#type i32 { value }
+        fn main() {
+            let r#false = 3;
+            let row = Row { r#loop: r#match!(r#false) };
+            let value = 'r#match: loop { break 'r#match r#fn(row.r#loop); };
+            println!("{}", raw_lifetime(&value));
+        }
+    """, "4\n"),
     ("boxed self receivers consume trait objects through dynamic dispatch", """
         trait Drain { fn take(self: Box<Self>) -> String; }
         struct Name { text: String }
@@ -2047,6 +2069,13 @@ VALID = [
 ]
 
 INVALID = [
+    ("raw identifiers still reject special path keywords", """
+        fn main() { let r#self = 1; }
+    """, "is reserved"),
+    ("bare keywords cannot name lifetimes", """
+        fn reference<'type>(value: &'type i32) -> &'type i32 { value }
+        fn main() {}
+    """, "lifetimes cannot use keyword names"),
     ("boxed self receivers move their owners", """
         trait Drain { fn take(self: Box<Self>) -> i32; }
         struct Unit;
@@ -3285,6 +3314,13 @@ class InterpreterTests(unittest.TestCase):
                 }
                 fn main() { println!("{}", either!(1 | 2)); }
             """, encoding="utf-8")
+            keywords = folder / "keywords.rs"
+            keywords.write_text('fn gen() -> i32 { 9 } fn main() { println!("{}", gen()); }', encoding="utf-8")
+            lifetimes = folder / "lifetimes.rs"
+            lifetimes.write_text("""
+                fn alias<'r#type>(value: &'r#type i32) -> &'r#type i32 { value }
+                fn main() { println!("{}", alias(&9)); }
+            """, encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             for edition, expected, pattern_outcome in (
                 ("2018", "2 3 5\n", "runtime_match"),
@@ -3293,13 +3329,15 @@ class InterpreterTests(unittest.TestCase):
             ):
                 with self.subTest(edition=edition):
                     report = subprocess.run([sys.executable, runner, "--json", f"--edition={edition}",
-                                             expressions, patterns], text=True, capture_output=True,
+                                             expressions, patterns, keywords, lifetimes], text=True, capture_output=True,
                                             timeout=15, check=False)
                     self.assertEqual(report.returncode, 0, report.stderr or report.stdout)
-                    exprs, pats = json.loads(report.stdout)["cases"]
+                    exprs, pats, names, regions = json.loads(report.stdout)["cases"]
                     self.assertEqual(exprs["outcome"], "runtime_match")
                     self.assertEqual(exprs["run"]["python"]["stdout"], expected)
                     self.assertEqual(pats["outcome"], pattern_outcome)
+                    self.assertEqual(names["outcome"], "both_rejected" if edition == "2024" else "runtime_match")
+                    self.assertEqual(regions["outcome"], "both_rejected" if edition == "2018" else "runtime_match")
 
     def test_invalid_programs(self):
         for name, source, message in INVALID:

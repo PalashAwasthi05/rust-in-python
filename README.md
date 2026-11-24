@@ -62,6 +62,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
+- Unicode and raw identifiers, NFC normalization, and edition-aware raw lifetimes
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
 - Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
@@ -240,7 +241,7 @@ python3 conformance.py --json src/main.rs examples/another_root.rs
 
 Pass each crate's root source file. The interpreter loads sibling modules from their `.rs` files or `mod.rs` directories. The conformance runner records the reference compiler version and checks acceptance before comparing standard output and exit status. It exits unsuccessfully on a mismatch, crash, or timeout. Exact diagnostic text is outside the comparison.
 
-Both commands accept `--edition`, which defaults to 2021 and selects the edition rules used for declarative macro matching. For example, 2024 adds top-level const blocks and underscores to `expr` fragments.
+Both commands accept `--edition`, which defaults to 2021 and selects the supported identifier and declarative macro rules. For example, 2024 adds top-level const blocks and underscores to `expr` fragments.
 
 ## Scope
 
