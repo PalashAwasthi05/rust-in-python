@@ -1,0 +1,9 @@
+0
+V2 { x: 9.0, y: 14.0 } 11 true
+7 1 [1, 0, 0, 0, 0, 7, 0, 0, 0]
+ok 42
+error: parse error: invalid digit found in string
+error: -4 is negative
+error: zero is not allowed
+abc 7 2.5 true 200
+5 x

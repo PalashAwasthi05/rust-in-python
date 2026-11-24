@@ -6,6 +6,8 @@ pub mod prelude {
     pub use crate::iter::IntoIterator;
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
+    pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
+    pub use crate::string::ToString;
 }
 
 pub mod intrinsics {
@@ -31,6 +33,7 @@ pub mod intrinsics {
     pub fn range_from_next<A>(range: &mut crate::ops::RangeFrom<A>) -> Option<A>;
     pub fn compare<T>(left: &T, right: &T) -> i32;
     pub fn parse_int<T>(text: &str) -> Result<T, crate::num::ParseIntError>;
+    pub fn try_integer<S, T>(value: S) -> Result<T, crate::num::TryFromIntError>;
     pub fn parse_float<T>(text: &str) -> Result<T, crate::num::ParseFloatError>;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
 }
@@ -890,6 +893,10 @@ pub mod fmt {
 
     pub type Result = core::result::Result<(), Error>;
 
+    impl Display for Error {
+        fn fmt(&self, f: &mut Formatter) -> Result { f.write_str("an error occurred when formatting an argument") }
+    }
+
     pub struct Formatter { buf: String, alternate: bool }
 
     impl Formatter {
@@ -948,6 +955,34 @@ pub mod marker {
 
 pub mod ops {
     use crate::fmt;
+
+    pub trait Add<Rhs = Self> { type Output; fn add(self, rhs: Rhs) -> Self::Output; }
+    pub trait Sub<Rhs = Self> { type Output; fn sub(self, rhs: Rhs) -> Self::Output; }
+    pub trait Mul<Rhs = Self> { type Output; fn mul(self, rhs: Rhs) -> Self::Output; }
+    pub trait Div<Rhs = Self> { type Output; fn div(self, rhs: Rhs) -> Self::Output; }
+    pub trait Rem<Rhs = Self> { type Output; fn rem(self, rhs: Rhs) -> Self::Output; }
+    pub trait BitAnd<Rhs = Self> { type Output; fn bitand(self, rhs: Rhs) -> Self::Output; }
+    pub trait BitOr<Rhs = Self> { type Output; fn bitor(self, rhs: Rhs) -> Self::Output; }
+    pub trait BitXor<Rhs = Self> { type Output; fn bitxor(self, rhs: Rhs) -> Self::Output; }
+    pub trait Shl<Rhs = Self> { type Output; fn shl(self, rhs: Rhs) -> Self::Output; }
+    pub trait Shr<Rhs = Self> { type Output; fn shr(self, rhs: Rhs) -> Self::Output; }
+    pub trait Neg { type Output; fn neg(self) -> Self::Output; }
+    pub trait Not { type Output; fn not(self) -> Self::Output; }
+    pub trait AddAssign<Rhs = Self> { fn add_assign(&mut self, rhs: Rhs); }
+    pub trait SubAssign<Rhs = Self> { fn sub_assign(&mut self, rhs: Rhs); }
+    pub trait MulAssign<Rhs = Self> { fn mul_assign(&mut self, rhs: Rhs); }
+    pub trait DivAssign<Rhs = Self> { fn div_assign(&mut self, rhs: Rhs); }
+    pub trait RemAssign<Rhs = Self> { fn rem_assign(&mut self, rhs: Rhs); }
+    pub trait BitAndAssign<Rhs = Self> { fn bitand_assign(&mut self, rhs: Rhs); }
+    pub trait BitOrAssign<Rhs = Self> { fn bitor_assign(&mut self, rhs: Rhs); }
+    pub trait BitXorAssign<Rhs = Self> { fn bitxor_assign(&mut self, rhs: Rhs); }
+    pub trait ShlAssign<Rhs = Self> { fn shl_assign(&mut self, rhs: Rhs); }
+    pub trait ShrAssign<Rhs = Self> { fn shr_assign(&mut self, rhs: Rhs); }
+    pub trait Index<Idx> { type Output; fn index(&self, index: Idx) -> &Self::Output; }
+    pub trait IndexMut<Idx>: Index<Idx> { fn index_mut(&mut self, index: Idx) -> &mut Self::Output; }
+    pub trait Deref { type Target; fn deref(&self) -> &Self::Target; }
+    pub trait DerefMut: Deref { fn deref_mut(&mut self) -> &mut Self::Target; }
+    pub trait Drop { fn drop(&mut self); }
 
     #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
     pub struct Range<Idx> { pub start: Idx, pub end: Idx }
@@ -1201,4 +1236,93 @@ pub mod f32 {
 pub mod convert {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Infallible {}
+
+    pub trait From<T>: Sized { fn from(value: T) -> Self; }
+    pub trait Into<T>: Sized { fn into(self) -> T; }
+    pub trait TryFrom<T>: Sized { type Error; fn try_from(value: T) -> Result<Self, Self::Error>; }
+    pub trait TryInto<T>: Sized { type Error; fn try_into(self) -> Result<T, Self::Error>; }
+    pub trait AsRef<T> { fn as_ref(&self) -> &T; }
+    pub trait AsMut<T> { fn as_mut(&mut self) -> &mut T; }
+
+    impl<T, U: From<T>> Into<U> for T {
+        fn into(self) -> U { U::from(self) }
+    }
+    impl<T> From<T> for T {
+        fn from(value: T) -> T { value }
+    }
+    impl<T, U: TryFrom<T>> TryInto<U> for T {
+        type Error = U::Error;
+        fn try_into(self) -> Result<U, U::Error> { U::try_from(self) }
+    }
+
+    impl From<&str> for String { fn from(value: &str) -> String { value.to_string() } }
+    impl From<&String> for String { fn from(value: &String) -> String { value.clone() } }
+    impl From<char> for String { fn from(value: char) -> String { value.to_string() } }
+    impl From<&mut str> for String { fn from(value: &mut str) -> String { value.to_string() } }
+    impl<T> From<T> for Option<T> { fn from(value: T) -> Option<T> { Some(value) } }
+    impl<T> From<T> for Box<T> { fn from(value: T) -> Box<T> { Box::new(value) } }
+    impl<T: Clone> From<&[T]> for Vec<T> { fn from(value: &[T]) -> Vec<T> { value.to_vec() } }
+    impl<T: Clone> From<&Vec<T>> for Vec<T> { fn from(value: &Vec<T>) -> Vec<T> { value.clone() } }
+    impl<T, const N: usize> From<[T; N]> for Vec<T> { fn from(value: [T; N]) -> Vec<T> { value.into_iter().collect() } }
+    impl From<String> for Vec<u8> { fn from(value: String) -> Vec<u8> { value.into_bytes() } }
+    impl From<&str> for Vec<u8> { fn from(value: &str) -> Vec<u8> { value.as_bytes().to_vec() } }
+    impl From<u8> for char { fn from(value: u8) -> char { value as char } }
+    impl From<char> for u32 { fn from(value: char) -> u32 { value as u32 } }
+    impl From<char> for u64 { fn from(value: char) -> u64 { value as u64 } }
+    impl From<bool> for i32 { fn from(value: bool) -> i32 { value as i32 } }
+    impl From<bool> for u8 { fn from(value: bool) -> u8 { value as u8 } }
+    impl From<bool> for usize { fn from(value: bool) -> usize { value as usize } }
+    impl From<bool> for u32 { fn from(value: bool) -> u32 { value as u32 } }
+    impl From<bool> for i64 { fn from(value: bool) -> i64 { value as i64 } }
+    impl From<bool> for u64 { fn from(value: bool) -> u64 { value as u64 } }
+    impl From<f32> for f64 { fn from(value: f32) -> f64 { value as f64 } }
+    impl TryFrom<u32> for char {
+        type Error = crate::num::TryFromIntError;
+        fn try_from(value: u32) -> Result<char, crate::num::TryFromIntError> {
+            match char::from_u32(value) { Some(c) => Ok(c), None => Err(crate::num::TryFromIntError) }
+        }
+    }
+
+    impl AsRef<str> for str { fn as_ref(&self) -> &str { self } }
+    impl AsRef<str> for String { fn as_ref(&self) -> &str { self.as_str() } }
+    impl<T> AsRef<[T]> for [T] { fn as_ref(&self) -> &[T] { self } }
+    impl<T> AsRef<[T]> for Vec<T> { fn as_ref(&self) -> &[T] { self.as_slice() } }
+    impl AsRef<[u8]> for str { fn as_ref(&self) -> &[u8] { self.as_bytes() } }
+    impl AsRef<[u8]> for String { fn as_ref(&self) -> &[u8] { self.as_bytes() } }
+}
+
+pub mod error {
+    use crate::fmt::{Debug, Display};
+
+    pub trait Error: Debug + Display {
+        fn source(&self) -> Option<&dyn Error> { None }
+        fn description(&self) -> &str { "description() is deprecated; use Display" }
+    }
+
+    impl<E: Error> From<E> for Box<dyn Error> {
+        fn from(err: E) -> Box<dyn Error> { Box::new(err) }
+    }
+    impl From<&str> for Box<dyn Error> {
+        fn from(err: &str) -> Box<dyn Error> { Box::new(crate::error::StringError(err.to_string())) }
+    }
+    impl From<String> for Box<dyn Error> {
+        fn from(err: String) -> Box<dyn Error> { Box::new(crate::error::StringError(err)) }
+    }
+
+    pub struct StringError(String);
+    impl Debug for StringError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "{:?}", self.0) }
+    }
+    impl Display for StringError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "{}", self.0) }
+    }
+    impl Error for StringError {}
+
+    impl Error for crate::num::ParseIntError {}
+    impl Error for crate::num::ParseFloatError {}
+    impl Error for crate::num::ParseBoolError {}
+    impl Error for crate::num::ParseCharError {}
+    impl Error for crate::num::TryFromIntError {}
+    impl Error for crate::fmt::Error {}
+    impl Error for crate::string::FromUtf8Error {}
 }

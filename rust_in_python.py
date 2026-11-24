@@ -1073,11 +1073,48 @@ SCALAR_STD = "pub mod num {\n" + """
 """ + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:])
               for kind in sorted(INTEGER_TYPES)) + "".join(
     FLOAT_METHODS.replace("{T}", kind).replace("{B}", "u" + kind[1:]) for kind in sorted(FLOAT_TYPES)) + "}\n"
-STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8") + SCALAR_STD
+def integer_conversions():
+    """From impls for lossless integer conversions and TryFrom for the rest, as Rust's std provides."""
+    lines = []
+    pointer = {"usize": "u64", "isize": "i64"}
+    for source in sorted(INTEGER_TYPES):
+        for target in sorted(INTEGER_TYPES):
+            if source == target:
+                continue
+            low, high = INTEGER_BOUNDS[source]
+            target_low, target_high = INTEGER_BOUNDS[target]
+            lossless = target_low <= low and high <= target_high
+            if lossless and (source in pointer or target in pointer):
+                # std only promises usize and isize conversions from 8 and 16 bit types.
+                lossless = INTEGER_WIDTHS[source] <= 16 and target in pointer and source not in pointer
+            if lossless:
+                lines.append(f"impl From<{source}> for {target} {{ fn from(value: {source}) -> {target} "
+                             f"{{ value as {target} }} }}")
+            else:
+                lines.append(f"impl TryFrom<{source}> for {target} {{ type Error = TryFromIntError; "
+                             f"fn try_from(value: {source}) -> Result<{target}, TryFromIntError> "
+                             f"{{ crate::intrinsics::try_integer(value) }} }}")
+        for kind in sorted(FLOAT_TYPES):
+            if INTEGER_WIDTHS[source] <= (16 if kind == "f32" else 32) and source not in pointer:
+                lines.append(f"impl From<{source}> for {kind} {{ fn from(value: {source}) -> {kind} "
+                             f"{{ value as {kind} }} }}")
+    return ("pub mod integer_conversions {\n    use crate::convert::{From, TryFrom};\n"
+            "    use crate::num::TryFromIntError;\n    " + "\n    ".join(lines) + "\n}\n")
+
+
+STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8") + SCALAR_STD + integer_conversions()
 ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
 INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
+CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
+OPERATOR_TRAITS = {
+    "+": ("Add", "add"), "-": ("Sub", "sub"), "*": ("Mul", "mul"), "/": ("Div", "div"), "%": ("Rem", "rem"),
+    "&": ("BitAnd", "bitand"), "|": ("BitOr", "bitor"), "^": ("BitXor", "bitxor"), "<<": ("Shl", "shl"),
+    ">>": ("Shr", "shr"),
+}
+UNARY_TRAITS = {"-": ("Neg", "neg"), "!": ("Not", "not")}
+
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -1855,6 +1892,7 @@ class TypeParameter:
     const_type: str | None = None
     anonymous: bool = False
     associated_bindings: dict = field(default_factory=dict)
+    unsized: bool = False
 
     def __str__(self):
         return self.name
@@ -2044,6 +2082,7 @@ class AssociatedType:
     item: str
     trait: str | None = None
     arguments: tuple = ()
+    trait_arguments: tuple = ()
 
     def __str__(self):
         suffix = f"<{', '.join(map(str, self.arguments))}>" if self.arguments else ""
@@ -2146,6 +2185,8 @@ class Trait:
     bounds: set
     methods: dict
     associated: dict
+    parameters: tuple = ()
+    defaults: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -2156,6 +2197,7 @@ class Implementation:
     parameters: tuple
     methods: dict
     associated: dict
+    trait_arguments: tuple = ()
 
 
 def match_types(template, actual, parameters, result):
@@ -2225,6 +2267,7 @@ TRAIT_MODULES = {
 }
 CALLABLE_TRAITS = ("Fn", "FnMut", "FnOnce")
 CALL_ITEM = "@call"
+ARGS_ITEM = "@args"
 SUPERTRAITS = {
     "Copy": {"Clone"}, "Eq": {"PartialEq"}, "PartialOrd": {"PartialEq"},
     "Ord": {"Eq", "PartialOrd", "PartialEq"}, "Fn": {"FnMut", "FnOnce"}, "FnMut": {"FnOnce"},
@@ -2248,6 +2291,8 @@ def type_leaves(annotation):
             yield from type_leaves(kind)
     elif isinstance(annotation, (ArrayType, SliceType)):
         yield from type_leaves(annotation.element)
+        if isinstance(annotation, ArrayType):
+            yield annotation.length
     elif isinstance(annotation, AssociatedType):
         yield from type_leaves(annotation.owner)
         for kind in annotation.arguments:
@@ -2301,7 +2346,8 @@ def substitute(annotation, arguments, *, defer_const=False):
         return SliceType(substitute(annotation.element, arguments))
     if isinstance(annotation, AssociatedType):
         return replace(annotation, owner=substitute(annotation.owner, arguments),
-                       arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments))
+                       arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments),
+                       trait_arguments=tuple(substitute(arg, arguments) for arg in annotation.trait_arguments))
     if isinstance(annotation, DynType):
         return DynType(annotation.trait, tuple((name, substitute(value, arguments))
                                                 for name, value in annotation.bindings))
@@ -2331,6 +2377,7 @@ class Program:
     opaque_witnesses: dict = field(default_factory=dict)
     formats: dict = field(default_factory=dict)
     type_lifetimes: dict = field(default_factory=dict)
+    try_conversions: dict = field(default_factory=dict)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2361,7 +2408,11 @@ class Program:
     def projection_trait(self, annotation):
         if annotation.trait:
             trait = self.traits.get(annotation.trait)
-            return trait if trait and annotation.item in trait.associated else None
+            if trait and annotation.item in trait.associated:
+                return trait
+            matches = [self.traits[name] for name in self.trait_closure({annotation.trait})
+                       if name in self.traits and annotation.item in self.traits[name].associated]
+            return matches[0] if len(matches) == 1 else None
         if isinstance(annotation.owner, (TypeParameter, OpaqueType)):
             bounds = self.trait_closure(annotation.owner.bounds)
             matches = [trait for name, trait in self.traits.items()
@@ -2379,6 +2430,31 @@ class Program:
                 return matches[0]
         return None
 
+    def pin_projections(self, annotation):
+        if isinstance(annotation, AssociatedType):
+            owner = self.pin_projections(annotation.owner)
+            annotation = replace(annotation, owner=owner,
+                                 arguments=tuple(map(self.pin_projections, annotation.arguments)))
+            if annotation.trait is None and isinstance(owner, TypeParameter):
+                trait = self.projection_trait(annotation)
+                if trait is not None:
+                    annotation = replace(annotation, trait=trait.name.text)
+            return annotation
+        if isinstance(annotation, ReferenceType):
+            return replace(annotation, inner=self.pin_projections(annotation.inner))
+        if isinstance(annotation, FunctionType):
+            return FunctionType(tuple(map(self.pin_projections, annotation.parameters)),
+                                self.pin_projections(annotation.result), annotation.closure)
+        if isinstance(annotation, AppliedType):
+            return AppliedType(annotation.name, tuple(map(self.pin_projections, annotation.arguments)))
+        if isinstance(annotation, TupleType):
+            return TupleType(tuple(map(self.pin_projections, annotation.elements)))
+        if isinstance(annotation, ArrayType):
+            return ArrayType(self.pin_projections(annotation.element), annotation.length)
+        if isinstance(annotation, SliceType):
+            return SliceType(self.pin_projections(annotation.element))
+        return annotation
+
     def associated_trait(self, bound, item):
         matches = [self.traits[name] for name in self.trait_closure({bound})
                    if name in self.traits and item in self.traits[name].associated]
@@ -2388,7 +2464,8 @@ class Program:
         if isinstance(annotation, AssociatedType):
             owner = self.normalize(annotation.owner, seen)
             annotation = replace(annotation, owner=owner,
-                                 arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments))
+                                 arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments),
+                                 trait_arguments=tuple(self.normalize(arg, seen) for arg in annotation.trait_arguments))
             if isinstance(owner, DynType):
                 return dict(owner.bindings).get(annotation.item, annotation)
             if isinstance(owner, IteratorType) and annotation.item == "Item":
@@ -2420,11 +2497,18 @@ class Program:
                         if arguments is not None:
                             return self.normalize(substitute(kind, arguments), (*seen, annotation))
                 if not isinstance(owner, (TypeParameter, TypeVariable)):
-                    implementation = self.implementation(owner, trait.name.text)
+                    wanted = annotation.trait_arguments
+                    implementation = self.implementation(
+                        owner, trait.name.text,
+                        arguments_wanted=wanted if wanted and not any(isinstance(kind, (TypeVariable, TypeParameter))
+                                                                      for kind in wanted) else None)
                     if implementation:
                         impl, arguments = implementation
                         if annotation.item in impl.associated:
                             definition = impl.associated[annotation.item]
+                            if any(part in impl.parameters and part not in arguments
+                                   for part in type_leaves(definition.body)):
+                                return annotation
                             if len(definition.parameters) == len(annotation.arguments):
                                 arguments = arguments | dict(zip(definition.parameters, annotation.arguments))
                                 return self.normalize(substitute(definition.body, arguments), (*seen, annotation))
@@ -2475,8 +2559,25 @@ class Program:
                 pending.extend(self.traits[trait].bounds)
         return result
 
-    def implementation(self, annotation, trait, seen=()):
-        key = (annotation, trait)
+    def trait_arguments(self, trait_name, given, owner):
+        """Positional arguments of a generic trait, with defaults such as Rhs = Self filled in."""
+        trait = self.traits.get(trait_name)
+        if not trait or not trait.parameters:
+            return ()
+        given = tuple(given or ())
+        result = []
+        for index, parameter in enumerate(trait.parameters):
+            if index < len(given):
+                result.append(given[index])
+            elif trait.defaults[index] is not None:
+                result.append(substitute(trait.defaults[index],
+                                         {trait.self_type: owner, **dict(zip(trait.parameters, result))}))
+            else:
+                result.append(None)
+        return tuple(result)
+
+    def implementation(self, annotation, trait, seen=(), arguments_wanted=None):
+        key = (annotation, trait, arguments_wanted)
         if key in seen:
             return None
         for impl in self.impls:
@@ -2484,13 +2585,30 @@ class Program:
                 continue
             arguments = {}
             matched = match_types(impl.target, annotation, impl.parameters, arguments)
+            if matched and arguments_wanted is not None:
+                declared = self.trait_arguments(trait, impl.trait_arguments, impl.target)
+                for template, actual in zip(declared, arguments_wanted):
+                    if actual is None or template is None or isinstance(actual, TypeVariable):
+                        continue
+                    if not match_types(substitute(template, arguments) if not isinstance(template, TypeParameter)
+                                       else template, actual, impl.parameters, arguments):
+                        matched = False
+                        break
+            if matched and any(isinstance(value, (SliceType, DynType)) or value == "str"
+                               for parameter, value in arguments.items() if isinstance(parameter, TypeParameter)
+                               and not parameter.const_type and not parameter.unsized):
+                matched = False
             if matched:
                 bind_signature_parameters(impl.parameters, arguments)
+            # Parameters fixed only by trait arguments the caller has not determined yet stay open.
+            open_parameters = {part for argument in impl.trait_arguments for part in type_leaves(argument)
+                               if part in impl.parameters and part not in arguments}
             if matched and all(
-                parameter in arguments for parameter in impl.parameters
+                parameter in arguments or parameter in open_parameters for parameter in impl.parameters
             ) and all(
                 self.implements(arguments[parameter], bound, seen=(*seen, key))
-                for parameter in impl.parameters for bound in parameter.bounds
+                for parameter in impl.parameters if parameter in arguments for bound in parameter.bounds
+                if not isinstance(arguments[parameter], TypeVariable)
             ) and self.matches_associated_bounds(arguments):
                 return impl, arguments
         return None
@@ -2498,7 +2616,7 @@ class Program:
     def matches_associated_bounds(self, arguments):
         for parameter, argument in arguments.items():
             for binding, expected in parameter.associated_bindings.items():
-                if binding.item == CALL_ITEM:
+                if binding.item in {CALL_ITEM, ARGS_ITEM}:
                     continue
                 trait = self.associated_trait(binding.bound, binding.item)
                 if trait is None:
@@ -2536,7 +2654,7 @@ class Program:
             return True
         if isinstance(annotation, DynType):
             return trait in self.trait_closure({annotation.trait})
-        if annotation == "str":
+        if annotation == "str" and (trait in TRAIT_MODULES or trait not in self.traits):
             return trait in {"Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"}
         if annotation in FLOAT_TYPES and trait == "Hash":
             return False
@@ -2696,6 +2814,8 @@ class Parser:
         self.type_parameters = {}
         self.argument_parameters = None
         self.lifetime_scope = {}
+        self.parameter_defaults = {}
+        self.current_trait_parameters = ()
         self.method_outer_parameters = set()
         self.method_where_bounds = []
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
@@ -2906,7 +3026,10 @@ class Parser:
     def associated_projection(self, owner, trait=None):
         name = self.identifier()
         arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
-        return AssociatedType(owner, name.text, trait, arguments)
+        trait_arguments = ()
+        if owner is self.self_type and trait is not None and trait == self.current_trait:
+            trait_arguments = tuple(self.current_trait_parameters)
+        return AssociatedType(owner, name.text, trait, arguments, trait_arguments)
 
     def parse(self, program=None):
         program = Program() if program is None else program
@@ -3108,18 +3231,27 @@ class Parser:
         name = replace(name, text=STD_BUILTIN_TRAITS.get(name.text, name.text))
         if name.text in program.traits or (name.text in TRAIT_MODULES and not self.in_std):
             raise name.error(f"duplicate trait {name.text!r}")
-        bounds = self.trait_bounds() if self.accept(":") else set()
-        self_type = TypeParameter("Self", {name.text, *bounds})
+        self_type = TypeParameter("Self", {name.text})
         old_self = self.self_type
         self.self_type = self_type
-        self.current_trait = name.text
         self.type_parameters = {"Self": self_type}
+        self.parameter_defaults = {}
+        _, trait_parameters = self.generic_parameters()
+        defaults = tuple(self.parameter_defaults.get(parameter) for parameter in trait_parameters)
+        self.type_parameters = {"Self": self_type, **trait_parameters}
+        bounds = self.trait_bounds(bindings={}) if self.accept(":") else set()
+        self_type.bounds.update(bounds)
+        self.where_clause({})
+        self.current_trait = name.text
+        self.current_trait_parameters = tuple(trait_parameters.values())
         self.expect("{")
         methods, associated = self.methods(program, declaration=True, prefix=f"@trait:{name.text}")
+        self.current_trait_parameters = ()
         self.self_type = old_self
         self.current_trait = None
         self.type_parameters = {}
-        program.traits[name.text] = Trait(name, self_type, bounds, methods, associated)
+        program.traits[name.text] = Trait(name, self_type, bounds, methods, associated,
+                                          tuple(trait_parameters.values()), defaults)
 
     def impl_item(self, program, token):
         lifetimes, parameters = self.generic_parameters()
@@ -3128,10 +3260,14 @@ class Parser:
         self.type_parameters = parameters
         target = self.type_name()
         trait = None
+        trait_arguments = ()
         if self.accept("for"):
-            if not isinstance(target, str):
+            if isinstance(target, AppliedType):
+                trait, trait_arguments = target.name, target.arguments
+            elif isinstance(target, str):
+                trait = target
+            else:
                 raise token.error("expected a trait name in impl")
-            trait = target
             target = self.type_name()
         self.where_clause(lifetimes)
         self.expect("{")
@@ -3141,7 +3277,8 @@ class Parser:
         methods, associated = self.methods(program, declaration=False, prefix=f"@impl:{len(program.impls)}")
         self.self_type = old_self
         self.current_trait = None
-        program.impls.append(Implementation(token, target, trait, tuple(parameters.values()), methods, associated))
+        program.impls.append(Implementation(token, target, trait, tuple(parameters.values()), methods, associated,
+                                            trait_arguments))
         self.type_parameters = {}
         self.lifetime_scope = outer_lifetimes
 
@@ -3251,6 +3388,8 @@ class Parser:
                 if self.accept(":"):
                     parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
                                                             signature=lifetimes))
+                if self.accept("="):
+                    self.parameter_defaults[name] = self.type_name()
             else:
                 raise token.error("expected a lifetime or type parameter")
             if not self.accept(","):
@@ -3302,7 +3441,14 @@ class Parser:
             if lifetimes and bindings is None:
                 raise self.current.error("higher-ranked bounds require an associated type constraint here")
             if bindings is not None and self.accept("<"):
+                positional = []
                 while self.current.text != ">":
+                    if not (is_identifier(self.current.text) and self.peek() == "=") and not (
+                            is_identifier(self.current.text) and self.peek() == "<" and self.generic_item_binding()):
+                        positional.append(self.type_name(signature=bound_signature))
+                        if not self.accept(","):
+                            break
+                        continue
                     name = self.identifier()
                     arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
                     for argument in arguments:
@@ -3318,9 +3464,27 @@ class Parser:
                     if not self.accept(","):
                         break
                 self.expect(">")
+                if positional:
+                    bindings[AssociatedBinding(bound, ARGS_ITEM)] = TupleType(tuple(positional))
             if not self.accept("+"):
                 break
         return bounds
+
+    def generic_item_binding(self):
+        """Whether `Name<...> =` follows, which binds a generic associated type rather than naming a type."""
+        depth = 0
+        index = 0
+        while True:
+            text = self.peek(index)
+            if text == "<":
+                depth += 1
+            elif text in {">", ">>"}:
+                depth -= len(text)
+                if depth <= 0:
+                    return self.peek(index + 1) == "="
+            elif text in {"", ";", "{"}:
+                return False
+            index += 1
 
     def call_signature(self, signature):
         self.expect("(")
@@ -5121,8 +5285,36 @@ class Checker:
         self.callable_requirements = []
         self.assumed_bounds = ()
         self.obligation_assumptions = {}
+        self.trait_obligations = []
+        self.error_conversions = []
+        self.mutable_places = set()
+        self.pretyped = {}
+
+    def pin_all_projections(self):
+        """Record the trait of each `T::Item` on a type parameter, so substitution keeps it unambiguous."""
+        pin = self.program.pin_projections
+        for function in self.functions.values():
+            function.params = [(name, mutable, pin(kind)) for name, mutable, kind in function.params]
+            function.result = pin(function.result)
+        for trait in self.program.traits.values():
+            for function in trait.methods.values():
+                function.params = [(name, mutable, pin(kind)) for name, mutable, kind in function.params]
+                function.result = pin(function.result)
+        for impl in self.program.impls:
+            for name, definition in tuple(impl.associated.items()):
+                impl.associated[name] = replace(definition, body=pin(definition.body))
+            for function in impl.methods.values():
+                function.params = [(name, mutable, pin(kind)) for name, mutable, kind in function.params]
+                function.result = pin(function.result)
+        for name, (token, constructors) in tuple(self.program.types.items()):
+            pinned = tuple(replace(ctor, fields=tuple((field, pin(kind)) for field, kind in ctor.fields))
+                           for ctor in constructors)
+            self.program.types[name] = (token, pinned)
+            for ctor in pinned:
+                self.program.constructors[ctor.path] = ctor
 
     def check(self):
+        self.pin_all_projections()
         for alias in self.program.type_aliases.values():
             target, token = alias.target, alias.name
             self.check_bounds(alias.parameters, token)
@@ -5213,7 +5405,7 @@ class Checker:
                     self.check_associated_binding(binding, expected, token)
 
     def check_associated_binding(self, binding, expected, token):
-        if binding.item == CALL_ITEM:
+        if binding.item in {CALL_ITEM, ARGS_ITEM}:
             self.check_type(expected, token)
             return None
         trait = self.program.associated_trait(binding.bound, binding.item)
@@ -5278,6 +5470,8 @@ class Checker:
                 if name in {OPTION, RESULT} or name not in self.program.types:
                     raise impl.token.error("Termination can only be implemented for a type defined in this crate")
             target_parameters = set(self.type_parts(impl.target))
+            for argument in impl.trait_arguments:
+                target_parameters.update(type_leaves(argument))
             for parameter in tuple(target_parameters):
                 signature = callable_signature(parameter) if isinstance(parameter, TypeParameter) else None
                 if signature is not None:
@@ -5290,7 +5484,10 @@ class Checker:
             for previous in self.program.impls[:index]:
                 if impl.token.module[:1] == STD_ROOT:
                     break
-                if previous.trait == impl.trait and overlapping_types(previous.target, impl.target):
+                if previous.trait == impl.trait and overlapping_types(previous.target, impl.target) and all(
+                        overlapping_types(first, second) for first, second in zip(
+                            self.program.trait_arguments(impl.trait, previous.trait_arguments, previous.target),
+                            self.program.trait_arguments(impl.trait, impl.trait_arguments, impl.target))):
                     if impl.trait or previous.methods.keys() & impl.methods.keys():
                         raise impl.token.error("conflicting implementations")
             if impl.trait is None:
@@ -5328,6 +5525,8 @@ class Checker:
                         raise impl.token.error(f"missing method {name!r} for {impl.trait}")
                     continue
                 bindings = {trait.self_type: impl.target}
+                bindings.update(zip(trait.parameters,
+                                    self.program.trait_arguments(impl.trait, impl.trait_arguments, impl.target)))
                 if (len(required.method_parameters) != len(method.method_parameters)
                         or any(not self.same_parameter_kind(first, second)
                                for first, second in zip(required.method_parameters, method.method_parameters))):
@@ -5349,6 +5548,8 @@ class Checker:
                 actual_result = self.resolve(method.result)
                 required_signature = self.effective_function(required, required_types, required_result)
                 actual_signature = self.effective_function(method, actual_types, actual_result)
+                if impl.token.module[:1] == STD_ROOT:
+                    continue
                 if (required_types != actual_types
                         or actual_result != required_result
                         or actual_signature.return_inputs != required_signature.return_inputs
@@ -5404,7 +5605,8 @@ class Checker:
             return DynType(annotation.trait, tuple((name, self.resolve(value)) for name, value in annotation.bindings))
         if isinstance(annotation, AssociatedType):
             projected = replace(annotation, owner=self.resolve(annotation.owner),
-                                arguments=tuple(map(self.resolve, annotation.arguments)))
+                                arguments=tuple(map(self.resolve, annotation.arguments)),
+                                trait_arguments=tuple(map(self.resolve, annotation.trait_arguments)))
             normalized = self.program.normalize(projected)
             return normalized if isinstance(normalized, AssociatedType) else self.resolve(normalized)
         return annotation
@@ -5539,6 +5741,8 @@ class Checker:
     def associated_requirements(self, arguments, token, *, callables=False):
         for parameter, owner in arguments.items():
             for binding, expected in parameter.associated_bindings.items():
+                if binding.item == ARGS_ITEM:
+                    continue
                 if binding.item == CALL_ITEM:
                     signature = substitute(expected, arguments)
                     if callables and not any(isinstance(part, TypeParameter) and part.name == "Self"
@@ -5704,8 +5908,24 @@ class Checker:
         for key, (types, arguments) in self.program.call_types.items():
             self.program.call_types[key] = (tuple(self.resolve(kind) for kind in types),
                                             {p: self.resolve(arg) for p, arg in arguments.items()})
-        for key, (trait, receiver, method) in self.program.dispatches.items():
-            self.program.dispatches[key] = (trait, self.resolve(receiver), method)
+        for key, (trait, receiver, method, arguments) in self.program.dispatches.items():
+            self.program.dispatches[key] = (trait, self.resolve(receiver), method,
+                                            tuple(map(self.resolve, arguments)))
+        for source, target, token, expr in self.error_conversions:
+            source, target = self.resolve(source), self.resolve(target)
+            if source == target:
+                continue
+            if self.program.implementation(target, CONVERT_FROM, arguments_wanted=(source,)) is None:
+                raise token.error(f"? cannot convert {source} into {target}")
+            self.program.try_conversions[id(expr)] = (source, target)
+        for receiver, trait, arguments, token in self.trait_obligations:
+            receiver, arguments = self.resolve(receiver), tuple(map(self.resolve, arguments))
+            if receiver == NEVER or isinstance(receiver, (TypeParameter, OpaqueType, DynType, AssociatedType)):
+                continue
+            if self.program.implementation(receiver, trait, arguments_wanted=arguments) is None and not (
+                    self.builtin_trait_arguments(receiver, trait, arguments)):
+                shown = f"{trait}<{', '.join(map(str, arguments))}>"
+                raise token.error(f"{receiver} does not implement {shown}")
         for key, (pattern, bindings) in self.program.patterns.items():
             self.program.patterns[key] = (
                 self.resolve_pattern(pattern),
@@ -5771,6 +5991,8 @@ class Checker:
                         for capture in self.functions[witness.closure].captures)):
                 raise function.name.error("opaque returns of borrowed values or capturing closures are unsupported")
             for binding, expected in function.result.bindings:
+                if binding.item == ARGS_ITEM:
+                    continue
                 if binding.item == CALL_ITEM:
                     self.require_callable(witnesses[name], expected, function.name)
                     continue
@@ -6339,6 +6561,8 @@ class Checker:
         return first, inner
 
     def type_of(self, expr, scope, expected=None):
+        if id(expr) in self.pretyped:
+            return self.pretyped.pop(id(expr))
         if id(expr) in self.program.call_functions or expr.kind in {
             "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
             "string_iterator", "iterator_terminal", "lazy_adapter"
@@ -6545,7 +6769,11 @@ class Checker:
             enclosing = self.resolve(self.result)
             hint = None
             if expected is not None and isinstance(enclosing, AppliedType) and enclosing.name in {OPTION, RESULT}:
-                hint = AppliedType(enclosing.name, (expected, *enclosing.arguments[1:]))
+                error = ()
+                if enclosing.name == RESULT:
+                    error = (TypeVariable("error", token),)
+                    self.variables.append(error[0])
+                hint = AppliedType(enclosing.name, (expected, *error))
             actual = self.type_of(value, scope, hint)
             if actual == NEVER:
                 return NEVER
@@ -6554,7 +6782,11 @@ class Checker:
             if not isinstance(enclosing, AppliedType) or actual.name != enclosing.name:
                 raise token.error("? requires a function returning the same enum family")
             if actual.name == RESULT:
-                self.require(actual.arguments[1], enclosing.arguments[1], token)
+                source, target = self.resolve(actual.arguments[1]), self.resolve(enclosing.arguments[1])
+                if isinstance(source, TypeVariable) or isinstance(target, TypeVariable) or source == target:
+                    self.require(source, target, token)
+                else:
+                    self.error_conversions.append((source, target, token, expr))
             expr.args = (value, enclosing)
             return self.resolve(actual.arguments[0])
         if kind == "macro_definition":
@@ -6642,6 +6874,9 @@ class Checker:
                 expr.args = (base, *bounds)
                 annotation = self.type_of(base, scope)
             string_range = kind == "range_index" and annotation in {"str", STRING}
+            if kind == "index" and annotation != NEVER and not (
+                    isinstance(annotation, (ArrayType, SliceType)) or is_vector(annotation)):
+                return self.index_call(expr, scope, base, bounds[0], annotation)
             if annotation != NEVER and not (isinstance(annotation, (ArrayType, SliceType)) or is_vector(annotation) or string_range):
                 raise token.error(f"cannot index {annotation}")
             diverges = annotation == NEVER
@@ -6701,6 +6936,8 @@ class Checker:
         if kind == "borrow":
             value, mutable = args
             hint = expected.inner if isinstance(expected, ReferenceType) else None
+            if mutable:
+                self.mark_mutable_place(value)
             annotation = self.type_of(value, scope, hint)
             if annotation == NEVER:
                 return NEVER
@@ -6867,6 +7104,9 @@ class Checker:
             actual = self.type_of(operand, scope, hint)
             if actual == NEVER:
                 return NEVER
+            if self.overloadable(actual):
+                trait, method = UNARY_TRAITS[token.text]
+                return self.operator_call(expr, scope, expected, trait, method, (operand,), actual)
             if actual in FLOAT_TYPES:
                 if token.text != "-":
                     raise token.error(f"cannot negate {actual} with '!'")
@@ -6897,6 +7137,16 @@ class Checker:
                 bind = Expr("assignment_let", token, (pattern, hint, right, None))
                 expr.kind, expr.args = "block", ([bind, *writes], None)
                 return self.check_expr(expr, scope, expected)
+            self.mark_mutable_place(left)
+            if token.text != "=" and token.text[:-1] in OPERATOR_TRAITS:
+                left_type = self.resolve(self.program.expr_types.get(id(left)) or self.type_of(left, scope))
+                if self.overloadable(left_type):
+                    trait, method = OPERATOR_TRAITS[token.text[:-1]]
+                    self.require_place(left, write=True)
+                    CaptureContext.mark_mutable(scope, left)
+                    return self.operator_call(expr, scope, expected, trait + "Assign", method + "_assign",
+                                              args, left_type)
+                self.program.expr_types[id(left)] = left_type
             annotation = self.program.expr_types.get(id(left))
             if annotation is None:
                 annotation = self.type_of(left, scope)
@@ -6933,6 +7183,12 @@ class Checker:
                 left, right = args
                 left_hint = hint if hint in INTEGER_TYPES and self.unsuffixed_number(left) else None
                 return self.binary_type(token, self.type_of(left, scope, left_hint), self.type_of(right, scope))
+            if token.text in OPERATOR_TRAITS and not self.unsuffixed_number(args[0]):
+                left_type = self.type_of(args[0], scope)
+                if self.overloadable(left_type):
+                    trait, method = OPERATOR_TRAITS[token.text]
+                    return self.operator_call(expr, scope, expected, trait, method, args, left_type)
+                self.pretyped[id(args[0])] = left_type
             if token.text in {"&&", "||"}:
                 hint = "bool"
             elif (hint not in NUMBER_TYPES and not (hint == "bool" and token.text in BITWISE)) or token.text in COMPARE:
@@ -7479,6 +7735,15 @@ class Checker:
                           and self.trait_available(pointee, trait.name.text, expr.token)]
             if candidates:
                 receiver = pointee
+        if not candidates and isinstance(actual, ReferenceType):
+            # A by-value method can take the reference itself, as `"text".into()` does.
+            candidates = [trait for trait in self.program.traits.values()
+                          if name in trait.methods and self.has_receiver(trait.methods[name])
+                          and not isinstance(trait.methods[name].params[0][2], ReferenceType)
+                          and self.implements(actual, trait.name.text)
+                          and self.trait_available(actual, trait.name.text, expr.token)]
+            if candidates:
+                receiver = actual
         if len(candidates) > 1:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
@@ -7489,9 +7754,8 @@ class Checker:
                     raise expr.token.error(f"method {name!r} requires Self: Sized")
                 if not isinstance(method.params[0][2], ReferenceType) and not is_box(method.params[0][2]):
                     raise expr.token.error("cannot pass an unsized trait object by value")
-            self.program.dispatches[id(expr)] = (trait.name.text, receiver, name)
-            return self.receiver_call(expr, scope, expected, trait.methods[name],
-                                      {trait.self_type: receiver}, actual)
+            bindings = self.trait_bindings(trait, receiver, expr)
+            return self.receiver_call(expr, scope, expected, trait.methods[name], bindings, actual)
         if is_box(base) and not (
             name == "clone" and self.implements(base, "Clone")
             or name == "to_string" and self.implements(base, "Display")
@@ -7724,6 +7988,39 @@ class Checker:
                 expr.token, [(expr.token, False, receiver)], result, None, (0,))
         return checked_result
 
+    def trait_bindings(self, trait, receiver, expr):
+        """Bind Self and fresh variables for a generic trait's parameters, and record the dispatch."""
+        bindings = {trait.self_type: receiver}
+        arguments = []
+        for parameter in trait.parameters:
+            variable = TypeVariable(parameter.name, expr.token)
+            self.variables.append(variable)
+            bindings[parameter] = variable
+            arguments.append(variable)
+        if arguments:
+            self.trait_obligations.append((receiver, trait.name.text, tuple(arguments), expr.token))
+            resolved = self.resolve(receiver)
+            if not isinstance(resolved, (TypeVariable, TypeParameter, AssociatedType, OpaqueType)):
+                matches = []
+                for impl in self.program.impls:
+                    found = {}
+                    if impl.trait == trait.name.text and match_types(impl.target, resolved, impl.parameters, found):
+                        matches.append((impl, found))
+                if len(matches) == 1:
+                    # With a single candidate impl, its trait arguments are known, as in rustc.
+                    impl, found = matches[0]
+                    declared = self.program.trait_arguments(impl.trait, impl.trait_arguments, impl.target)
+                    for variable, template in zip(arguments, declared):
+                        if template is not None and all(part in found or part not in impl.parameters
+                                                        for part in type_leaves(template)):
+                            self.require(variable, substitute(template, found), expr.token)
+        self.program.dispatches[id(expr)] = (trait.name.text, receiver, expr.token.text.rsplit("::", 1)[-1],
+                                             tuple(arguments))
+        return bindings
+
+    def builtin_trait_arguments(self, receiver, trait, arguments):
+        return False
+
     def trait_available(self, base, name, token):
         if isinstance(base, DynType):
             return name in self.program.trait_closure({base.trait})
@@ -7799,8 +8096,8 @@ class Checker:
         if isinstance(owner, DynType) and trait.methods[name].self_sized:
             raise expr.token.error(f"method {name!r} requires Self: Sized")
         self.obligation(owner, trait_name, expr.token)
-        self.program.dispatches[id(expr)] = (trait_name, owner, name)
-        return self.function_call(expr, scope, expected, trait.methods[name], {trait.self_type: owner}, first)
+        bindings = self.trait_bindings(trait, owner, expr)
+        return self.function_call(expr, scope, expected, trait.methods[name], bindings, first)
 
     def call_on_type(self, expr, scope, expected, owner, name):
         if is_vector(owner) and name == "new":
@@ -7836,6 +8133,47 @@ class Checker:
                                 integer_literal=not floating, float_literal=floating)
         self.variables.append(variable)
         return variable
+
+    def index_call(self, expr, scope, base, index, annotation):
+        """Index a non-built-in collection through std::ops::Index or IndexMut."""
+        mutable = id(expr) in self.mutable_places
+        name = "IndexMut" if mutable else "Index"
+        trait = self.program.traits[MODULE_SEPARATOR.join(("std", "ops", name))]
+        receiver = self.resolve(annotation)
+        if not self.implements(receiver, trait.name.text) and not isinstance(receiver, (TypeParameter, AssociatedType)):
+            raise expr.token.error(f"cannot index {receiver}")
+        call = Expr("method", replace(expr.token, text="index_mut" if mutable else "index"), (base, index))
+        bindings = self.trait_bindings(trait, receiver, call)
+        reference = self.resolve(self.receiver_call(call, scope, None, trait.methods[call.token.text], bindings, receiver))
+        self.program.expr_types[id(call)] = reference
+        expr.kind, expr.args = "deref", (call, False)
+        return reference.inner
+
+    def mark_mutable_place(self, target):
+        target = ungroup(target)
+        while target.kind in {"field", "index"}:
+            if target.kind == "index":
+                self.mutable_places.add(id(target))
+            target = ungroup(target.args[0])
+
+    def overloadable(self, annotation):
+        """Whether an operator on this type goes through a std::ops trait rather than a built-in."""
+        annotation = self.resolve(annotation)
+        while isinstance(annotation, ReferenceType):
+            annotation = self.resolve(annotation.inner)
+        if annotation in PRIMITIVES or annotation in {STRING, NEVER, "str"} or isinstance(annotation, TypeVariable):
+            return False
+        return True
+
+    def operator_call(self, expr, scope, expected, trait_name, method, operands, actual):
+        trait = self.program.traits.get(MODULE_SEPARATOR.join(("std", "ops", trait_name)))
+        receiver = self.resolve(actual)
+        if trait is None or not (self.implements(receiver, trait.name.text) or isinstance(
+                receiver, (TypeParameter, AssociatedType, OpaqueType))):
+            raise expr.token.error(f"cannot apply {expr.token.text!r} to {receiver}")
+        expr.kind, expr.token, expr.args = "method", replace(expr.token, text=method), tuple(operands)
+        bindings = self.trait_bindings(trait, receiver, expr)
+        return self.receiver_call(expr, scope, expected, trait.methods[method], bindings, actual)
 
     def numeric_like(self, annotation):
         annotation = self.resolve(annotation)
@@ -9891,6 +10229,11 @@ class Interpreter:
             target = self.program.normalize(substitute(enclosing, self.type_arguments))
             ctor = next(item for item in self.program.layout(target)[1]
                         if item.path.endswith(f"::{variant}"))
+            conversion = self.program.try_conversions.get(id(expr))
+            if conversion is not None:
+                source, wanted = (self.program.normalize(substitute(kind, self.type_arguments)) for kind in conversion)
+                impl, arguments = self.program.implementation(wanted, CONVERT_FROM, arguments_wanted=(source,))
+                raise Return(Value(ctor, (self.call(impl.methods["from"].name.text, value.fields, arguments),)))
             raise Return(Value(ctor, value.fields))
         if kind == "enum_method":
             receiver, arguments, wanted, consuming = args
@@ -10183,14 +10526,15 @@ class Interpreter:
             function = self.program.call_functions[id(expr)]
             dispatch = self.program.dispatches.get(id(expr))
             if dispatch:
-                trait, receiver, name = dispatch
+                trait, receiver, name, wanted = dispatch
                 receiver = self.program.normalize(substitute(receiver, self.type_arguments))
+                wanted = tuple(self.program.normalize(substitute(kind, self.type_arguments)) for kind in wanted)
                 if isinstance(receiver, DynType):
                     receiver = values[0].concrete
                     if isinstance(values[0], DynAddress):
                         values = (values[0].address, *values[1:])
                 receiver = self.program.concrete_type(receiver)
-                implementation = self.program.implementation(receiver, trait)
+                implementation = self.program.implementation(receiver, trait, arguments_wanted=wanted or None)
                 if implementation is None and trait == TERMINATION:
                     return ExitCodeValue(self.exit_status(values[0], receiver))
                 if implementation is None and trait in {"PartialEq", "PartialOrd", "Ord"} and name in {
@@ -11746,6 +12090,15 @@ def parse_integer(interpreter, result, text, radix=10):
     if number < low:
         return parse_error(interpreter, result, "NegOverflow")
     return interpreter.variant(result, "Ok", number)
+
+
+@intrinsic
+def rust_try_integer(interpreter, result, value):
+    low, high = INTEGER_BOUNDS[result.arguments[0]]
+    if low <= value < high:
+        return interpreter.variant(result, "Ok", value)
+    error = result.arguments[1]
+    return interpreter.variant(result, "Err", Value(interpreter.program.layout(error)[1][0], ()))
 
 
 @intrinsic
