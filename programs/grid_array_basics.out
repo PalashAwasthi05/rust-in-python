@@ -1,0 +1,26 @@
+0
+[0, 0, 0, 0, 0] [3, 1, 4, 1, 5] [10, 20, 30]
+len=5 first=3 last=5
+[3, 1, 9, 1, 5]
+contains 9: true, contains 7: false
+position of 1: Some(1)
+rposition of 1: Some(3)
+position of 8: None
+eq true ne true lt true cmp Greater
+max Some([1, 2, 4]) min Some([1, 2, 3])
+sum=19 prod=6000
+[
+    1,
+    2,
+]
+0: apple (5)
+1: banana (6)
+2: cherry (6)
+is_empty false true
+copy [3, 1, 9, 1, 5] orig [100, 1, 9, 1, 5]
+first Some(100) last Some(5)
+[true, true, true, true] all=true
+xxx
+[1.5, 2.25, -0.5] 3.25
+[5, 1, 9, 1, 100]
+100,1,9,1,5

@@ -963,8 +963,12 @@ impl {T} {
     pub fn ilog10(self) -> u32;
     pub fn ilog(self, base: {T}) -> u32;
     pub fn midpoint(self, rhs: {T}) -> {T};
-    pub fn to_be_bytes(self) -> Vec<u8>;
-    pub fn to_le_bytes(self) -> Vec<u8>;
+    pub fn to_be_bytes(self) -> [u8; {N}];
+    pub fn to_le_bytes(self) -> [u8; {N}];
+    pub fn to_ne_bytes(self) -> [u8; {N}] { self.to_le_bytes() }
+    pub fn from_be_bytes(bytes: [u8; {N}]) -> {T};
+    pub fn from_le_bytes(bytes: [u8; {N}]) -> {T};
+    pub fn from_ne_bytes(bytes: [u8; {N}]) -> {T} { {T}::from_le_bytes(bytes) }
     pub fn from_str_radix(src: &str, radix: u32) -> Result<{T}, crate::num::ParseIntError>;
 }
 impl crate::str::FromStr for {T} {
@@ -1093,7 +1097,7 @@ SCALAR_STD = "pub mod num {\n    pub use crate::num_wrapping::Wrapping;\n" + """
         fn from_str(s: &str) -> Result<String, crate::convert::Infallible> { Ok(s.to_string()) }
     }
 """ + "".join(INTEGER_METHODS.replace("{T}", kind).replace("{U}", "u" + kind[1:])
-              for kind in sorted(INTEGER_TYPES)) + "".join(
+              .replace("{N}", str(INTEGER_WIDTHS[kind] // 8)) for kind in sorted(INTEGER_TYPES)) + "".join(
     FLOAT_METHODS.replace("{T}", kind).replace("{B}", "u" + kind[1:]) for kind in sorted(FLOAT_TYPES)) + "}\n"
 def integer_conversions():
     """From impls for lossless integer conversions and TryFrom for the rest, as Rust's std provides."""
@@ -2900,6 +2904,11 @@ class Program:
                         owner, trait.name.text,
                         arguments_wanted=wanted if wanted and not any(isinstance(kind, (TypeVariable, TypeParameter))
                                                                       for kind in wanted) else None)
+                    if implementation and wanted and any(isinstance(kind, TypeVariable) for kind in wanted) and sum(
+                            impl.trait == trait.name.text and match_types(impl.target, owner, impl.parameters, {})
+                            for impl in self.impls) > 1:
+                        # Several impls (TryFrom<Vec<T>> and TryFrom<&[T]>) fit until the trait arguments are known.
+                        return annotation
                     if implementation:
                         impl, arguments = implementation
                         if annotation.item in impl.associated:
@@ -4413,8 +4422,10 @@ class Parser:
             return self.closure(token, self.advance().text if word == "move" else word)
         if word == "<":
             owner = self.type_name()
-            self.expect("as")
-            trait = self.trait_path()
+            trait = None
+            if self.current.text != ">":
+                self.expect("as")
+                trait = self.trait_path()
             self.expect(">")
             self.expect("::")
             member = self.identifier()
@@ -4680,7 +4691,7 @@ class Parser:
                 lifetime = LifetimeArgument(self.lifetime_token(self.advance()).text)
                 if lifetimes:
                     arguments.append(lifetime)
-            elif (word in {"{", "-", "true", "false"} or self.unqualified_constant()
+            elif (word in {"{", "-", "true", "false"} or (not parameter and self.unqualified_constant())
                   or word and word[0].isdigit()
                   or word.endswith("'") and word.startswith(("'", "b'"))
                   or (parameter and parameter.const_type)):
@@ -4706,7 +4717,8 @@ class Parser:
             return value
         negative = self.accept("-")
         token = self.advance()
-        if not negative and self.constants and is_identifier(token.text):
+        if (not negative and self.constants and is_identifier(token.text)
+                and identifier_text(token.text) not in self.type_parameters):
             path = self.qualified_token(token, (token.text,), bare=True)
             if path.text in self.constants:
                 return self.constants[path.text]
@@ -8581,6 +8593,17 @@ class Checker:
                           and self.trait_available(actual, trait.name.text, expr.token)]
             if candidates:
                 receiver = actual
+        if not candidates and (isinstance(actual, SliceType) or actual == "str"):
+            # An unsized place autorefs for a by-value trait method, as `bytes[..4].try_into()` does.
+            borrowed = ReferenceType(actual, False)
+            candidates = [trait for trait in self.program.traits.values()
+                          if name in trait.methods and self.has_receiver(trait.methods[name])
+                          and self.implements(borrowed, trait.name.text)
+                          and self.trait_available(borrowed, trait.name.text, expr.token)]
+            if candidates:
+                original = Expr("borrow", expr.token, (original, False), auto_borrow=True)
+                actual = receiver = self.type_of(original, scope)
+                expr.args = (original, *rest)
         if (candidates and isinstance(actual, ReferenceType) and actual.mutable and receiver is base
                 and not isinstance(candidates[0].methods[name].params[0][2], ReferenceType)
                 and self.implements(actual, candidates[0].name.text)
@@ -8770,6 +8793,10 @@ class Checker:
         self.variables.append(output)
         signature = FunctionType((iterator.item,), output)
         actual = self.type_of(mapper, scope, signature)
+        if isinstance(self.resolve(actual), TypeParameter):
+            # A generic `F: FnMut(T) -> U` goes through the std Map adapter.
+            self.variables.remove(output)
+            return None
         if not isinstance(actual, FunctionType) or len(actual.parameters) != 1:
             raise mapper.token.error("map expects a callable with one parameter")
         self.require(actual.parameters[0], iterator.item, mapper.token)
@@ -10712,6 +10739,17 @@ def format_value(value, annotation, spec):
         if text is not None:
             return text
     kind = spec.kind
+    if (kind == "?" and isinstance(value, ArrayValue) and not spec.alternate
+            and (spec.width or spec.precision is not None or spec.sign or spec.zero)):
+        # Debug for slices hands the formatter to each element, so width and precision apply per element.
+        element = annotation.inner if isinstance(annotation, ReferenceType) else annotation
+        element = (element.element if isinstance(element, (ArrayType, SliceType))
+                   else element.arguments[0] if is_vector(element) else None)
+        # str and char Debug write their quoted text without padding.
+        return "[" + ", ".join(display(item, True) if isinstance(text_of_plain(item), (str, Character))
+                               else format_value(item, element if element is not None else (
+            "f64" if isinstance(item, float) else "i64" if isinstance(item, int) and not isinstance(item, bool)
+            else None), spec) for item in value.items) + "]"
     numeric = annotation in NUMBER_TYPES
     prefix = ""
     if kind in {"b", "o", "x", "X"}:
@@ -10741,6 +10779,12 @@ def format_value(value, annotation, spec):
     align = spec.align or (">" if numeric else "<")
     left = width if align == ">" else width // 2 if align == "^" else 0
     return spec.fill * left + sign + prefix + text + spec.fill * (width - left)
+
+
+def text_of_plain(value):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
+        value = value.read()
+    return value
 
 
 USER_FORMAT = None
@@ -12619,6 +12663,10 @@ def method_rotate_right(interpreter, result, items, count):
     items.write(ArrayValue(values[split:] + values[:split]))
 
 
+# Integer rotate_left/rotate_right below share these names; they defer to the slice versions.
+slice_rotate_left, slice_rotate_right = INTRINSICS[".rotate_left"], INTRINSICS[".rotate_right"]
+
+
 @intrinsic
 def method_copy_from_slice(interpreter, result, items, source):
     values = items_of(source)
@@ -12665,6 +12713,11 @@ def method_rchunks(interpreter, result, items, size):
         raise RustPanic("chunk size must be non-zero")
     count = len(items_of(items))
     return views(items, ((max(stop - size, 0), stop) for stop in range(count, 0, -size)))
+
+
+INTRINSICS[".chunks_mut"] = method_chunks
+INTRINSICS[".chunks_exact_mut"] = method_chunks_exact
+INTRINSICS[".rchunks_mut"] = method_rchunks
 
 
 @intrinsic
@@ -12930,6 +12983,9 @@ def rust_iter_max(interpreter, result, iterator, last):
 @intrinsic
 def rust_iter_collect(interpreter, result, iterator):
     return ArrayValue(tuple(interpreter.iterate(iterator, 0)))
+
+
+INTRINSICS["collect_exact"] = rust_iter_collect
 
 
 @intrinsic
@@ -13508,6 +13564,8 @@ def method_trailing_ones(interpreter, result, value):
 
 @intrinsic
 def method_rotate_left(interpreter, result, value, amount):
+    if result not in INTEGER_WIDTHS:
+        return slice_rotate_left(interpreter, result, value, amount)
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits << amount) | (bits >> (width - amount))) & ((1 << width) - 1), result)
@@ -13515,6 +13573,8 @@ def method_rotate_left(interpreter, result, value, amount):
 
 @intrinsic
 def method_rotate_right(interpreter, result, value, amount):
+    if result not in INTEGER_WIDTHS:
+        return slice_rotate_right(interpreter, result, value, amount)
     width = INTEGER_WIDTHS[result]
     bits, amount = unsigned_bits(value, width), amount % width
     return wrap(((bits >> amount) | (bits << (width - amount))) & ((1 << width) - 1), result)
@@ -13591,6 +13651,16 @@ def method_to_be_bytes(interpreter, result, value):
 def method_to_le_bytes(interpreter, result, value):
     width = interpreter.receiver_width()
     return ArrayValue(tuple(unsigned_bits(value, width).to_bytes(width // 8, "little")))
+
+
+@intrinsic
+def method_from_be_bytes(interpreter, result, items):
+    return wrap(int.from_bytes(bytes(items_of(items)), "big"), result)
+
+
+@intrinsic
+def method_from_le_bytes(interpreter, result, items):
+    return wrap(int.from_bytes(bytes(items_of(items)), "little"), result)
 
 
 def parse_error(interpreter, result, kind):

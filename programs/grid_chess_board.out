@@ -1,0 +1,24 @@
+0
+8 rnbqkbnr
+7 pppppppp
+6 .:.:.:.:
+5 :.:.:.:.
+4 .:.:.:.:
+3 :.:.:.:.
+2 PPPPPPPP
+1 RNBQKBNR
+  abcdefgh
+8 rnb:kbnr
+7 pppp:ppp
+6 .:.:.:.:
+5 :.:.p.:.
+4 .:.:P:.N
+3 :.:.:.:.
+2 PPPP.PPP
+1 RNBQKB:R
+  abcdefgh
+white 16 black 15
+Some(Piece { kind: Knight, color: White })
+Some(Piece { kind: Pawn, color: Black })
+dark squares: 32
+[0, 1, 0, 1, 0, 1, 0, 1]

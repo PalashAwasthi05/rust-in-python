@@ -1,0 +1,22 @@
+0
+ X | X | X 
+---+---+---
+ . | O | . 
+---+---+---
+ . | . | O 
+X wins!
+
+ X | X | O 
+---+---+---
+ O | O | X 
+---+---+---
+ X | O | X 
+draw
+
+error: cell (1, 1) taken by X
+ O | . | O 
+---+---+---
+ X | X | . 
+---+---+---
+ X | . | . 
+unfinished, O to move

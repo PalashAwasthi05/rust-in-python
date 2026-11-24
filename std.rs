@@ -134,7 +134,7 @@ pub mod iter {
             if step == 0 { panic!("assertion failed: step != 0"); }
             StepBy { iter: self, step: step - 1, first: true }
         }
-        fn chain<U>(self, other: U) -> Chain<Self, U::IntoIter> where Self: Sized, U: IntoIterator {
+        fn chain<U>(self, other: U) -> Chain<Self, U::IntoIter> where Self: Sized, U: IntoIterator<Item = Self::Item> {
             Chain { first: Some(self), second: other.into_iter() }
         }
         fn zip<U>(self, other: U) -> Zip<Self, U::IntoIter> where Self: Sized, U: IntoIterator {
@@ -2499,5 +2499,58 @@ pub mod env {
     }
     pub fn var(key: &str) -> Result<String, VarError> {
         match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
+    }
+}
+
+pub mod array {
+    use crate::iter::Iterator;
+
+    // Collects exactly N items into an array; callers guarantee the count.
+    pub fn collect_exact<I: Iterator, const N: usize>(iter: I) -> [I::Item; N];
+
+    pub fn from_fn<T, const N: usize, F: FnMut(usize) -> T>(f: F) -> [T; N] {
+        collect_exact((0..N).map(f))
+    }
+
+    impl<T, const N: usize> [T; N] {
+        pub fn map<U, F: FnMut(T) -> U>(self, f: F) -> [U; N] { collect_exact(self.into_iter().map(f)) }
+        pub fn each_ref(&self) -> [&T; N] { collect_exact(self.iter()) }
+        pub fn each_mut(&mut self) -> [&mut T; N] { collect_exact(self.iter_mut()) }
+        pub fn as_slice(&self) -> &[T] { self }
+        pub fn as_mut_slice(&mut self) -> &mut [T] { self }
+    }
+
+    impl<T, const N: usize> crate::intrinsics::Join for [T; N] { type Output = Vec<T>; }
+
+    impl<T> [T] {
+        pub fn chunks_mut(&mut self, size: usize) -> crate::iter::Lazy<&mut [T]>;
+        pub fn chunks_exact_mut(&mut self, size: usize) -> crate::iter::Lazy<&mut [T]>;
+        pub fn rchunks_mut(&mut self, size: usize) -> crate::iter::Lazy<&mut [T]>;
+        pub fn select_nth_unstable(&mut self, index: usize) -> (&mut [T], &mut T, &mut [T]) where T: Ord {
+            self.sort_unstable();
+            let (left, rest) = self.split_at_mut(index);
+            let (middle, right) = rest.split_at_mut(1);
+            (left, &mut middle[0], right)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TryFromSliceError(());
+    impl crate::fmt::Display for TryFromSliceError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "could not convert slice to array") }
+    }
+    impl crate::error::Error for TryFromSliceError {}
+
+    impl<T, const N: usize> TryFrom<Vec<T>> for [T; N] {
+        type Error = Vec<T>;
+        fn try_from(value: Vec<T>) -> Result<[T; N], Vec<T>> {
+            if value.len() == N { Ok(collect_exact(value.into_iter())) } else { Err(value) }
+        }
+    }
+    impl<T: Copy, const N: usize> TryFrom<&[T]> for [T; N] {
+        type Error = TryFromSliceError;
+        fn try_from(value: &[T]) -> Result<[T; N], TryFromSliceError> {
+            if value.len() == N { Ok(collect_exact(value.iter().copied())) } else { Err(TryFromSliceError(())) }
+        }
     }
 }

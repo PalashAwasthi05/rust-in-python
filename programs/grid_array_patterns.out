@@ -1,0 +1,24 @@
+0
+1 2 3
+10 50
+7 [8, 9]
+r s
+[0, 0, 0] -> zero
+[4, 4, 4] -> uniform
+[1, 0, 9] -> middle zero
+[9, 5, 1] -> descending ends
+[1, 2, 3] -> other
+nothing
+only 5
+5 then [6, 7]
+Some([2, 3]) Some([]) None
+#ff8000
+Rgb([255, 128, 0])
+dot 44
+(2,1) (4,3) (6,5) 
+det -2
+starts with 1, second row [3, 4]
+[1, 0, 0, 9]
+[11, 0, 0, 9]
+3 > 1 and 4 more
+[1, 2] [3, 4]
