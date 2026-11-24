@@ -1570,6 +1570,52 @@ VALID = [
             println!("{x:?} {y:?}");
         }
     """, '"Rust🦀!" 9 4\nSome(\'!\') Some(\'🦀\')\nRust in\n"" true "true" "Ω"\n"five" ""\n'),
+    ("string views preserve explicit and elided lifetimes", """
+        fn view<'a>(text: &'a String) -> &'a str { text.as_str() }
+        fn echo(text: &str) -> &str { text }
+        fn static_text() -> &'static str { "static" }
+        fn main() {
+            let mut s = String::from("Rust🦀");
+            let a: &str = echo(&s);
+            let b = view(&s);
+            println!("{a} {b:?} {}", a.len());
+            s.push('!');
+            let mut t = String::from("abcΩ");
+            t.as_mut_str().make_ascii_uppercase();
+            let appended = s + &t;
+            match appended.as_str() { "Rust🦀!ABCΩ" => println!("matched"), _ => panic!("unexpected") }
+            println!("{appended} {}", static_text());
+        }
+    """, 'Rust🦀 "Rust🦀" 8\nmatched\nRust🦀!ABCΩ static\n'),
+    ("UTF-8 substrings alias the original data", """
+        fn middle<'a>(text: &'a str) -> &'a str { &text[1..3] }
+        fn main() {
+            let mut text = String::from("aΩbc");
+            let s = middle(&text);
+            println!("{s} {}", s.len());
+            text[3..].make_ascii_uppercase();
+            let alt = &text[1..];
+            println!("{} {} {}", text, &alt[..2], &alt[2..=3]);
+            let fixed: &'static str = &"XY"[..1];
+            println!("{fixed}");
+            let frozen = ["a", "b"];
+            let item = frozen[1];
+            println!("{item}");
+            let mut text: &'static str = "before";
+            println!("{text}");
+            text = "after";
+            println!("{text}");
+        }
+    """, "Ω 2\naΩBC Ω BC\nX\nb\nbefore\nafter\n"),
+    ("string iterators distinguish Unicode scalars and UTF-8 bytes", """
+        fn main() {
+            let mut s = String::from("aΩ");
+            let letters = s.chars().rev();
+            for c in letters { println!("{c}"); }
+            s.push('!');
+            for b in s[1..3].bytes() { println!("{b}"); }
+        }
+    """, "Ω\na\n206\n169\n"),
 ]
 
 INVALID = [
@@ -2323,6 +2369,28 @@ INVALID = [
             println!("{borrowed}");
         }
     """, "immutably borrowed"),
+    ("borrowed strings cannot outlive their owner", """
+        fn invalid() -> &'static str {
+            let text = String::from("rust");
+            text.as_str()
+        }
+        fn main() {}
+    """, "outlives its block"),
+    ("dynamic string views cannot be stored in static string fields", """
+        struct Message { name: &'static str }
+        fn main() {
+            let text = String::from("rust");
+            let _message = Message { name: &text };
+        }
+    """, "reference does not live for 'static"),
+    ("string iterators hold a borrow of the original text", """
+        fn main() {
+            let mut text = String::from("x");
+            let chars = text.chars();
+            text.push('y');
+            for character in chars { println!("{character}"); }
+        }
+    """, "immutably borrowed"),
 ]
 
 
@@ -2420,11 +2488,18 @@ class InterpreterTests(unittest.TestCase):
                     println!("{text}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "borrowed_string.rs"
-            unsupported.write_text('''
+            borrowed_string = folder / "borrowed_string.rs"
+            borrowed_string.write_text('''
                 fn main() {
                     let text = String::from("rust");
                     println!("{}", text.as_str());
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "iterator_collect.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let text: String = "abc".chars().rev().collect();
+                    println!("{text}");
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2452,21 +2527,29 @@ class InterpreterTests(unittest.TestCase):
                     text.truncate(1);
                 }
             ''', encoding="utf-8")
+            substring = folder / "substring.rs"
+            substring.write_text('''
+                fn main() {
+                    let text = String::from("🦀");
+                    println!("before");
+                    println!("{}", &text[1..2]);
+                }
+            ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, map_iterator, string, unsupported, panics, bounds,
-                                     overflow, shift, utf8],
+                                     for_iteration, iterator, map_iterator, string, borrowed_string, unsupported,
+                                     panics, bounds, overflow, shift, utf8, substring],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match"])
+                              "runtime_match", "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
 
