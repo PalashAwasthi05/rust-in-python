@@ -3478,8 +3478,8 @@ class InterpreterTests(unittest.TestCase):
             formatting.write_text('''
                 fn main() { println!("{:.2}", 1.234f64); }
             ''', encoding="utf-8")
-            unsupported = folder / "static_item.rs"
-            unsupported.write_text('''
+            static_slice = folder / "static_item.rs"
+            static_slice.write_text('''
                 static NUMBERS: &[i32] = &[3];
                 fn main() { println!("{}", NUMBERS[0]); }
             ''', encoding="utf-8")
@@ -3520,17 +3520,17 @@ class InterpreterTests(unittest.TestCase):
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
                                      for_iteration, iterator, map_iterator, string, borrowed_string, collect, floating,
-                                     formatting, unsupported,
+                                     formatting, static_slice,
                                      panics, bounds, overflow, shift, utf8, substring],
                                     text=True, capture_output=True, timeout=40, check=False)
-            self.assertEqual(report.returncode, 1, report.stderr)
+            self.assertEqual(report.returncode, 0, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "acceptance_mismatch",
+                              "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")

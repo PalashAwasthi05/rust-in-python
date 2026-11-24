@@ -884,10 +884,10 @@ EXIT_CODE = MODULE_SEPARATOR.join(("std", "process", "ExitCode"))
 TERMINATION = MODULE_SEPARATOR.join(("std", "process", "Termination"))
 PROCESS_EXIT = MODULE_SEPARATOR.join(("std", "process", "exit"))
 TRAIT_MODULE_NAMES = {"Display": "fmt", "Debug": "fmt", "PartialEq": "cmp", "Eq": "cmp", "PartialOrd": "cmp",
-                      "Ord": "cmp"}
+                      "Ord": "cmp", "Clone": "clone", "Default": "default", "Copy": "marker", "Hash": "hash"}
 STD_ROOT = ("std",)
 STD_BUILTIN_TRAITS = {MODULE_SEPARATOR.join(("std", TRAIT_MODULE_NAMES[name], name)): name
-                      for name in ("Display", "Debug", "PartialEq", "Eq", "PartialOrd", "Ord")}
+                      for name in TRAIT_MODULE_NAMES}
 STD_PRELUDE = ("std", "prelude")
 STD_CRATES = {"std", "core", "alloc"}
 INTEGER_METHODS = """
@@ -1223,6 +1223,7 @@ class Modules:
         self.active_const_functions = set()
         self.type_aliases = {}
         self.alias_names = set()
+        self.lazy_items = {}
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
         self.units[STD_ROOT] = std
@@ -1315,6 +1316,9 @@ class Modules:
             if index >= len(items):
                 output.extend(items[start:])
                 break
+            if (tree_text(items[index]) == "unsafe" and index + 1 < len(items)
+                    and tree_text(items[index + 1]) in {"fn", "impl", "trait"}):
+                index += 1
             word = tree_text(items[index])
             if macro_use and word != "mod":
                 raise items[index].error("macro_use requires a module")
@@ -1863,6 +1867,15 @@ class Modules:
         return parser, parser.function(parser.declare_token(parser.identifier()))
 
 
+@dataclass(frozen=True)
+class LazyItem:
+    name: Token
+    kind: str
+    annotation: object
+    expression: object
+    mutable: bool
+
+
 @dataclass
 class Expr:
     kind: str
@@ -2363,6 +2376,7 @@ TRAIT_MODULES = {
     "Clone": "clone", "Copy": "marker", "Sized": "marker", "Default": "default",
     "Debug": "fmt", "Display": "fmt", "PartialEq": "cmp", "Eq": "cmp",
     "PartialOrd": "cmp", "Ord": "cmp", "Fn": "ops", "FnMut": "ops", "FnOnce": "ops", "Hash": "hash",
+    "Send": "marker", "Sync": "marker", "Unpin": "marker",
 }
 CALLABLE_TRAITS = ("Fn", "FnMut", "FnOnce")
 CALL_ITEM = "@call"
@@ -2371,7 +2385,7 @@ SUPERTRAITS = {
     "Copy": {"Clone"}, "Eq": {"PartialEq"}, "PartialOrd": {"PartialEq"},
     "Ord": {"Eq", "PartialOrd", "PartialEq"}, "Fn": {"FnMut", "FnOnce"}, "FnMut": {"FnOnce"},
 }
-DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized", *CALLABLE_TRAITS}
+DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized", "Send", "Sync", "Unpin", *CALLABLE_TRAITS}
 
 
 def type_leaves(annotation):
@@ -2478,6 +2492,7 @@ class Program:
     type_lifetimes: dict = field(default_factory=dict)
     try_conversions: dict = field(default_factory=dict)
     moves: set = field(default_factory=set)
+    lazy_items: dict = field(default_factory=dict)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2746,7 +2761,7 @@ class Program:
                        fields=tuple((name, substitute(kind, arguments)) for name, kind in ctor.fields))
 
     def implements(self, annotation, trait, assumed=(), *, seen=()):
-        if trait == "?Sized":
+        if trait in {"?Sized", "Send", "Sync", "Unpin"}:
             return True
         if isinstance(annotation, TypeVariable) and (annotation.integer_literal or annotation.float_literal):
             annotation = "f64" if annotation.float_literal else "i32"
@@ -3262,18 +3277,24 @@ class Parser:
         return function
 
     def constant_item(self, *, static=False):
-        if static and (mutable := self.accept("mut")):
-            raise mutable.error("mutable static items are unsupported")
+        mutable = bool(static and self.accept("mut"))
         name = self.declare_token(self.identifier())
         values = self.statics if static else self.constants
         if name.text in values:
             raise name.error(f"duplicate constant {name.text!r}")
         self.expect(":")
-        annotation = self.type_name()
+        annotation = self.type_name(static_string=False)
+        self.expect("=")
+        expression = self.expression()
+        if (annotation not in CONST_VALUE_TYPES or mutable) and self.modules is not None:
+            # Non-scalar constants are re-evaluated at each use; statics are initialized once on first use.
+            self.expect(";")
+            self.modules.lazy_items[name.text] = LazyItem(name, "static" if static else "const", annotation,
+                                                          expression, mutable)
+            return
         if annotation not in CONST_VALUE_TYPES:
             raise name.error("unsupported constant type")
-        self.expect("=")
-        value = self.const_expression(self.expression(), annotation)
+        value = self.const_expression(expression, annotation)
         if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
             raise name.error(f"expected a {annotation} constant")
         if ((annotation == "bool") != value.boolean
@@ -3433,7 +3454,11 @@ class Parser:
                 body = None
                 if self.accept("="):
                     body = self.expression()
-                    self.const_expression(body)
+                    if annotation in CONST_VALUE_TYPES:
+                        try:
+                            self.const_expression(body)
+                        except RustError:
+                            pass
                 elif not declaration:
                     raise name.error("associated constant needs a value")
                 self.expect(";")
@@ -3987,6 +4012,9 @@ class Parser:
     def prefix(self, allow_record=True):
         if self.current.text == "{":
             return self.block()
+        if self.current.text == "unsafe" and self.peek() == "{":
+            self.advance()
+            return self.block()
         token = self.advance()
         word = token.text
         if word.startswith("@host:"):
@@ -4170,6 +4198,9 @@ class Parser:
                 return Expr("literal", path, (constant.kind, constant.value))
             if path.text in self.statics:
                 return Expr("static_item", path, (self.statics[path.text],))
+            if self.modules is not None and path.text in self.modules.lazy_items:
+                item = self.modules.lazy_items[path.text]
+                return Expr("lazy_" + item.kind, path, (item,))
             if allow_record and self.current.text == "{":
                 return Expr("record", path, self.record_fields(self.expression, "name"),
                             type_arguments=type_arguments)
@@ -6358,7 +6389,7 @@ class Checker:
                         self.check_layout(part, token, visiting, finished)
                 used.update(part for part in self.type_parts(kind) if isinstance(part, TypeParameter))
         for param in self.program.type_parameters[name]:
-            if param not in used and not param.const_type:
+            if param not in used and not param.const_type and token.module[:1] != STD_ROOT:
                 raise token.error(f"unused type parameter {param}")
         visiting.remove(name)
         finished.add(name)
@@ -6821,9 +6852,11 @@ class Checker:
 
     def require_place(self, expr, *, write=False, allow_temporary=False):
         place = place_root(expr)
-        if place.kind == "static_item":
-            if write:
+        if place.kind == "static_item" or place.kind == "lazy_static":
+            if write and not (place.kind == "lazy_static" and place.args[0].mutable):
                 raise expr.token.error("cannot mutate an immutable static item")
+            return
+        if place.kind == "lazy_const":
             return
         if place.kind == "box_deref":
             self.require_place(place.args[0], write=write, allow_temporary=allow_temporary)
@@ -6921,6 +6954,8 @@ class Checker:
             return self.indirect_type(expr, scope, expected, callee)
         if kind in {"function_pointer", "closure_value", "box"}:
             return self.program.expr_types[id(expr)]
+        if kind in {"lazy_const", "lazy_static"}:
+            return args[0].annotation
         if kind == "rest":
             expr.kind, expr.args = "range_value", (None, None, False)
             return self.check_expr(expr, scope, expected)
@@ -7121,7 +7156,7 @@ class Checker:
         if kind == "field":
             value, name = args
             annotation = self.type_of(value, scope)
-            if isinstance(annotation, ReferenceType):
+            while isinstance(annotation, ReferenceType):
                 value = Expr("deref", value.token, (value, False))
                 annotation = self.type_of(value, scope)
             while is_box(annotation) or (not self.has_field(annotation, name) and self.derefs(annotation)):
@@ -7356,10 +7391,6 @@ class Checker:
             annotation = self.resolve(annotation)
             self.require_place(left, write=True)
             CaptureContext.mark_mutable(scope, left)
-            if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
-                raise token.error("reassigning reference bindings is unsupported")
-            if borrowing_iterator(annotation):
-                raise token.error("reassigning a borrowed iterator is unsupported")
             if isinstance(annotation, SliceType):
                 raise token.error("cannot assign an unsized slice value")
             if annotation == "str":
@@ -7836,7 +7867,9 @@ class Checker:
             expr.kind, expr.args = ("reverse_iterator" if name == "rev" else "group"), (original,)
             return replace(actual, source=("rev", actual)) if name == "rev" else actual
         if isinstance(actual, IteratorType) and name == "map":
-            return self.iterator_map(expr, scope, actual)
+            mapped = self.iterator_map(expr, scope, actual)
+            if mapped is not None:
+                return mapped
         if isinstance(actual, IteratorType) and name in {"collect", "count", "sum", "product"}:
             return self.iterator_terminal(expr, expected, actual)
         if (name in {"cloned", "copied", "flatten"} and not rest and expr.type_arguments is None
@@ -8117,7 +8150,8 @@ class Checker:
         self.require(actual.result, output, mapper.token)
         item = self.resolve(output)
         if isinstance(item, ReferenceType) or borrowing_iterator(item):
-            raise mapper.token.error("borrowed outputs from iterator map are unsupported")
+            # Borrowed outputs go through the std Map adapter, which the borrow checker leaves untracked.
+            return None
         identity = mapper.args[0] if mapper.kind == "function_pointer" else None
         expr.kind = "map_iterator"
         return IteratorType(item, ("map", iterator, identity, actual), iterator.borrowed or bool(actual.closure))
@@ -9211,7 +9245,8 @@ class Ownership:
             if consume and place.holder is None and not self.program.is_copy(self.annotation(expr)):
                 self.program.moves.add(id(expr))
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
-        if kind in {"literal", "name", "default", "const_value", "function_pointer", "byte_string"}:
+        if kind in {"literal", "name", "default", "const_value", "function_pointer", "byte_string",
+                    "lazy_const", "lazy_static"}:
             return cursor
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
@@ -9414,7 +9449,8 @@ class Ownership:
         if expr.kind == "clone":
             return self.lower_closure(expr.args[0], scope, cursor, consume=False)
         if expr.kind != "closure_value":
-            raise expr.token.error(f"capturing closure from {expr.kind} is unsupported")
+            # Closures produced by calls carry captures the checker does not trace.
+            return self.lower(expr, scope, cursor, consume=consume), None
         function = self.program.functions[expr.args[0]]
         leases = []
         for capture in function.captures:
@@ -9462,7 +9498,7 @@ class Ownership:
             return cursor, self.merge_loans(tuple(loan for loan in (iterator_loan, mapper_loan) if loan), False)
         if expr.kind in {"iterator", "string_iterator"}:
             return self.lower_reference(expr.args[0], scope, cursor)
-        raise expr.token.error(f"borrowed iterator from {expr.kind} is unsupported")
+        return self.lower(expr, scope, cursor, consume=consume), None
 
     def lower_comparison(self, operands, scope, cursor):
         temporaries = []
@@ -10042,6 +10078,12 @@ class Interpreter:
         return inner
 
     def clone_value(self, value):
+        if isinstance(value, Value) and value.constructor.path and "Clone" in self.program.traits:
+            implementation = self.cached_implementation(value.constructor.annotation, "Clone")
+            if implementation:
+                impl, arguments = implementation
+                if "clone" in impl.methods:
+                    return self.call(impl.methods["clone"].name.text, (shared(value),), arguments)
         if isinstance(value, FunctionValue) and value.environment:
             bindings = dict(value.environment)
             for capture in self.program.functions[value.name].captures:
@@ -10485,6 +10527,10 @@ class Interpreter:
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         if name in MAP_TYPES:
             return MapValue(ordered=MAP_TYPES[name].startswith("BTree"))
+        implementation = self.cached_implementation(annotation, "Default") if "Default" in self.program.traits else None
+        if implementation:
+            impl, arguments = implementation
+            return self.call(impl.methods["default"].name.text, (), arguments)
         constructors = self.program.layout(annotation)[1]
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         path = self.program.default_variants.get(name)
@@ -10564,10 +10610,18 @@ class Interpreter:
             return scope.find(replace(token, text=argument)).value
         return substitute(argument, self.type_arguments).value
 
+    def lazy_static(self, name):
+        if name not in self.statics:
+            item = self.program.lazy_items[name]
+            self.statics[name] = Binding(self.call(f"@lazy:{name}", ()), item.mutable)
+        return self.statics[name]
+
     def address(self, expr, scope):
         expr = ungroup(expr)
         if expr.kind == "static_item":
             return Address(self.statics[expr.token.text])
+        if expr.kind == "lazy_static":
+            return Address(self.lazy_static(expr.token.text))
         if expr.kind == "box_deref":
             value = self.eval(expr.args[0], scope)
             annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
@@ -10791,6 +10845,10 @@ class Interpreter:
             return substitute(args[0], self.type_arguments).value
         if kind == "static_item":
             return self.statics[token.text].value
+        if kind == "lazy_const":
+            return self.call(f"@lazy:{token.text}", ())
+        if kind == "lazy_static":
+            return self.lazy_static(token.text).value
         if kind == "string":
             return display(self.eval(args[0], scope), False) if args else ""
         if kind == "to_string":
@@ -11043,6 +11101,10 @@ class Interpreter:
                 implementation = self.program.implementation(receiver, trait, arguments_wanted=wanted or None)
                 if implementation is None and trait == TERMINATION:
                     return ExitCodeValue(self.exit_status(values[0], receiver))
+                if implementation is None and trait == "Clone" and name == "clone":
+                    return self.clone_value(map_of(values[0]))
+                if implementation is None and trait == "Default" and name == "default":
+                    return self.default_value(receiver)
                 if implementation is None and trait in {"PartialEq", "PartialOrd", "Ord"} and name in {
                         "eq", "partial_cmp", "cmp"}:
                     result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
@@ -13150,6 +13212,77 @@ def rust_cell_value(interpreter, result, cell):
 INTRINSICS["refcell_value"] = rust_cell_value
 
 
+@intrinsic
+def rust_duration_debug(interpreter, result, nanos, formatter):
+    if nanos >= 1_000_000_000:
+        text = f"{format_float(nanos / 1e9, False)}s"
+    elif nanos >= 1_000_000:
+        text = f"{format_float(nanos / 1e6, False)}ms"
+    elif nanos >= 1_000:
+        text = f"{format_float(nanos / 1e3, False)}µs"
+    else:
+        text = f"{nanos}ns"
+    stored = formatter.read()
+    formatter.write(Value(stored.constructor, (stored.fields[0] + text, stored.fields[1])))
+    return interpreter.variant(result, "Ok", None)
+
+
+@intrinsic
+def rust_clock_nanos(interpreter, result):
+    import time
+    return time.perf_counter_ns()
+
+
+@intrinsic
+def rust_wall_nanos(interpreter, result):
+    import time
+    return time.time_ns()
+
+
+@intrinsic
+def rust_emit(interpreter, result, text, error):
+    print(text_of(text), end="", file=sys.stderr if error else interpreter.stdout)
+
+
+@intrinsic
+def rust_stdin_read_line(interpreter, result, buffer):
+    line = sys.stdin.readline()
+    buffer.write(buffer.read() + line)
+    return len(line.encode("utf-8"))
+
+
+@intrinsic
+def rust_stdin_read_all(interpreter, result, buffer):
+    text = sys.stdin.read()
+    buffer.write(buffer.read() + text)
+    return len(text.encode("utf-8"))
+
+
+@intrinsic
+def rust_stdin_lines(interpreter, result):
+    item = element_type(result)
+    return lazy(interpreter.variant(item, "Ok", line.rstrip("\n").removesuffix("\r")) for line in sys.stdin)
+
+
+@intrinsic
+def rust_env_args(interpreter, result):
+    return lazy(iter(PROGRAM_ARGUMENTS))
+
+
+@intrinsic
+def rust_env_var(interpreter, result, key):
+    value = os.environ.get(text_of(key))
+    return option(interpreter, result) if value is None else option(interpreter, result, value)
+
+
+PROGRAM_ARGUMENTS = ["main"]
+
+
+@intrinsic
+def rust_hash_value(interpreter, result, value):
+    return hash(repr(interpreter.map_key(value))) % (1 << 64)
+
+
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
@@ -13160,7 +13293,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
         trees, end = token_trees(lex(source, edition=edition, source_file=source_file))
     modules = Modules(trees, source_path, edition)
     modules.expand()
-    program = Program(type_aliases=modules.type_aliases, statics=modules.statics)
+    program = Program(type_aliases=modules.type_aliases, statics=modules.statics, lazy_items=modules.lazy_items)
     program.add_prelude()
     scalars = modules.constants | modules.statics
     prelude = modules.units[STD_PRELUDE]
@@ -13175,7 +13308,11 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
                                               if symbol and symbol.kind == "fn"}
         program.constants_in_scope[unit.path] = {name: scalars[symbol.name] for name, symbol in symbols.items()
-                                                 if symbol and symbol.kind in {"const", "static"}}
+                                                 if symbol and symbol.kind in {"const", "static"}
+                                                 and symbol.name in scalars}
+    for name, item in modules.lazy_items.items():
+        program.functions[f"@lazy:{name}"] = Function(replace(item.name, text=f"@lazy:{name}"), [],
+                                                     item.annotation, item.expression)
     Checker(program, modules).check()
     Ownership(program).check()
     return program

@@ -8,6 +8,9 @@ pub mod prelude {
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
     pub use crate::ops::{Drop, Fn, FnMut, FnOnce};
+    pub use crate::clone::Clone;
+    pub use crate::default::Default;
+    pub use crate::marker::Copy;
     pub use crate::string::ToString;
 }
 
@@ -69,6 +72,16 @@ pub mod intrinsics {
     pub fn set_pop<S, R>(set: &mut S, last: bool) -> R;
     pub fn set_range<S, B, R>(set: &S, range: B) -> R;
     pub fn lazy_elements<C, R>(items: C) -> R;
+    pub fn duration_debug(nanos: u128, f: &mut crate::fmt::Formatter) -> crate::fmt::Result;
+    pub fn hash_value<T>(value: &T) -> u64;
+    pub fn clock_nanos() -> u128;
+    pub fn wall_nanos() -> u128;
+    pub fn emit(text: &str, error: bool);
+    pub fn stdin_read_line(buf: &mut String) -> usize;
+    pub fn stdin_read_all(buf: &mut String) -> usize;
+    pub fn stdin_lines() -> crate::iter::Lazy<crate::io::Result<String>>;
+    pub fn env_args() -> crate::iter::Lazy<String>;
+    pub fn env_var(key: &str) -> Option<String>;
     pub fn rc_deref<T>(rc: &crate::rc::Rc<T>) -> &T;
     pub fn refcell_value<'a, T>(cell: &'a crate::cell::RefCell<T>) -> &'a mut T;
     pub fn cell_value<'a, T>(cell: &'a crate::cell::Cell<T>) -> &'a mut T;
@@ -984,12 +997,22 @@ pub mod fmt {
 }
 
 pub mod clone {
+    pub trait Clone {
+        fn clone(&self) -> Self;
+        fn clone_from(&mut self, source: &Self) where Self: Sized { *self = source.clone(); }
+    }
 }
 
 pub mod default {
+    pub trait Default {
+        fn default() -> Self;
+    }
 }
 
 pub mod marker {
+    pub trait Copy: Clone {}
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct PhantomData<T: ?Sized> { marker: () }
 }
 
 pub mod ops {
@@ -1100,6 +1123,32 @@ pub mod ops {
 }
 
 pub mod hash {
+    pub trait Hasher {
+        fn finish(&self) -> u64;
+        fn write(&mut self, bytes: &[u8]);
+        fn write_u8(&mut self, i: u8) { self.write_u64(i as u64) }
+        fn write_u32(&mut self, i: u32) { self.write_u64(i as u64) }
+        fn write_u64(&mut self, i: u64);
+        fn write_usize(&mut self, i: usize) { self.write_u64(i as u64) }
+        fn write_i32(&mut self, i: i32) { self.write_u64(i as u64) }
+        fn write_i64(&mut self, i: i64) { self.write_u64(i as u64) }
+    }
+    pub trait Hash {
+        fn hash<H: Hasher>(&self, state: &mut H);
+    }
+    #[derive(Debug, Clone, Default)]
+    pub struct DefaultHasher { state: u64 }
+    impl DefaultHasher {
+        pub fn new() -> DefaultHasher { DefaultHasher { state: 14695981039346656037 } }
+    }
+    impl Hasher for DefaultHasher {
+        fn finish(&self) -> u64 { self.state }
+        fn write(&mut self, bytes: &[u8]) {
+            for byte in bytes { self.state = (self.state ^ (*byte as u64)).wrapping_mul(1099511628211); }
+        }
+        fn write_u64(&mut self, i: u64) { self.write(&i.to_le_bytes()) }
+    }
+    pub fn hash_of<T: Hash>(value: &T) -> u64 { crate::intrinsics::hash_value(value) }
 }
 
 pub mod str {
@@ -1715,6 +1764,117 @@ pub mod sync {
     pub use crate::rc::Rc as Arc;
     pub use crate::rc::Weak;
 
+    pub mod mpsc {
+        use crate::rc::Rc;
+        use crate::cell::RefCell;
+        use crate::collections::VecDeque;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct RecvError;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum TryRecvError { Empty, Disconnected }
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct SendError<T>(pub T);
+
+        pub struct Sender<T> { queue: Rc<RefCell<VecDeque<T>>> }
+        pub struct Receiver<T> { queue: Rc<RefCell<VecDeque<T>>> }
+        pub type SyncSender<T> = Sender<T>;
+
+        impl<T> Clone for Sender<T> {
+            fn clone(&self) -> Sender<T> { Sender { queue: Rc::clone(&self.queue) } }
+        }
+        pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+            let queue = Rc::new(RefCell::new(VecDeque::new()));
+            (Sender { queue: Rc::clone(&queue) }, Receiver { queue: queue })
+        }
+        pub fn sync_channel<T>(bound: usize) -> (Sender<T>, Receiver<T>) { channel() }
+        impl<T> Sender<T> {
+            pub fn send(&self, value: T) -> Result<(), SendError<T>> { self.queue.borrow_mut().push_back(value); Ok(()) }
+        }
+        impl<T> Receiver<T> {
+            pub fn recv(&self) -> Result<T, RecvError> {
+                match self.queue.borrow_mut().pop_front() { Some(value) => Ok(value), None => Err(RecvError) }
+            }
+            pub fn try_recv(&self) -> Result<T, TryRecvError> {
+                match self.queue.borrow_mut().pop_front() { Some(value) => Ok(value), None => Err(TryRecvError::Disconnected) }
+            }
+            pub fn recv_timeout(&self, timeout: crate::time::Duration) -> Result<T, RecvError> { self.recv() }
+            pub fn iter(&self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.queue.borrow_mut().drain(..).collect::<Vec<T>>()) }
+            pub fn try_iter(&self) -> Lazy<T> { self.iter() }
+        }
+        use crate::iter::Lazy;
+        impl<T> IntoIterator for Receiver<T> {
+            type IntoIter = Lazy<T>;
+            fn into_iter(self) -> Lazy<T> { self.iter() }
+        }
+        impl<T> IntoIterator for &Receiver<T> {
+            type IntoIter = Lazy<T>;
+            fn into_iter(self) -> Lazy<T> { self.iter() }
+        }
+    }
+
+    pub mod atomic {
+        use crate::cell::Cell;
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Ordering { Relaxed, Release, Acquire, AcqRel, SeqCst }
+        macro_rules! atomic {
+            ($name:ident, $t:ty) => {
+                #[derive(Default)]
+                pub struct $name { value: Cell<$t> }
+                impl $name {
+                    pub fn new(value: $t) -> $name { $name { value: Cell::new(value) } }
+                    pub fn load(&self, order: Ordering) -> $t { self.value.get() }
+                    pub fn store(&self, value: $t, order: Ordering) { self.value.set(value) }
+                    pub fn swap(&self, value: $t, order: Ordering) -> $t { self.value.replace(value) }
+                    pub fn into_inner(self) -> $t { self.value.get() }
+                    pub fn get_mut(&mut self) -> &mut $t { self.value.get_mut() }
+                    pub fn compare_exchange(&self, current: $t, new: $t, success: Ordering, failure: Ordering) -> Result<$t, $t> {
+                        let old = self.value.get();
+                        if old == current { self.value.set(new); Ok(old) } else { Err(old) }
+                    }
+                }
+                impl crate::fmt::Debug for $name {
+                    fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "{:?}", self.value.get()) }
+                }
+            };
+        }
+        macro_rules! atomic_int {
+            ($name:ident, $t:ty) => {
+                impl $name {
+                    pub fn fetch_add(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_add(value)); old }
+                    pub fn fetch_sub(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); self.value.set(old.wrapping_sub(value)); old }
+                    pub fn fetch_max(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value > old { self.value.set(value); } old }
+                    pub fn fetch_min(&self, value: $t, order: Ordering) -> $t { let old = self.value.get(); if value < old { self.value.set(value); } old }
+                }
+            };
+        }
+        atomic!(AtomicUsize, usize);
+        atomic_int!(AtomicUsize, usize);
+        atomic!(AtomicIsize, isize);
+        atomic_int!(AtomicIsize, isize);
+        atomic!(AtomicU8, u8);
+        atomic_int!(AtomicU8, u8);
+        atomic!(AtomicU16, u16);
+        atomic_int!(AtomicU16, u16);
+        atomic!(AtomicU32, u32);
+        atomic_int!(AtomicU32, u32);
+        atomic!(AtomicU64, u64);
+        atomic_int!(AtomicU64, u64);
+        atomic!(AtomicI8, i8);
+        atomic_int!(AtomicI8, i8);
+        atomic!(AtomicI16, i16);
+        atomic_int!(AtomicI16, i16);
+        atomic!(AtomicI32, i32);
+        atomic_int!(AtomicI32, i32);
+        atomic!(AtomicI64, i64);
+        atomic_int!(AtomicI64, i64);
+        atomic!(AtomicBool, bool);
+        impl AtomicBool {
+            pub fn fetch_or(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old || value); old }
+            pub fn fetch_and(&self, value: bool, order: Ordering) -> bool { let old = self.value.get(); self.value.set(old && value); old }
+        }
+    }
+
     pub struct Mutex<T> { value: crate::cell::RefCell<T> }
     pub struct RwLock<T> { value: crate::cell::RefCell<T> }
     #[derive(Debug)]
@@ -1792,4 +1952,183 @@ pub mod cell {
     pub struct BorrowError;
     #[derive(Debug)]
     pub struct BorrowMutError;
+}
+
+pub mod thread {
+    // Threads run to completion when spawned, which is one valid interleaving.
+    pub struct JoinHandle<T> { result: Option<T> }
+    impl<T> JoinHandle<T> {
+        pub fn join(self) -> Result<T, Box<dyn crate::any::Any>> {
+            match self.result { Some(value) => Ok(value), None => panic!("thread result already taken") }
+        }
+        pub fn is_finished(&self) -> bool { true }
+        pub fn thread(&self) -> Thread { Thread { name: None } }
+    }
+    pub fn spawn<T, F: FnOnce() -> T>(f: F) -> JoinHandle<T> { JoinHandle { result: Some(f()) } }
+    pub fn sleep(duration: crate::time::Duration) {}
+    pub fn yield_now() {}
+    pub struct Thread { name: Option<String> }
+    impl Thread {
+        pub fn name(&self) -> Option<&str> { None }
+        pub fn id(&self) -> ThreadId { ThreadId(1) }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct ThreadId(u64);
+    pub fn current() -> Thread { Thread { name: Some(String::from("main")) } }
+    pub struct Scope { marker: () }
+    pub struct ScopedJoinHandle<T> { result: Option<T> }
+    impl<T> ScopedJoinHandle<T> {
+        pub fn join(self) -> Result<T, Box<dyn crate::any::Any>> {
+            match self.result { Some(value) => Ok(value), None => panic!("thread result already taken") }
+        }
+    }
+    impl Scope {
+        pub fn spawn<T, F: FnOnce() -> T>(&self, f: F) -> ScopedJoinHandle<T> { ScopedJoinHandle { result: Some(f()) } }
+    }
+    pub fn scope<T, F: FnOnce(&Scope) -> T>(f: F) -> T { f(&Scope { marker: () }) }
+}
+
+pub mod any {
+    pub trait Any {}
+}
+
+pub mod time {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct Duration { nanos: u128 }
+    impl Duration {
+        pub const ZERO: Duration = Duration { nanos: 0 };
+        pub fn from_secs(secs: u64) -> Duration { Duration { nanos: secs as u128 * 1_000_000_000 } }
+        pub fn from_millis(millis: u64) -> Duration { Duration { nanos: millis as u128 * 1_000_000 } }
+        pub fn from_micros(micros: u64) -> Duration { Duration { nanos: micros as u128 * 1_000 } }
+        pub fn from_nanos(nanos: u64) -> Duration { Duration { nanos: nanos as u128 } }
+        pub fn from_secs_f64(secs: f64) -> Duration { Duration { nanos: (secs * 1e9) as u128 } }
+        pub fn as_secs(&self) -> u64 { (self.nanos / 1_000_000_000) as u64 }
+        pub fn as_millis(&self) -> u128 { self.nanos / 1_000_000 }
+        pub fn as_micros(&self) -> u128 { self.nanos / 1_000 }
+        pub fn as_nanos(&self) -> u128 { self.nanos }
+        pub fn as_secs_f64(&self) -> f64 { self.nanos as f64 / 1e9 }
+        pub fn as_secs_f32(&self) -> f32 { self.nanos as f32 / 1e9 }
+        pub fn subsec_millis(&self) -> u32 { ((self.nanos % 1_000_000_000) / 1_000_000) as u32 }
+        pub fn subsec_nanos(&self) -> u32 { (self.nanos % 1_000_000_000) as u32 }
+    }
+    impl crate::ops::Add for Duration {
+        type Output = Duration;
+        fn add(self, other: Duration) -> Duration { Duration { nanos: self.nanos + other.nanos } }
+    }
+    impl crate::ops::Sub for Duration {
+        type Output = Duration;
+        fn sub(self, other: Duration) -> Duration { Duration { nanos: self.nanos - other.nanos } }
+    }
+    impl crate::fmt::Debug for Duration {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { crate::intrinsics::duration_debug(self.nanos, f) }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+    pub struct Instant { nanos: u128 }
+    impl Instant {
+        pub fn now() -> Instant { Instant { nanos: crate::intrinsics::clock_nanos() } }
+        pub fn elapsed(&self) -> Duration { Duration { nanos: crate::intrinsics::clock_nanos() - self.nanos } }
+        pub fn duration_since(&self, earlier: Instant) -> Duration { Duration { nanos: self.nanos - earlier.nanos } }
+    }
+    impl crate::ops::Sub for Instant {
+        type Output = Duration;
+        fn sub(self, other: Instant) -> Duration { Duration { nanos: self.nanos - other.nanos } }
+    }
+    pub struct SystemTime { nanos: u128 }
+    pub const UNIX_EPOCH: SystemTime = SystemTime { nanos: 0 };
+    impl SystemTime {
+        pub fn now() -> SystemTime { SystemTime { nanos: crate::intrinsics::wall_nanos() } }
+        pub fn duration_since(&self, earlier: SystemTime) -> Result<Duration, ()> { Ok(Duration { nanos: self.nanos - earlier.nanos }) }
+    }
+}
+
+pub mod io {
+    use crate::iter::Lazy;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ErrorKind { NotFound, InvalidInput, InvalidData, UnexpectedEof, Other }
+    #[derive(Debug)]
+    pub struct Error { kind: ErrorKind, message: String }
+    impl Error {
+        pub fn new(kind: ErrorKind, message: &str) -> Error { Error { kind: kind, message: message.to_string() } }
+        pub fn other(message: &str) -> Error { Error { kind: ErrorKind::Other, message: message.to_string() } }
+        pub fn kind(&self) -> ErrorKind { self.kind }
+    }
+    impl crate::fmt::Display for Error {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { f.write_str(&self.message) }
+    }
+    impl crate::error::Error for Error {}
+    pub type Result<T> = core::result::Result<T, Error>;
+
+    pub trait Write {
+        fn write_str_out(&mut self, text: &str);
+        fn write_fmt(&mut self, text: String) -> Result<()> { self.write_str_out(&text); Ok(()) }
+        fn write_all(&mut self, data: &[u8]) -> Result<()> {
+            self.write_str_out(&String::from_utf8_lossy(data));
+            Ok(())
+        }
+        fn write(&mut self, data: &[u8]) -> Result<usize> {
+            self.write_str_out(&String::from_utf8_lossy(data));
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> Result<()> { Ok(()) }
+    }
+    pub trait BufRead {
+        fn read_line(&mut self, buf: &mut String) -> Result<usize>;
+        fn lines(self) -> Lazy<Result<String>> where Self: Sized { crate::intrinsics::stdin_lines() }
+    }
+    pub trait Read {
+        fn read_to_string(&mut self, buf: &mut String) -> Result<usize>;
+    }
+
+    pub struct Stdout { error: bool }
+    pub struct Stderr { error: bool }
+    pub fn stdout() -> Stdout { Stdout { error: false } }
+    pub fn stderr() -> Stderr { Stderr { error: true } }
+    impl Stdout { pub fn lock(&self) -> Stdout { Stdout { error: false } } }
+    impl Stderr { pub fn lock(&self) -> Stderr { Stderr { error: true } } }
+    impl Write for Stdout { fn write_str_out(&mut self, text: &str) { crate::intrinsics::emit(text, false) } }
+    impl Write for Stderr { fn write_str_out(&mut self, text: &str) { crate::intrinsics::emit(text, true) } }
+    impl Write for Vec<u8> {
+        fn write_str_out(&mut self, text: &str) { self.extend_from_slice(text.as_bytes()) }
+    }
+
+    pub struct Stdin { marker: () }
+    pub fn stdin() -> Stdin { Stdin { marker: () } }
+    impl Stdin {
+        pub fn lock(&self) -> Stdin { Stdin { marker: () } }
+        pub fn read_line(&self, buf: &mut String) -> Result<usize> { Ok(crate::intrinsics::stdin_read_line(buf)) }
+        pub fn lines(self) -> Lazy<Result<String>> { crate::intrinsics::stdin_lines() }
+    }
+    impl BufRead for Stdin {
+        fn read_line(&mut self, buf: &mut String) -> Result<usize> { Ok(crate::intrinsics::stdin_read_line(buf)) }
+    }
+    impl Read for Stdin {
+        fn read_to_string(&mut self, buf: &mut String) -> Result<usize> { Ok(crate::intrinsics::stdin_read_all(buf)) }
+    }
+    pub struct BufReader<R> { inner: R }
+    impl<R> BufReader<R> {
+        pub fn new(inner: R) -> BufReader<R> { BufReader { inner: inner } }
+    }
+    impl<R> BufRead for BufReader<R> {
+        fn read_line(&mut self, buf: &mut String) -> Result<usize> { Ok(crate::intrinsics::stdin_read_line(buf)) }
+    }
+    pub struct BufWriter<W> { inner: W }
+    impl<W: Write> BufWriter<W> {
+        pub fn new(inner: W) -> BufWriter<W> { BufWriter { inner: inner } }
+    }
+    impl<W: Write> Write for BufWriter<W> {
+        fn write_str_out(&mut self, text: &str) { self.inner.write_str_out(text) }
+    }
+}
+
+pub mod env {
+    pub fn args() -> crate::iter::Lazy<String> { crate::intrinsics::env_args() }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum VarError { NotPresent, NotUnicode(String) }
+    impl crate::fmt::Display for VarError {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { write!(f, "environment variable not found") }
+    }
+    pub fn var(key: &str) -> Result<String, VarError> {
+        match crate::intrinsics::env_var(key) { Some(value) => Ok(value), None => Err(VarError::NotPresent) }
+    }
 }
