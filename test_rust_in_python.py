@@ -1547,6 +1547,29 @@ VALID = [
             println!("{}", mapper(0));
         }
     """, "4\n10\n2\n1 1\n3\n6\n3\n6\n2\n"),
+    ("owned strings preserve UTF-8 lengths and character boundaries", """
+        use std::string::String as Text;
+        fn add_mark(text: &mut Text) { text.push('!'); }
+        fn main() {
+            let mut text = Text::from("Rust");
+            text.push('🦀');
+            add_mark(&mut text);
+            println!("{:?} {} {}", text, text.len(), "🦀".len());
+            assert_eq!(text, "Rust🦀!");
+            println!("{:?} {:?}", text.pop(), text.pop());
+            text += " in ";
+            let mut result = text + "Python";
+            result.truncate(7);
+            println!("{result}");
+            let mut empty = String::new();
+            empty.push_str("lost");
+            empty.clear();
+            println!("{:?} {} {:?} {:?}", empty, empty.is_empty(), true.to_string(), 'Ω'.to_string());
+            let x: String = "five".to_owned();
+            let y: String = Default::default();
+            println!("{x:?} {y:?}");
+        }
+    """, '"Rust🦀!" 9 4\nSome(\'!\') Some(\'🦀\')\nRust in\n"" true "true" "Ω"\n"five" ""\n'),
 ]
 
 INVALID = [
@@ -2285,6 +2308,21 @@ INVALID = [
             for n in v.iter_mut().map(|value| *value + v.len()) { println!("{n}"); }
         }
     """, "mutably borrowed"),
+    ("adding strings consumes the owned left operand", """
+        fn main() {
+            let a = String::from("Rust");
+            let b = a + " in Python";
+            println!("{a} {b}");
+        }
+    """, "use of moved value 'a'"),
+    ("writing a string requires its active shared reference to end", """
+        fn main() {
+            let mut text = String::from("rust");
+            let borrowed = &text;
+            text.push('!');
+            println!("{borrowed}");
+        }
+    """, "immutably borrowed"),
 ]
 
 
@@ -2374,12 +2412,19 @@ class InterpreterTests(unittest.TestCase):
                     for n in vec![1, 2, 3].into_iter().map(|n| n + 1) { println!("{n}"); }
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "owned_string.rs"
-            unsupported.write_text('''
+            string = folder / "owned_string.rs"
+            string.write_text('''
                 fn main() {
                     let mut text = String::from("Rust");
                     text.push('!');
                     println!("{text}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "borrowed_string.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let text = String::from("rust");
+                    println!("{}", text.as_str());
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2399,20 +2444,29 @@ class InterpreterTests(unittest.TestCase):
                 fn rotate(n: u8, amount: i16) -> u8 { n << amount }
                 fn main() { println!("before"); rotate(1, -1); }
             ''', encoding="utf-8")
+            utf8 = folder / "utf8.rs"
+            utf8.write_text('''
+                fn main() {
+                    let mut text = String::from("🦀");
+                    println!("before");
+                    text.truncate(1);
+                }
+            ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, map_iterator, unsupported, panics, bounds, overflow, shift],
+                                     for_iteration, iterator, map_iterator, string, unsupported, panics, bounds,
+                                     overflow, shift, utf8],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match"])
+                              "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
 

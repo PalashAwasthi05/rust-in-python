@@ -488,7 +488,8 @@ MODULE_SEPARATOR = "§"
 OPTION = MODULE_SEPARATOR.join(("core", "option", "Option"))
 RESULT = MODULE_SEPARATOR.join(("core", "result", "Result"))
 VEC = MODULE_SEPARATOR.join(("alloc", "vec", "Vec"))
-PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC}
+STRING = MODULE_SEPARATOR.join(("alloc", "string", "String"))
+PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
 macro_rules! assert {
@@ -813,13 +814,13 @@ class Modules:
             crate = head
             module, head, *tail = tail
             if (module, head) not in {("option", "Option"), ("result", "Result")}:
-                if (crate, module, head) != ("std", "vec", "Vec"):
+                if crate != "std" or (module, head) not in {("vec", "Vec"), ("string", "String")}:
                     return None
         if head in PRELUDE_TYPES and len(tail) <= 1:
             parts = tuple(PRELUDE_TYPES[head].split(MODULE_SEPARATOR))
             if tail:
                 return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{tail[0]}"), "associated", (), token)
-            return ModuleSymbol(parts, "struct" if head == "Vec" else "enum", (), token)
+            return ModuleSymbol(parts, "struct" if head in {"Vec", "String"} else "enum", (), token)
         if head in PRELUDE_VARIANTS and not tail:
             parts = tuple(PRELUDE_VARIANTS[head].split(MODULE_SEPARATOR))
             return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{head}"), "associated", (), token)
@@ -1630,6 +1631,8 @@ class Program:
         if isinstance(annotation, SliceType):
             return trait in {"Debug", "PartialEq", "Eq", "PartialOrd", "Ord"} and self.implements(
                 annotation.element, trait, assumed)
+        if annotation == STRING:
+            return trait in {"Clone", "Debug", "Display", "Default", "PartialEq", "Eq", "PartialOrd", "Ord"}
         if annotation in PRIMITIVES:
             return trait != "Display" or annotation != "()"
         return trait in self.derives.get(annotation, {})
@@ -4068,7 +4071,7 @@ class Checker:
         if self.program.type_parameters.get(annotation):
             count = len(self.program.type_parameters[annotation])
             raise token.error(f"{annotation} expects {count} type arguments")
-        if annotation in PRIMITIVES or annotation in self.program.types:
+        if annotation in PRIMITIVES or annotation == STRING or annotation in self.program.types:
             return
         if annotation != NEVER or not allow_never:
             raise token.error(f"unsupported type {annotation!r}")
@@ -4948,6 +4951,8 @@ class Checker:
                 arguments = self.specialize(self.program.type_parameters[VEC], expr.type_arguments, token)
                 owner = AppliedType(VEC, tuple(arguments.values()))
             return self.vector_constructor(expr, scope, owner or expected)
+        if token.text in {f"{STRING}::new", f"{STRING}::from"}:
+            return self.string_constructor(expr, scope, token.text.rsplit("::", 1)[-1])
         ctor = self.program.constructors.get(token.text)
         if ctor and ctor.style == "tuple":
             ctor = self.constructor(expr, "tuple", expected)
@@ -5108,7 +5113,8 @@ class Checker:
             result = self.prelude_method(expr, scope, original, actual, base, rest)
             if result is not None:
                 return result
-        if (isinstance(base, (ArrayType, SliceType)) or is_vector(base)) and name in {"len", "is_empty"} and not rest:
+        has_length = isinstance(base, (ArrayType, SliceType)) or is_vector(base) or base in {STRING, "&str"}
+        if has_length and name in {"len", "is_empty"} and not rest and expr.type_arguments is None:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", expr.token, (original, False))
                 self.type_of(original, scope)
@@ -5116,6 +5122,11 @@ class Checker:
             return "usize" if name == "len" else "bool"
         if is_vector(base) and name in {"push", "pop", "clear", "truncate", "as_slice", "as_mut_slice"}:
             return self.vector_method(expr, scope, expected, actual, base)
+        if base == STRING and name in {"push", "push_str", "pop", "clear", "truncate"}:
+            arguments = {"push": ("char",), "push_str": ("&str",), "truncate": ("usize",)}.get(name, ())
+            result = AppliedType(OPTION, ("char",)) if name == "pop" else "()"
+            return self.builtin_receiver_call(expr, scope, expected, actual, STRING, arguments,
+                                              result, kind="string_method", mutable=True)
         # There can be multiple inherent impl blocks on one target.
         for impl in self.program.impls:
             if impl.trait or name not in impl.methods:
@@ -5144,6 +5155,11 @@ class Checker:
         if name == "clone" and not rest:
             expr.kind = "clone"
             return self.check_expr(expr, scope, expected)
+        if ((name == "to_string" or (name == "to_owned" and actual == "&str"))
+                and not rest and expr.type_arguments is None):
+            self.obligation(base, "Display", expr.token)
+            expr.kind, expr.args = "to_string", (original,)
+            return STRING
         raise expr.token.error(f"no method {name!r} for {base}")
 
     def prelude_method(self, expr, scope, original, actual, base, rest):
@@ -5179,6 +5195,20 @@ class Checker:
             raise expr.token.error("Vec::new takes no arguments")
         expr.kind = "vector"
         return self.sequence_type(expr, scope, expected)
+
+    def string_constructor(self, expr, scope, name):
+        count = int(name == "from")
+        if len(expr.args) != count or expr.type_arguments is not None:
+            raise expr.token.error(f"String::{name} takes {count} arguments")
+        if count:
+            actual = self.type_of(expr.args[0], scope)
+            if actual == NEVER:
+                expr.kind, expr.args = "group", (expr.args[0],)
+                return NEVER
+            if actual not in {"&str", "char", STRING}:
+                raise expr.token.error(f"cannot construct String from {actual}")
+        expr.kind = "string"
+        return STRING
 
     def iterator_constructor(self, expr, scope, original, actual):
         name = expr.token.text
@@ -5224,23 +5254,28 @@ class Checker:
 
     def vector_method(self, expr, scope, expected, actual, base):
         name = expr.token.text
-        original, *rest = expr.args
         element = base.arguments[0]
         mutable = name != "as_slice"
-        receiver = ReferenceType(base, mutable)
-        if not isinstance(actual, ReferenceType):
-            original = Expr("borrow", expr.token, (original, mutable), auto_borrow=True)
-            actual = self.type_of(original, scope)
-        if expr.type_arguments is not None:
-            raise expr.token.error(f"{name} takes no type arguments")
-        params = (receiver, element) if name == "push" else (receiver, "usize") if name == "truncate" else (receiver,)
+        arguments = (element,) if name == "push" else ("usize",) if name == "truncate" else ()
         if name == "pop":
             result = AppliedType(OPTION, (element,))
         elif name in {"as_slice", "as_mut_slice"}:
             result = ReferenceType(SliceType(element), mutable)
         else:
             result = "()"
-        expr.kind, expr.args = "vector_method", (original, *rest)
+        return self.builtin_receiver_call(expr, scope, expected, actual, base, arguments,
+                                          result, kind="vector_method", mutable=mutable)
+
+    def builtin_receiver_call(self, expr, scope, expected, actual, base, arguments, result, *, kind, mutable):
+        original, *rest = expr.args
+        receiver = ReferenceType(base, mutable)
+        if not isinstance(actual, ReferenceType):
+            original = Expr("borrow", expr.token, (original, mutable), auto_borrow=True)
+            actual = self.type_of(original, scope)
+        if expr.type_arguments is not None:
+            raise expr.token.error(f"{expr.token.text} takes no type arguments")
+        expr.kind, expr.args = kind, (original, *rest)
+        params = (receiver, *arguments)
         checked_result = self.check_call(expr, scope, expected, params, result, {}, actual)
         if isinstance(result, ReferenceType):
             self.program.call_functions[id(expr)] = Function(
@@ -5324,6 +5359,8 @@ class Checker:
     def call_on_type(self, expr, scope, expected, owner, name):
         if is_vector(owner) and name == "new":
             return self.vector_constructor(expr, scope, owner)
+        if owner == STRING and name in {"new", "from"}:
+            return self.string_constructor(expr, scope, name)
         for impl in self.program.impls:
             if impl.trait is not None or name not in impl.methods:
                 continue
@@ -5343,13 +5380,17 @@ class Checker:
 
     def binary_type(self, token, left, right):
         word = token.text
+        if word == "+" and left == STRING:
+            self.require(right, "&str", token)
+            return NEVER if right == NEVER else STRING
         if word in {"&&", "||"}:
             self.require(left, "bool", token)
             self.require(right, "bool", token)
             return NEVER if left == NEVER else "bool"
         if word in COMPARE:
             if left != NEVER and right != NEVER:
-                self.require(right, left, token)
+                if word not in {"==", "!="} or {left, right} != {STRING, "&str"}:
+                    self.require(right, left, token)
                 self.obligation(left, "PartialEq" if word in {"==", "!="} else "PartialOrd", token)
             return NEVER if NEVER in {left, right} else "bool"
         if word in SHIFTS:
@@ -5995,14 +6036,14 @@ class Ownership:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"length", "is_empty"}:
+        if kind in {"length", "is_empty", "to_string"}:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "range_index":
             for item in args[:3]:
                 if item is not None:
                     cursor = self.lower(item, scope, cursor)
             return cursor
-        if kind in {"array", "tuple", "index", "array_repeat", "vector", "vector_repeat"}:
+        if kind in {"array", "tuple", "index", "array_repeat", "vector", "vector_repeat", "string"}:
             for item in (args[:1] if kind == "array_repeat" else args):
                 cursor = self.lower(item, scope, cursor)
             return cursor
@@ -6125,7 +6166,7 @@ class Ownership:
             for _, value in args[0]:
                 cursor = self.lower(value, scope, cursor)
             return cursor
-        if kind in {"call", "indirect_call", "vector_method"}:
+        if kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, _ = self.lower_call(expr, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
         if kind in {"print", "panic"}:
@@ -6447,6 +6488,8 @@ def complement(value, annotation):
 
 
 def binary(word, left, right, token, integer="i32", *, runtime=False):
+    if word == "+" and integer == STRING:
+        return left + right
     if word in BITWISE and integer == "bool":
         return BITWISE[word](left, right)
     if word in SHIFTS:
@@ -6593,6 +6636,8 @@ class Interpreter:
             return 0
         if annotation in PRIMITIVES:
             return {"bool": False, "char": Character("\0"), "&str": "", "()": None}[annotation]
+        if annotation == STRING:
+            return ""
         if isinstance(annotation, ArrayType):
             return ArrayValue(tuple(self.default_value(annotation.element)
                                     for _ in range(annotation.length.value)))
@@ -6635,6 +6680,12 @@ class Interpreter:
         if layout:
             return next(ctor for ctor in layout[1] if ctor.path == template.path)
         return template
+
+    def option_value(self, expr, fields):
+        annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+        variant = "Some" if fields else "None"
+        ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path.endswith(f"::{variant}"))
+        return Value(ctor, fields)
 
     def address(self, expr, scope):
         expr = ungroup(expr)
@@ -6728,12 +6779,27 @@ class Interpreter:
             elif token.text == "truncate":
                 address.write(ArrayValue(items[:arguments[0]]))
             elif token.text == "pop":
-                annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
-                variant = "Some" if items else "None"
-                ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path.endswith(f"::{variant}"))
                 if items:
                     address.write(ArrayValue(items[:-1]))
-                return Value(ctor, items[-1:])
+                return self.option_value(expr, items[-1:])
+            return None
+        if kind == "string_method":
+            address = self.eval(args[0], scope)
+            arguments = tuple(self.eval(arg, scope) for arg in args[1:])
+            value = address.read()
+            if token.text in {"push", "push_str"}:
+                address.write(value + arguments[0])
+            elif token.text == "clear":
+                address.write("")
+            elif token.text == "truncate":
+                try:
+                    address.write(value.encode("utf-8")[:arguments[0]].decode("utf-8"))
+                except UnicodeDecodeError:
+                    raise RustPanic("String::truncate requires a UTF-8 character boundary") from None
+            elif token.text == "pop":
+                if value:
+                    address.write(value[:-1])
+                return self.option_value(expr, (Character(value[-1]),) if value else ())
             return None
         if kind == "macro_definition":
             scope.remember(token)
@@ -6752,6 +6818,10 @@ class Interpreter:
             return Address(Binding(ArrayValue(args), False))
         if kind == "const_value":
             return substitute(args[0], self.type_arguments).value
+        if kind == "string":
+            return str(self.eval(args[0], scope)) if args else ""
+        if kind == "to_string":
+            return display(self.eval(args[0], scope), False)
         if kind in {"array", "vector"}:
             return ArrayValue(tuple(self.eval(item, scope) for item in args))
         if kind == "tuple":
@@ -6769,7 +6839,11 @@ class Interpreter:
             return self.address(expr, scope).read()
         if kind in {"length", "is_empty"}:
             root = self.address(args[0], scope)
-            length = root.length if isinstance(root, SliceAddress) else len(root.read().items)
+            if isinstance(root, SliceAddress):
+                length = root.length
+            else:
+                value = root.read()
+                length = len(value.encode("utf-8")) if isinstance(value, str) else len(value.items)
             return length if kind == "length" else length == 0
         if kind == "default":
             annotation = self.program.expr_types[id(expr)]

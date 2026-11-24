@@ -60,6 +60,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
 - Signed and unsigned integer widths, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
+- Owned `String` values with concatenation and UTF-8-aware lengths and mutation
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `println!` with display, debug, and named placeholders
 
