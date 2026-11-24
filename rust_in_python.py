@@ -882,6 +882,10 @@ STRING = MODULE_SEPARATOR.join(("alloc", "string", "String"))
 EXIT_CODE = MODULE_SEPARATOR.join(("std", "process", "ExitCode"))
 TERMINATION = MODULE_SEPARATOR.join(("std", "process", "Termination"))
 PROCESS_EXIT = MODULE_SEPARATOR.join(("std", "process", "exit"))
+STD_ROOT = ("std",)
+STD_PRELUDE = ("std", "prelude")
+STD_CRATES = {"std", "core", "alloc"}
+STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8")
 PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT, "Vec": VEC, "Box": BOX, "String": STRING}
 PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
 PRELUDE_MACROS = """
@@ -969,6 +973,9 @@ class Modules:
         self.type_aliases = {}
         self.alias_names = set()
         root.items = self.scan(root, trees)
+        std = ModuleUnit(STD_ROOT, None)
+        self.units[STD_ROOT] = std
+        std.items = self.scan(std, token_trees(lex(STD_SOURCE, edition=edition, source_file="<std>"))[0])
 
     def register(self, unit, token, kind, boundary):
         if not is_identifier(token.text) or token.text in RESERVED_BY_EDITION[self.edition]:
@@ -1221,7 +1228,7 @@ class Modules:
             head = path.pop(0)
             absolute = True
             if head == "crate":
-                root = self.units[()]
+                root = self.units[STD_ROOT if unit.path[:1] == STD_ROOT else ()]
             if head == "super":
                 current = unit.path
                 while True:
@@ -1236,13 +1243,23 @@ class Modules:
             return ModuleSymbol(root.path, "module", (), token)
         first = path.pop(0)
         symbol = self.lookup(root, first, origin, token)
+        if not symbol and not absolute and first in STD_CRATES:
+            symbol = ModuleSymbol(STD_ROOT, "module", (), token)
+        if not symbol and not absolute:
+            symbol = self.lookup(self.units[STD_PRELUDE], first, origin, token)
         if not symbol:
             if absolute:
                 raise token.error("unresolved path")
             return self.prelude((first, *path), token)
         while path and symbol.kind == "module":
             nested = self.units[symbol.path]
-            symbol = self.lookup(nested, path.pop(0), origin, token)
+            name = path.pop(0)
+            found = self.lookup(nested, name, origin, token)
+            if not found and symbol.path[:1] == STD_ROOT:
+                if not path and TRAIT_MODULES.get(name) == symbol.path[-1]:
+                    return ModuleSymbol((name,), "trait", (), token)
+                return self.prelude(("std", *symbol.path[1:], name, *path), token)
+            symbol = found
             if not symbol:
                 raise token.error("unresolved path")
         if not path:
@@ -2348,6 +2365,7 @@ class Parser:
         self.current = next(self.tokens)
         self.type_parameters = {}
         self.argument_parameters = None
+        self.lifetime_scope = {}
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
         if unit:
             self.trait_names.update(unit.trait_imports)
@@ -2414,6 +2432,8 @@ class Parser:
         return Modules.visibility(self.unit, TokenGroup(opening, tuple(parts), closing))
 
     def type_name(self, *, static_string=False, signature=None):
+        if signature is None and self.lifetime_scope:
+            signature = self.lifetime_scope
         token = self.advance()
         if token.text == "_":
             return None
@@ -2596,15 +2616,22 @@ class Parser:
             name = self.declare_token(self.identifier())
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
-            function = self.function(name)
+            function = self.function(name, declaration=self.in_std)
             if constant:
                 self.validate_const_function(function)
             program.functions[name.text] = function
         return program
 
+    @property
+    def in_std(self):
+        return bool(self.unit and self.unit.path[:1] == STD_ROOT)
+
     def function(self, name, *, method=False, declaration=False):
         outer_parameters = self.type_parameters
+        outer_lifetimes = self.lifetime_scope
         lifetimes, parameters = self.generic_parameters()
+        lifetimes = {**outer_lifetimes, **lifetimes}
+        self.lifetime_scope = lifetimes
         self.type_parameters = outer_parameters | parameters
         self.argument_parameters = parameters
         self.expect("(")
@@ -2653,6 +2680,7 @@ class Parser:
                             method_parameters=tuple(parameters.values()) if method else (),
                             lifetimes=lifetimes, self_sized=sized_receiver)
         self.type_parameters = outer_parameters
+        self.lifetime_scope = outer_lifetimes
         return function
 
     def constant_item(self, *, static=False):
@@ -2818,10 +2846,10 @@ class Parser:
                 function = Function(internal, [], annotation, body,
                                     type_parameters=tuple(self.type_parameters.values()), associated_const=True)
             else:
-                function = self.function(internal, method=True, declaration=declaration)
+                function = self.function(internal, method=True, declaration=declaration or self.in_std)
             function.visible_from = visible
             methods[name.text] = function
-            if function.body is not None:
+            if function.body is not None or (self.in_std and not declaration):
                 program.functions[internal.text] = function
         return methods, associated
 
@@ -4757,6 +4785,8 @@ class Checker:
             concrete = self.effective_function(function, tuple(kind for _, _, kind in function.params),
                                                self.resolve(self.result))
             function.return_inputs = concrete.return_inputs
+            if function.body is None:
+                continue
             result = self.type_of(function.body, scope, self.result)
             if opaque and result == function.result:
                 result = NEVER
@@ -4841,7 +4871,8 @@ class Checker:
             target_parameters = set(self.type_parts(impl.target))
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
-            if impl.trait is None and (isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
+            if impl.trait is None and impl.token.module[:1] != STD_ROOT and (
+                    isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
                 raise impl.token.error("inherent impl requires a declared struct or enum")
             for previous in self.program.impls[:index]:
                 if previous.trait == impl.trait and overlapping_types(previous.target, impl.target):
@@ -5233,8 +5264,6 @@ class Checker:
                                       for capture in function.captures)
         for annotation, token in self.generic_arguments:
             annotation = self.resolve(annotation)
-            if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
-                raise token.error("references as generic type arguments are unsupported")
             if borrowing_iterator(annotation):
                 raise token.error("borrowed iterators as generic type arguments are unsupported")
         for annotation, trait, token in self.obligations:
@@ -5382,14 +5411,9 @@ class Checker:
             return
         if isinstance(annotation, TupleType):
             for kind in annotation.elements:
-                if (isinstance(kind, ReferenceType) or (isinstance(kind, FunctionType) and kind.closure)
-                        or borrowing_iterator(kind)) and not is_static_str(kind):
-                    raise token.error("references, capturing closures, and borrowed iterators in tuples are unsupported")
                 self.check_type(kind, token)
             return
         if isinstance(annotation, ArrayType):
-            if isinstance(annotation.element, ReferenceType) and not is_static_str(annotation.element):
-                raise token.error("reference elements in arrays are unsupported")
             if borrowing_iterator(annotation.element):
                 raise token.error("borrowed iterator elements in arrays are unsupported")
             self.check_type(annotation.element, token)
@@ -5404,8 +5428,6 @@ class Checker:
             self.check_associated_arguments(trait, annotation.item, annotation.arguments, token)
             return
         if isinstance(annotation, ReferenceType):
-            if isinstance(annotation.inner, ReferenceType) and not is_static_str(annotation.inner):
-                raise token.error("nested reference types are unsupported")
             if borrowing_iterator(annotation.inner):
                 raise token.error("references to borrowed iterators are unsupported")
             if annotation.inner == "str":
@@ -5414,8 +5436,6 @@ class Checker:
                 self.check_dyn(annotation.inner, token)
             elif isinstance(annotation.inner, SliceType):
                 element = annotation.inner.element
-                if isinstance(element, ReferenceType):
-                    raise token.error("reference elements in slices are unsupported")
                 self.check_type(element, token)
             else:
                 self.check_type(annotation.inner, token)
@@ -5921,8 +5941,6 @@ class Checker:
             self.check_dyn_conversion(result.arguments[0], expected.arguments[0], expr.token)
             result = expected
         result = self.coerce_reference(expr, result, expected)
-        if isinstance(result, ReferenceType) and not reference_source(expr, result):
-            raise expr.token.error(f"reference result from {expr.kind} is unsupported")
         self.program.expr_types[id(expr)] = result
         return result
 
@@ -7482,6 +7500,8 @@ class Ownership:
         ordered = tuple(function for function in functions if function.name.text.startswith("@closure:"))
         ordered += tuple(function for function in functions if not function.name.text.startswith("@closure:"))
         for function in ordered:
+            if function.body is None:
+                continue
             scope = Scope()
             entry = FlowNode()
             cursor = entry
@@ -7751,8 +7771,9 @@ class Ownership:
                         extend_to.owned.add(local)
             return self.start_loan(cursor, place, mutable, expr.token, expiring=expiring,
                                    two_phase=two_phase and expr.auto_borrow)
-        if expr.kind != "name" and is_static_str(annotation):
-            return self.static_loan(self.lower(expr, scope, cursor), expr.token)
+        if expr.kind != "name":
+            # References copied out of places the checker does not model are not tracked.
+            return self.static_loan(self.lower(expr, scope, cursor, consume=False), expr.token)
         holder = scope.find(expr.token)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
@@ -8822,6 +8843,15 @@ class Interpreter:
 
     def call(self, name, values, arguments=None, environment=None):
         function = self.functions[name]
+        if function.body is None:
+            previous = self.type_arguments
+            self.type_arguments = {p: self.program.normalize(substitute(t, previous))
+                                   for p, t in (arguments or {}).items()}
+            try:
+                result = self.program.normalize(substitute(function.result, self.type_arguments))
+                return INTRINSICS[name.rsplit(MODULE_SEPARATOR, 1)[-1]](self, result, *values)
+            finally:
+                self.type_arguments = previous
         bindings = dict(environment or {}) | {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
@@ -8896,6 +8926,10 @@ class Interpreter:
         if layout:
             return next(ctor for ctor in layout[1] if ctor.path == template.path)
         return template
+
+    def variant(self, annotation, name, *fields):
+        ctor = next(ctor for ctor in self.program.layout(annotation)[1] if ctor.path.endswith(f"::{name}"))
+        return Value(ctor, fields)
 
     def option_value(self, expr, fields):
         annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
@@ -9597,6 +9631,22 @@ def macro_libraries(values):
     return libraries
 
 
+INTRINSICS = {}
+
+
+def intrinsic(function):
+    INTRINSICS[function.__name__] = function
+    return function
+
+
+@intrinsic
+def vec_last(interpreter, result, vector):
+    items = vector.read().items
+    if not items:
+        return interpreter.variant(result, "None")
+    return interpreter.variant(result, "Some", vector.child(Token(str(len(items) - 1), 0, 0)))
+
+
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
@@ -9610,10 +9660,13 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     program = Program(type_aliases=modules.type_aliases, statics=modules.statics)
     program.add_prelude()
     scalars = modules.constants | modules.statics
+    prelude = modules.units[STD_PRELUDE]
+    prelude_traits = {symbol.name for symbol in (prelude.aliases | prelude.symbols).values()
+                      if symbol and symbol.kind == "trait"}
     for unit in modules.units.values():
         Parser("", tokens=(*flatten_trees(unit.items), end), modules=modules, unit=unit).parse(program)
         symbols = unit.glob_aliases | unit.aliases | unit.symbols
-        program.traits_in_scope[unit.path] = unit.hidden_traits | {
+        program.traits_in_scope[unit.path] = unit.hidden_traits | prelude_traits | {
             symbol.name for symbol in symbols.values() if symbol and symbol.kind == "trait"
         }
         program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
