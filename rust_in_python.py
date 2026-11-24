@@ -2503,15 +2503,14 @@ class Parser:
         if word == "loop":
             return Expr("loop", token, (self.block(),))
         if word == "for":
-            mutable = bool(self.accept("mut"))
-            name = self.identifier()
+            pattern = self.pattern()
             self.expect("in")
-            start = self.expression()
+            iterable = self.expression(allow_record=False)
             inclusive = bool(self.accept("..="))
-            if not inclusive:
-                self.expect("..")
-            end = self.expression(allow_record=False)
-            return Expr("for", token, (name, mutable, start, end, inclusive, self.block()))
+            if inclusive or self.accept(".."):
+                stop = self.expression(allow_record=False)
+                iterable = Expr("range", iterable.token, (iterable, stop, inclusive))
+            return Expr("for", token, (pattern, iterable, self.block()))
         if word == "match":
             return self.match_expression(token)
         if word in {"return", "break", "continue"}:
@@ -3085,6 +3084,17 @@ def shared_coercion(actual, expected):
     return (isinstance(actual, ReferenceType) and actual.mutable
             and isinstance(expected, ReferenceType) and not expected.mutable
             and actual.inner == expected.inner)
+
+
+def iteration_item(annotation):
+    base = annotation.inner if isinstance(annotation, ReferenceType) else annotation
+    if isinstance(base, ArrayType) or (isinstance(base, SliceType) and isinstance(annotation, ReferenceType)):
+        element = base.element
+    elif isinstance(base, AppliedType) and base.name in {VEC, OPTION, RESULT}:
+        element = base.arguments[0]
+    else:
+        return None
+    return ReferenceType(element, annotation.mutable) if isinstance(annotation, ReferenceType) else element
 
 
 @dataclass(frozen=True)
@@ -4330,15 +4340,26 @@ class Checker:
         target = ControlTarget(expr)
         test = "()"
         if kind == "for":
-            name, mutable, start, end, _, _ = args
-            first, last = self.operand_types(start, end, scope, same_type=True)
-            integer = self.integer_pair(first, last)
-            bounds = (first, last)
-            for bound in bounds:
-                self.require(bound, integer, token)
-            if NEVER in bounds:
-                test = NEVER
-            scope = Scope(scope, {name.key: Binding(integer, mutable)})
+            source, iterable, _ = args
+            if iterable.kind == "range":
+                start, stop, _ = iterable.args
+                first, last = self.operand_types(start, stop, scope, same_type=True)
+                item = self.integer_pair(first, last)
+                self.require(first, item, token)
+                self.require(last, item, token)
+                if NEVER in {first, last}:
+                    test = NEVER
+            else:
+                annotation = self.type_of(iterable, scope)
+                item = iteration_item(annotation)
+                if item is None:
+                    raise iterable.token.error(f"cannot iterate over {annotation}")
+            pattern, bindings = self.prepare_pattern(source, item)
+            missing = uncovered([(pattern,)], (self.resolve(item),), self.program)
+            if missing is not None:
+                raise source.token.error(f"refutable for pattern, missing {show_missing(missing[0])}")
+            self.program.patterns[id(source)] = pattern, bindings
+            scope = Scope(scope, {name: Binding(kind, mutable) for name, (kind, mutable) in bindings.items()})
         self.loops.append(target)
         try:
             if kind in {"while", "while_let"}:
@@ -6040,9 +6061,23 @@ class Ownership:
 
     def lower_loop(self, expr, scope, cursor):
         kind, token, args = expr.kind, expr.token, expr.args
+        loan = None
+        iterator = None
         if kind == "for":
-            name, mutable, start, end, _, body = args
-            cursor = self.lower(end, scope, self.lower(start, scope, cursor))
+            source, iterable, body = args
+            if iterable.kind == "range":
+                start, stop, _ = iterable.args
+                first, last = self.annotation(start), self.annotation(stop)
+                item_type = first if first in INTEGER_TYPES else last if last in INTEGER_TYPES else "i32"
+                cursor = self.lower(stop, scope, self.lower(start, scope, cursor))
+            else:
+                iterable_type = self.annotation(iterable)
+                item_type = iteration_item(iterable_type)
+                if isinstance(iterable_type, ReferenceType):
+                    cursor, loan = self.lower_reference(iterable, scope, cursor)
+                    cursor, iterator = self.keep_loan(cursor, loan, iterable.token)
+                else:
+                    cursor = self.lower(iterable, scope, cursor)
         else:
             body = args[-1]
         restart = self.join(cursor)
@@ -6071,10 +6106,17 @@ class Ownership:
                 scope = Scope(scope)
                 body_entry = self.declare(source, types, scope, body_entry, loan=loan, borrows=access.borrows)
             if kind == "for":
-                self.connect(restart, finish)
-                local = Local(name, mutable)
-                scope = Scope(scope, {name.key: local})
-                body_entry = self.emit(restart, "declare", Place(local), token)
+                step = self.emit(restart, "read", iterator, token) if iterator else restart
+                self.connect(step, finish)
+                item = Place(Local(replace(source.token, text="<iteration item>"), True, loan))
+                body_entry = self.emit(step, "declare", item, source.token)
+                pattern, types = self.program.patterns[id(source)]
+                access = self.pattern_accesses(pattern, item, item_type)
+                body_entry = self.read_pattern(body_entry, access.tests | access.reads, source.token)
+                body_entry = self.move_pattern(body_entry, access.moves, source.token)
+                scope = Scope(scope)
+                scope.owned.add(item.local)
+                body_entry = self.declare(source, types, scope, body_entry, loan=loan, borrows=access.borrows)
             self.connect(self.lower(body, scope, body_entry), restart)
         finally:
             self.loops.pop()
@@ -6620,11 +6662,30 @@ class Interpreter:
                         raise
                     return signal.args[1]
         if kind == "for":
-            name, mutable, start, end, inclusive, body = args
-            first = self.eval(start, scope)
-            stop = self.eval(end, scope) + int(inclusive)
-            for value in range(first, stop):
-                inner = Scope(scope, {name.key: Binding(value, mutable)})
+            source, iterable, body = args
+            if iterable.kind == "range":
+                start, stop, inclusive = iterable.args
+                values = range(self.eval(start, scope), self.eval(stop, scope) + int(inclusive))
+            else:
+                collection = self.eval(iterable, scope)
+                borrowed = isinstance(self.program.expr_types[id(iterable)], ReferenceType)
+                stored = collection.read() if borrowed else collection
+                if isinstance(stored, Value):
+                    present = stored.constructor.path.rsplit("::", 1)[-1] in {"Some", "Ok"}
+                    if not present:
+                        values = ()
+                    elif borrowed:
+                        values = (collection.child(replace(iterable.token, text="0")),)
+                    else:
+                        values = stored.fields
+                elif borrowed:
+                    length = len(stored.items)
+                    values = (collection.child(replace(iterable.token, text=str(index))) for index in range(length))
+                else:
+                    values = stored.items
+            for value in values:
+                address = Address(Binding(value, True))
+                inner = Scope(scope, next(self.match_bindings(source, address)))
                 try:
                     self.eval(body, inner)
                 except Continue as signal:

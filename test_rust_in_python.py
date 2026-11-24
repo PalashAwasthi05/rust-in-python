@@ -1460,6 +1460,45 @@ VALID = [
         macro_rules! vec { () => { 7i32 }; }
         fn main() { println!("{}", vec!()); }
     """, "7\n"),
+    ("for loops destructure owned sequences and borrow collection elements", """
+        struct Item(i32);
+        fn first(values: &mut [i32]) -> &mut i32 {
+            for value in values { return value; }
+            panic!("empty");
+        }
+        fn main() {
+            let mut v = vec![3, 4, 5];
+            for value in &mut v { *value += 1; }
+            *first(&mut v) += 1;
+            let mut sum = 0;
+            'outer: for &value in &v {
+                for (_, extra) in [(0, 1), (0, 2)] {
+                    if value == 6 { break 'outer; }
+                    sum += value + extra;
+                }
+            }
+            let mut tag = 0;
+            for &byte in b"AB" { tag += byte as i32; }
+            for _ in 0..2 { tag += 1; }
+            let mut tally = 0;
+            let items = vec![Item(2), Item(4)];
+            for Item(value) in items { tally += value; }
+            println!("{v:?} {sum} {tag} {tally}");
+        }
+    """, "[5, 5, 6] 26 133 6\n"),
+    ("for loops visit successful Option and Result values once", """
+        fn main() {
+            let mut option = Some(2);
+            for value in &mut option { *value *= 2; }
+            let success: Result<i32, bool> = Ok(3);
+            let error: Result<i32, bool> = Err(false);
+            let mut sum = 0;
+            for v in option { sum += v; }
+            for &v in &success { sum += v; }
+            for v in error { sum += v; }
+            println!("{sum}");
+        }
+    """, "7\n"),
 ]
 
 INVALID = [
@@ -2146,6 +2185,22 @@ INVALID = [
     ("using a moved vector is rejected", """
         fn main() { let a = vec![1]; let b = a; println!("{a:?} {b:?}"); }
     """, "use of moved value 'a'"),
+    ("for loop patterns must match every element", """
+        fn main() { for Some(n) in vec![Some(1), None] { println!("{n}"); } }
+    """, "refutable for pattern"),
+    ("borrowed iteration holds the collection loan across iterations", """
+        fn main() {
+            let mut v = vec![1, 2];
+            for &value in &v { v.push(value); }
+        }
+    """, "immutably borrowed"),
+    ("owned iteration consumes vectors", """
+        fn main() {
+            let v = vec![1, 2];
+            for n in v { println!("{n}"); }
+            println!("{v:?}");
+        }
+    """, "use of moved value 'v'"),
 ]
 
 
@@ -2216,10 +2271,17 @@ class InterpreterTests(unittest.TestCase):
                     println!("{values:?}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "for_iterator.rs"
-            unsupported.write_text('''
+            for_iteration = folder / "for_iterator.rs"
+            for_iteration.write_text('''
                 fn main() {
                     for n in vec![1, 2, 3] { println!("{n}"); }
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "iterator_method.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let v = vec![1, 2, 3];
+                    for n in v.iter() { println!("{n}"); }
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2242,13 +2304,14 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     unsupported, panics, bounds, overflow, shift],
+                                     for_iteration, unsupported, panics, bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "acceptance_mismatch",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")

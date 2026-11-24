@@ -50,6 +50,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Const generic parameters and fixed-size arrays with length inference, indexing, repeat literals, and patterns
 - Borrowed slices, array-to-slice coercion, range indexing, and patterns on dereferenced slices
 - `Vec<T>`, `vec!`, indexing, slice views, and basic vector mutation
+- Destructuring `for` loops over ranges, arrays, vectors, borrowed slices, `Option`, and `Result`
 - Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
 - Generic associated types and const expressions evaluated at specialization
