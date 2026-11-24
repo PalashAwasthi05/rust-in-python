@@ -3577,6 +3577,7 @@ class Checker:
         self.numeric_operands = []
         self.unary_results = []
         self.array_integers = []
+        self.iterator_results = []
         self.parameters = {}
         self.ascriptions = []
         self.closures = []
@@ -3923,6 +3924,8 @@ class Checker:
                 if operand != "bool" and operand not in INTEGER_TYPES:
                     raise token.error(f"cannot negate {operand} with '!'")
                 self.require(result, operand, token)
+        for name, item, result, token in self.iterator_results:
+            self.check_iterator_result(name, self.resolve(item), self.resolve(result), token)
         for variable in self.variables:
             if isinstance(self.resolve(variable), TypeVariable):
                 raise variable.token.error(f"type annotations needed for {variable.name}")
@@ -4484,7 +4487,7 @@ class Checker:
 
     def type_of(self, expr, scope, expected=None):
         if id(expr) in self.program.call_functions or expr.kind in {
-            "length", "is_empty", "iterator", "reverse_iterator", "map_iterator", "string_iterator"
+            "length", "is_empty", "iterator", "reverse_iterator", "map_iterator", "string_iterator", "iterator_terminal"
         }:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
@@ -5158,6 +5161,8 @@ class Checker:
             return replace(actual, source=("rev", actual)) if name == "rev" else actual
         if isinstance(actual, IteratorType) and name == "map":
             return self.iterator_map(expr, scope, actual)
+        if isinstance(actual, IteratorType) and name in {"collect", "count", "sum"}:
+            return self.iterator_terminal(expr, expected, actual)
         if base in {STRING, "str"} and name in {"chars", "bytes"} and not rest and expr.type_arguments is None:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", original.token, (original, False))
@@ -5316,6 +5321,50 @@ class Checker:
         identity = mapper.args[0] if mapper.kind == "function_pointer" else None
         expr.kind = "map_iterator"
         return IteratorType(item, ("map", iterator, identity, actual), iterator.borrowed or bool(actual.closure))
+
+    def iterator_terminal(self, expr, expected, iterator):
+        name, token = expr.token.text, expr.token
+        if len(expr.args) != 1:
+            raise token.error(f"{name} takes no value arguments")
+        arguments = expr.type_arguments
+        if name == "count":
+            if arguments is not None:
+                raise token.error("count takes no type arguments")
+            result = "usize"
+        else:
+            if arguments is not None and len(arguments) != 1:
+                raise token.error(f"{name} expects one type argument")
+            target = arguments[0] if arguments is not None else expected
+            result = self.fill_holes(target, token)
+            if expected is not None:
+                self.require(result, expected, token)
+            resolved = self.resolve(result)
+            if name == "collect" and is_vector(resolved):
+                self.require(iterator.item, resolved.arguments[0], token)
+            elif name == "sum" and resolved in INTEGER_TYPES:
+                item = iterator.item.inner if isinstance(iterator.item, ReferenceType) else iterator.item
+                self.require(item, resolved, token)
+            self.iterator_results.append((name, iterator.item, result, token))
+        expr.kind = "iterator_terminal"
+        return result
+
+    def check_iterator_result(self, method, item, target, token):
+        if isinstance(target, TypeVariable):
+            raise token.error(f"type annotations needed for {method}")
+        if method == "collect":
+            if is_vector(target):
+                self.check_type(target, token)
+                self.require(item, target.arguments[0], token)
+            elif target == STRING and (item in {"char", STRING} or is_str_reference(item)
+                                       or isinstance(item, ReferenceType) and item.inner == "char"):
+                return
+            else:
+                raise token.error(f"cannot collect items of type {item} into {target}")
+        else:
+            element = item.inner if isinstance(item, ReferenceType) else item
+            if target not in INTEGER_TYPES:
+                raise token.error(f"sum requires an integer result, found {target}")
+            self.require(element, target, token)
 
     def vector_method(self, expr, scope, expected, actual, base):
         name = expr.token.text
@@ -6077,6 +6126,15 @@ class Ownership:
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "iterator_terminal":
+            source = args[0]
+            if borrowing_iterator(self.annotation(source)):
+                cursor, loan = self.lower_iterator(source, scope, cursor)
+                if loan:
+                    cursor, holder = self.keep_loan(cursor, loan, token)
+                    cursor = self.emit(cursor, "read", holder, token)
+                return cursor
+            return self.lower(source, scope, cursor)
         if kind in {"iterator", "reverse_iterator", "map_iterator", "string_iterator"}:
             if borrowing_iterator(self.annotation(expr)):
                 cursor, _ = self.lower_iterator(expr, scope, cursor)
@@ -6709,6 +6767,33 @@ class Interpreter:
                 value = self.call(mapper.name, (value,), mapper.arguments, mapper.environment)
             yield value
 
+    def iteration_values(self, collection, annotation, token):
+        iterator = collection if isinstance(collection, IteratorValue) else None
+        if iterator:
+            collection, borrowed = iterator.collection, iterator.borrowed
+        else:
+            borrowed = isinstance(annotation, ReferenceType)
+        stored = collection.read() if borrowed else collection
+        if iterator and iterator.string_mode:
+            values = map(Character, stored) if iterator.string_mode == "chars" else stored.encode("utf-8")
+        elif isinstance(stored, Value):
+            present = stored.constructor.path.rsplit("::", 1)[-1] in {"Some", "Ok"}
+            if not present:
+                values = ()
+            elif borrowed:
+                values = (collection.child(replace(token, text="0")),)
+            else:
+                values = stored.fields
+        elif borrowed:
+            values = (collection.child(replace(token, text=str(index))) for index in range(len(stored.items)))
+        else:
+            values = stored.items
+        if iterator and iterator.reverse:
+            values = reversed(tuple(values))
+        if iterator and iterator.mappers:
+            values = self.mapped_items(values, iterator.mappers)
+        return values
+
     def placeholder(self, annotation):
         # Wildcard patterns can inspect an aggregate's shape without reading
         # its fields. Ownership prevents an uninitialized field from escaping.
@@ -6834,6 +6919,20 @@ class Interpreter:
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "iterator_terminal":
+            source = args[0]
+            annotation = self.program.expr_types[id(source)]
+            values = self.iteration_values(self.eval(source, scope), annotation, source.token)
+            result = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+            if token.text == "collect":
+                return "".join(display(value, False) for value in values) if result == STRING else ArrayValue(tuple(values))
+            if token.text == "count":
+                return checked(sum(1 for _ in values), token, "usize", runtime=True)
+            total = 0
+            for value in values:
+                element = value.read() if isinstance(value, Address) else value
+                total = binary("+", total, element, token, result, runtime=True)
+            return total
         if kind == "iterator":
             return IteratorValue(self.eval(args[0], scope), borrowing_iterator(self.program.expr_types[id(expr)]))
         if kind == "string_iterator":
@@ -7061,32 +7160,8 @@ class Interpreter:
                 start, stop, inclusive = iterable.args
                 values = range(self.eval(start, scope), self.eval(stop, scope) + int(inclusive))
             else:
-                collection = self.eval(iterable, scope)
-                iterator = collection if isinstance(collection, IteratorValue) else None
-                if iterator:
-                    collection, borrowed = iterator.collection, iterator.borrowed
-                else:
-                    borrowed = isinstance(self.program.expr_types[id(iterable)], ReferenceType)
-                stored = collection.read() if borrowed else collection
-                if iterator and iterator.string_mode:
-                    values = map(Character, stored) if iterator.string_mode == "chars" else stored.encode("utf-8")
-                elif isinstance(stored, Value):
-                    present = stored.constructor.path.rsplit("::", 1)[-1] in {"Some", "Ok"}
-                    if not present:
-                        values = ()
-                    elif borrowed:
-                        values = (collection.child(replace(iterable.token, text="0")),)
-                    else:
-                        values = stored.fields
-                elif borrowed:
-                    length = len(stored.items)
-                    values = (collection.child(replace(iterable.token, text=str(index))) for index in range(length))
-                else:
-                    values = stored.items
-                if iterator and iterator.reverse:
-                    values = reversed(tuple(values))
-                if iterator and iterator.mappers:
-                    values = self.mapped_items(values, iterator.mappers)
+                values = self.iteration_values(self.eval(iterable, scope), self.program.expr_types[id(iterable)],
+                                               iterable.token)
             for value in values:
                 address = Address(Binding(value, True))
                 inner = Scope(scope, next(self.match_bindings(source, address)))

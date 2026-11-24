@@ -1616,6 +1616,20 @@ VALID = [
             for b in s[1..3].bytes() { println!("{b}"); }
         }
     """, "Ω\na\n206\n169\n"),
+    ("iterator consumers collect strings and vectors and drive mapper effects", """
+        fn main() {
+            let mut s = String::from("aΩ");
+            let ascii: String = s.chars().rev().collect();
+            s.push('!');
+            let bytes = s.bytes().map(|x| x as u16).collect::<Vec<_>>();
+            let sum: u16 = bytes.iter().sum();
+            let count = bytes.iter().map(|n| { println!("{n}"); *n }).count();
+            let parts = ["one", " two"].into_iter().collect::<String>();
+            println!("{ascii} {bytes:?} {sum} {count} {parts} {s}");
+            let words = ["first", "second"].into_iter().rev().collect::<Vec<_>>();
+            println!("{words:?}");
+        }
+    """, '97\n206\n169\n33\nΩa [97, 206, 169, 33] 505 4 one two aΩ!\n["second", "first"]\n'),
 ]
 
 INVALID = [
@@ -2391,6 +2405,17 @@ INVALID = [
             for character in chars { println!("{character}"); }
         }
     """, "immutably borrowed"),
+    ("collect requires an inferred or explicit destination type", """
+        fn main() { let _value = [1, 2].into_iter().collect(); }
+    """, "type annotations needed for collect"),
+    ("iterator consumers move the iterator", """
+        fn main() {
+            let data = vec![1, 2];
+            let it = data.into_iter();
+            println!("{}", it.count());
+            println!("{}", it.count());
+        }
+    """, "use of moved value 'it'"),
 ]
 
 
@@ -2495,11 +2520,18 @@ class InterpreterTests(unittest.TestCase):
                     println!("{}", text.as_str());
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "iterator_collect.rs"
-            unsupported.write_text('''
+            collect = folder / "iterator_collect.rs"
+            collect.write_text('''
                 fn main() {
                     let text: String = "abc".chars().rev().collect();
                     println!("{text}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "floating_point.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let n = 1.5f64;
+                    println!("{}", n * 2.0);
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2538,7 +2570,7 @@ class InterpreterTests(unittest.TestCase):
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
                                      capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, vector,
-                                     for_iteration, iterator, map_iterator, string, borrowed_string, unsupported,
+                                     for_iteration, iterator, map_iterator, string, borrowed_string, collect, unsupported,
                                      panics, bounds, overflow, shift, utf8, substring],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
@@ -2546,7 +2578,7 @@ class InterpreterTests(unittest.TestCase):
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
                               "acceptance_mismatch",
                               "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match", "runtime_match", "runtime_match"])
