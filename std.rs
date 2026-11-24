@@ -1098,7 +1098,7 @@ pub mod default {
 pub mod marker {
     pub trait Copy: Clone {}
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct PhantomData<T: ?Sized> { marker: () }
+    pub struct PhantomData<T: ?Sized>;
 }
 
 pub mod ops {

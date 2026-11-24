@@ -2596,6 +2596,16 @@ class Program:
     try_conversions: dict = field(default_factory=dict)
     moves: set = field(default_factory=set)
     cross_compares: dict = field(default_factory=dict)
+    discriminants: dict = field(default_factory=dict)
+
+    def discriminant(self, ctor):
+        """The integer a C-like enum variant casts to: its explicit value, or one past the previous variant."""
+        value = -1
+        for candidate in self.layout(ctor.annotation)[1]:
+            value = self.discriminants.get(candidate.path, value + 1)
+            if candidate.path == ctor.path:
+                return value
+        raise AssertionError(ctor.path)
     lazy_items: dict = field(default_factory=dict)
     normalized: dict | None = None
     dispatch_cache: dict = field(default_factory=dict)
@@ -3976,6 +3986,9 @@ class Parser:
                     raise variant.error(f"duplicate variant {variant.text!r}")
                 variants.add(variant.text)
                 ctor = self.constructor(name.text, f"{name.text}::{variant.text}")
+                if self.accept("="):
+                    discriminant = self.const_expression(self.expression(), "i128")
+                    program.discriminants[ctor.path] = discriminant.value
                 if marker:
                     if "Default" not in derives or ctor.style != "unit":
                         raise marker.error("#[default] requires a unit variant on an enum deriving Default")
@@ -6609,7 +6622,7 @@ class Checker:
                         self.check_layout(part, token, visiting, finished)
                 used.update(part for part in self.type_parts(kind) if isinstance(part, TypeParameter))
         for param in self.program.type_parameters[name]:
-            if param not in used and not param.const_type and token.module[:1] != STD_ROOT:
+            if param not in used and not param.const_type and self.program.types[name][0].module[:1] != STD_ROOT:
                 raise token.error(f"unused type parameter {param}")
         visiting.remove(name)
         finished.add(name)
@@ -6958,7 +6971,10 @@ class Checker:
                 first, last = self.operand_types(start, stop, scope, same_type=True)
                 literal_variables = [kind for kind in (self.resolve(first), self.resolve(last))
                                      if isinstance(kind, TypeVariable) and kind.integer_literal]
-                item = literal_variables[0] if len(literal_variables) == 2 else self.integer_pair(first, last)
+                if "char" in {self.resolve(first), self.resolve(last)}:
+                    item = "char"
+                else:
+                    item = literal_variables[0] if len(literal_variables) == 2 else self.integer_pair(first, last)
                 self.require(first, item, token)
                 self.require(last, item, token)
                 if NEVER in {first, last}:
@@ -7024,7 +7040,7 @@ class Checker:
         if id(expr) in self.program.call_functions or expr.kind in {
             "length", "is_empty", "float_method", "iterator", "reverse_iterator", "map_iterator",
             "string_iterator", "iterator_terminal", "lazy_adapter", "enum_method", "string_method",
-            "vector_method", "to_string", "scalar_cast", "range_value", "chars_as_str"
+            "vector_method", "to_string", "scalar_cast", "range_value", "chars_as_str", "enum_cast"
         } and id(expr) in self.program.expr_types:
             cached = self.resolve(self.program.expr_types[id(expr)])
             result = cached
@@ -7289,6 +7305,14 @@ class Checker:
                 self.require_argument(result, target, token)
                 expr.kind, expr.args = "group", (value,)
                 return result
+            if target in INTEGER_TYPES and not self.unsuffixed_number(value):
+                actual = self.resolve(self.type_of(value, scope))
+                layout = self.program.layout(actual) if not isinstance(actual, (TypeVariable, ReferenceType)) else None
+                if (layout and actual not in PRIMITIVES and isinstance(actual, str) and len(layout[1]) >= 1
+                        and all(ctor.style == "unit" for ctor in layout[1]) and "::" in layout[1][0].path):
+                    expr.kind = "enum_cast"
+                    return target
+                self.pretyped[id(value)] = actual
             if target in SCALAR_BOUNDS or target in FLOAT_TYPES:
                 hint = ("u8" if target == "char" else target) if self.unsuffixed_number(value) else None
                 actual = self.type_of(value, scope, hint)
@@ -9666,7 +9690,7 @@ class Ownership:
             return None
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"length", "is_empty", "to_string", "float_method", "chars_as_str"}:
+        if kind in {"length", "is_empty", "to_string", "float_method", "chars_as_str", "enum_cast"}:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "range_value":
             for item in args[:2]:
@@ -11177,6 +11201,9 @@ class Interpreter:
             return total
         if kind == "iterator":
             return IteratorValue(self.eval(args[0], scope), borrowing_iterator(self.program.expr_types[id(expr)]))
+        if kind == "enum_cast":
+            value = map_of(self.eval(args[0], scope))
+            return truncate_integer(self.program.discriminant(value.constructor), args[1])
         if kind == "chars_as_str":
             iterator = self.eval(args[0], scope)
             if iterator.cursor is None:
@@ -11503,7 +11530,12 @@ class Interpreter:
             source, iterable, body = args
             if iterable.kind == "range":
                 start, stop, inclusive = iterable.args
-                values = range(self.eval(start, scope), self.eval(stop, scope) + int(inclusive))
+                first, last = self.eval(start, scope), self.eval(stop, scope)
+                if isinstance(first, Character):
+                    values = (Character(chr(code)) for code in range(ord(first), ord(last) + int(inclusive))
+                              if code not in SURROGATES)
+                else:
+                    values = range(first, last + int(inclusive))
             else:
                 values = self.iteration_values(self.eval(iterable, scope), self.program.expr_types[id(iterable)],
                                                iterable.token)
