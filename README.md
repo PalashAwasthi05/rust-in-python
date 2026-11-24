@@ -60,6 +60,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Iterator `collect` into `Vec` and `String`, plus `count` and checked integer `sum`
 - Declarative `macro_rules!` with multiple arms, fragment forwarding, repetitions, and matcher follow-set checks
 - Built-in `concat!` and `stringify!` with literal text and token spacing
+- Source-location macros `file!`, `line!`, `column!`, and `module_path!`, plus `include_str!` and `include_bytes!`
 - Shared, mutable, and boxed `dyn` objects with dynamic dispatch, associated-type bindings, supertrait upcasts, and consuming `Box<Self>` receivers
 - Generic associated types with specialized and higher-ranked equality constraints
 - Const expressions evaluated at specialization

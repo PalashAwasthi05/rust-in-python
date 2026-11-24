@@ -59,6 +59,8 @@ class Token:
     child_module: tuple | None = None
     end: tuple[int, int] | None = field(default=None, compare=False, repr=False)
     origin: object | None = field(default=None, compare=False, repr=False)
+    source_file: str | None = field(default=None, compare=False, repr=False)
+    expansion_site: Token | None = field(default=None, compare=False, repr=False)
 
     @property
     def key(self):
@@ -181,7 +183,7 @@ def is_lifetime(text):
     return text.startswith("'") and is_identifier(text[1:])
 
 
-def lex(source, *, edition="2021"):
+def lex(source, *, edition="2021", source_file=None):
     offset, line, column = 0, 1, 1
     origin = object()
     while offset < len(source):
@@ -221,7 +223,8 @@ def lex(source, *, edition="2021"):
         lines = consumed.count("\n")
         next_column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
         if word != "/*" and not (word.isspace() or word.startswith("//")):
-            yield Token(word, line, column, end=(line + lines, next_column), origin=origin)
+            yield Token(word, line, column, end=(line + lines, next_column), origin=origin,
+                        source_file=source_file)
         line += lines
         column = next_column
         offset = end
@@ -419,8 +422,10 @@ def macro_sequence(items, *, matcher):
 
 
 class MacroExpander:
-    def __init__(self, edition):
+    def __init__(self, edition, crate_name):
         self.edition = edition
+        self.crate_name = crate_name
+        self.module_path = ()
         self.steps = 0
         self.match_steps = 0
         self.definitions = 0
@@ -462,6 +467,7 @@ class MacroExpander:
                 continue
             macro = macros.get(identifier_text(item.text)) if isinstance(item, Token) else None
             builtin = identifier_text(item.text) if isinstance(item, Token) else None
+            namespace = None
             argument = index + 2
             if isinstance(item, Token) and index + 4 < len(items) and tree_text(items[index + 1]) == "::":
                 path = [identifier_text(item.text)]
@@ -470,7 +476,8 @@ class MacroExpander:
                     path.append(identifier_text(tree_text(items[position + 1])))
                     position += 2
                 macro = self.qualified.get(tuple(path))
-                builtin = path[1] if len(path) == 2 and path[0] in {"std", "core", "alloc"} else None
+                namespace = path[0]
+                builtin = path[1] if len(path) == 2 and namespace in {"std", "core", "alloc"} else None
                 argument = position + 1
             if (macro and argument < len(items) and tree_text(items[argument - 1]) == "!"
                     and isinstance(items[argument], TokenGroup)):
@@ -479,7 +486,9 @@ class MacroExpander:
                     raise item.error("macro expansion limit reached")
                 definition, rules, local_inner = macro
                 mark = definition, self.steps
-                expanded = self.invoke(item, rules, items[argument].items, mark)
+                group = items[argument]
+                site = item.expansion_site or group.opening.expansion_site or item
+                expanded = self.invoke(item, rules, group.items, mark, site)
                 if local_inner:
                     expanded = self.qualify_inner(expanded, mark)
                 index = argument + 1
@@ -515,11 +524,51 @@ class MacroExpander:
                     result.append(replace(item, text=display(value, True), end=group.closing.end))
                     index = argument + 1
                     continue
+                if namespace != "alloc" and builtin in {"file", "line", "column", "module_path",
+                                                        "include_str", "include_bytes"}:
+                    site = item.expansion_site or group.opening.expansion_site or item
+                    if builtin in {"include_str", "include_bytes"}:
+                        parts = self.expand(group.items, macros, depth + 1)
+                        value = self.include_literal(builtin, parts, site)
+                    else:
+                        if group.items:
+                            raise item.error(f"{builtin}! takes no arguments")
+                        value = self.location_literal(builtin, site)
+                    result.append(replace(item, text=value, end=group.closing.end))
+                    index = argument + 1
+                    continue
             if isinstance(item, (TokenGroup, OpaqueFragment)):
                 item = replace(item, items=self.expand(item.items, macros, depth))
             result.append(item)
             index += 1
         return tuple(result)
+
+    def location_literal(self, name, site):
+        if name == "line":
+            return f"{site.line}u32"
+        if name == "column":
+            return f"{site.column}u32"
+        if name == "file":
+            return display(site.source_file or "<anon>", True)
+        return display("::".join((self.crate_name, *self.module_path)), True)
+
+    @staticmethod
+    def include_literal(name, items, site):
+        parts = list(flatten_trees(items, group_fragments=False))
+        if parts and parts[-1].text == ",":
+            parts.pop()
+        if len(parts) != 1 or not is_string_literal(parts[0].text):
+            raise site.error(f"{name}! requires one string literal path")
+        path = Path(decode_string(parts[0]))
+        if not path.is_absolute() and site.source_file is not None:
+            path = Path(site.source_file).parent / path
+        try:
+            data = path.read_bytes()
+            if name == "include_str":
+                return display(data.decode("utf-8"), True)
+        except (OSError, UnicodeError, ValueError) as error:
+            raise site.error(f"{name}! could not read {str(path)!r}: {error}") from error
+        return 'b"' + "".join(f"\\x{byte:02x}" for byte in data) + '"'
 
     @staticmethod
     def qualify_inner(items, mark):
@@ -591,12 +640,12 @@ class MacroExpander:
                 index += 1
         return rules
 
-    def invoke(self, token, rules, items, mark):
+    def invoke(self, token, rules, items, mark, site):
         self.match_steps = 0
         for matcher, body in rules:
             for offset, captures in self.match(matcher, items, 0, {}, ()):
                 if offset == len(items):
-                    return tuple(self.render(body, captures, (), mark))
+                    return tuple(self.render(body, captures, (), mark, site))
         raise token.error(f"no matching rule for {token.text}!")
 
     def match(self, nodes, items, pos, captures, path):
@@ -776,14 +825,14 @@ class MacroExpander:
             elif isinstance(node, TokenGroup):
                 yield from MacroExpander.variables(node.items)
 
-    def render(self, nodes, captures, path, mark):
+    def render(self, nodes, captures, path, mark, site):
         for index, node in enumerate(nodes):
             if isinstance(node, MacroCapture):
                 if node.name.text == "crate":
                     following = nodes[index + 1] if index + 1 < len(nodes) else None
                     if not isinstance(following, Token) or following.text != "::":
                         raise node.name.error("expected a path after $crate")
-                    yield replace(node.name, text="crate")
+                    yield replace(node.name, text="crate", expansion_site=site)
                     continue
                 for level in range(len(path), -1, -1):
                     key = (node.name.text, path[:level])
@@ -797,10 +846,10 @@ class MacroExpander:
                 else:
                     raise node.name.error(f"metavariable {node.name.text!r} has no value at this repetition depth")
             elif isinstance(node, TokenGroup):
-                opening = replace(node.opening, context=(*node.opening.context, mark))
-                closing = replace(node.closing, context=(*node.closing.context, mark))
+                opening = replace(node.opening, context=(*node.opening.context, mark), expansion_site=site)
+                closing = replace(node.closing, context=(*node.closing.context, mark), expansion_site=site)
                 yield replace(node, opening=opening, closing=closing,
-                              items=tuple(self.render(node.items, captures, path, mark)))
+                              items=tuple(self.render(node.items, captures, path, mark, site)))
             elif isinstance(node, MacroRepeat):
                 names = set(self.variables(node.body))
                 if not names:
@@ -810,10 +859,10 @@ class MacroExpander:
                            if name in names and len(key) > len(path) and key[:len(path)] == path}
                 for position, index_in_path in enumerate(sorted(indices)):
                     if position and node.separator is not None:
-                        yield node.separator
-                    yield from self.render(node.body, captures, (*path, index_in_path), mark)
+                        yield replace(node.separator, expansion_site=site)
+                    yield from self.render(node.body, captures, (*path, index_in_path), mark, site)
             elif isinstance(node, Token):
-                yield replace(node, context=(*node.context, mark))
+                yield replace(node, context=(*node.context, mark), expansion_site=site)
             else:
                 yield node
 
@@ -900,8 +949,9 @@ class ModuleUnit:
 
 class Modules:
     def __init__(self, trees, source_path, edition):
-        directory = Path(source_path).resolve().parent if source_path is not None else None
-        root = ModuleUnit((), directory)
+        self.source_path = os.fspath(source_path) if source_path is not None else None
+        self.directory = Path(source_path).absolute().parent if source_path is not None else None
+        root = ModuleUnit((), self.directory)
         self.units = {(): root}
         self.edition = edition
         self.exported = {}
@@ -1099,7 +1149,10 @@ class Modules:
                 raise token.error(f"module {token.text!r} exists in both {filenames[0]} and {filenames[1]}")
             raise token.error(f"module {token.text!r} needs {filenames[0]} or {filenames[1]}")
         try:
-            return token_trees(lex(found[0].read_text(encoding="utf-8"), edition=self.edition))[0]
+            filename = found[0]
+            source_file = os.path.join(os.path.dirname(self.source_path), os.path.relpath(filename, self.directory))
+            return token_trees(lex(filename.read_text(encoding="utf-8"), edition=self.edition,
+                                   source_file=source_file))[0]
         except RustError as error:
             raise RustError(f"{found[0]}: {error}") from error
 
@@ -1355,7 +1408,8 @@ class Modules:
         return token
 
     def expand(self):
-        expander = MacroExpander(self.edition)
+        crate_name = Path(self.source_path).stem.replace("-", "_") if self.source_path else "rust_out"
+        expander = MacroExpander(self.edition, crate_name)
         builtin_items, _ = token_trees(lex(PRELUDE_MACROS))
         builtins = {}
         for index in range(0, len(builtin_items), 4):
@@ -1383,11 +1437,14 @@ class Modules:
             macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
                            for item in unit.imports if self.is_macro_import(unit, item)})
             previous = expander.qualified
+            previous_path = expander.module_path
             expander.qualified = self.macro_qualifiers(unit)
+            expander.module_path = unit.path
             try:
                 expanded = expander.expand(unit.items, macros, item_scope=True, definitions=definitions)
             finally:
                 expander.qualified = previous
+                expander.module_path = previous_path
             unit.items = self.scan(unit, expanded, expanded=True)
             return definitions
 
@@ -9338,7 +9395,8 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     if proc_extern:
         trees, end = rustc_source(source, proc_libraries(proc_extern), source_path, edition=edition)
     else:
-        trees, end = token_trees(lex(source, edition=edition))
+        source_file = os.fspath(source_path) if source_path is not None else None
+        trees, end = token_trees(lex(source, edition=edition, source_file=source_file))
     modules = Modules(trees, source_path, edition)
     modules.expand()
     program = Program(type_aliases=modules.type_aliases, statics=modules.statics)

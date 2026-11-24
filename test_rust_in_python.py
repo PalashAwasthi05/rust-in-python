@@ -3281,6 +3281,47 @@ INVALID = [
 
 class InterpreterTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_source_location_and_file_inclusion(self):
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "nested").mkdir()
+            (folder / "nested" / "mod.rs").write_text(
+                'macro_rules! source { ($value:expr) => {{\n'
+                '    println!("{}:{}:{} {} {}", file!(), line!(), column!(), module_path!(), $value);\n'
+                '    println!("{:?}", include_str!("text.txt"));\n'
+                '}} }\n'
+                'pub fn show() { println!("{} {}", file!(), module_path!()); source!(line!()); }\n',
+                encoding="utf-8",
+            )
+            (folder / "text.txt").write_bytes("root β\r\n".encode("utf-8"))
+            (folder / "nested" / "text.txt").write_bytes(b"nested\n")
+            (folder / "data.bin").write_bytes(b"\x00\x7f\x80\xff")
+            source = folder / "demo-crate.rs"
+            source.write_text(
+                '#[macro_use] mod nested;\n'
+                'fn main() {\n'
+                '    source!(\n'
+                '        line!()\n'
+                '    );\n'
+                '    nested::show();\n'
+                '    let data: &[u8; 4] = std::include_bytes!(concat!("data", ".bin"),);\n'
+                '    println!("{data:?}");\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            invalid = folder / "invalid_encoding.rs"
+            invalid.write_text('fn main() { println!("{}", include_str!("data.bin")); }', encoding="utf-8")
+            bad_path = folder / "missing_path.rs"
+            bad_path.write_text('fn main() { println!("{:?}", include_bytes!("missing")); }', encoding="utf-8")
+            runner = Path(__file__).with_name("conformance.py")
+            report = subprocess.run([sys.executable, runner, "--json", source, invalid, bad_path],
+                                    text=True, capture_output=True, timeout=30, check=False)
+            self.assertEqual(report.returncode, 0, report.stdout + report.stderr)
+            cases = json.loads(report.stdout)["cases"]
+            self.assertEqual([case["outcome"] for case in cases],
+                             ["runtime_match", "both_rejected", "both_rejected"])
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_external_modules_and_conformance_report(self):
         with TemporaryDirectory() as folder:
             folder = Path(folder)
