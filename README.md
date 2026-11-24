@@ -33,6 +33,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Typed bindings, mutability, and block expressions
 - Conditionals, labeled loops and blocks, integer ranges, and value-producing `break`
 - Named, tuple, and unit structs, plus enums with payloads
+- Tuples with positional fields, annotations, destructuring, and partial moves
 - Field access and mutation, destructuring, `if let`, `while let`, and `let-else`
 - Exhaustive `match` with nested patterns, alternatives, integer ranges, and guards
 - Move and initialization checks across branches and loop iterations
@@ -43,14 +44,14 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Generic functions, structs, and enums with inferred and explicit type arguments
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
-- Const generic parameters and fixed-size arrays with length inference, indexing, and repeat literals
+- Const generic parameters and fixed-size arrays with length inference, indexing, repeat literals, and patterns
 - Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
 - Generic associated types and const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
-- Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures
+- Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 

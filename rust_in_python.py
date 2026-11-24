@@ -1013,7 +1013,7 @@ class Constructor:
         for index, (name, _) in enumerate(self.fields):
             if name == token.text:
                 return index
-        raise token.error(f"{self.path} has no field {token.text!r}")
+        raise token.error(f"{self.path or self.annotation} has no field {token.text!r}")
 
 
 @dataclass(frozen=True)
@@ -1134,6 +1134,20 @@ def fold_const(expression):
 
 
 @dataclass(frozen=True)
+class TupleType:
+    elements: tuple
+
+    def __str__(self):
+        return tuple_text(map(str, self.elements))
+
+
+def tuple_text(elements):
+    elements = tuple(elements)
+    comma = "," if len(elements) == 1 else ""
+    return f"({', '.join(elements)}{comma})"
+
+
+@dataclass(frozen=True)
 class ArrayType:
     element: object
     length: object
@@ -1215,6 +1229,11 @@ def match_types(template, actual, parameters, result):
     if isinstance(template, ArrayType) and isinstance(actual, ArrayType):
         return (match_types(template.element, actual.element, parameters, result)
                 and match_types(template.length, actual.length, parameters, result))
+    if isinstance(template, TupleType) and isinstance(actual, TupleType):
+        return len(template.elements) == len(actual.elements) and all(
+            match_types(left, right, parameters, result)
+            for left, right in zip(template.elements, actual.elements)
+        )
     return template == actual
 
 
@@ -1227,6 +1246,10 @@ def overlapping_types(first, second):
     if isinstance(first, ArrayType) and isinstance(second, ArrayType):
         return (overlapping_types(first.element, second.element)
                 and overlapping_types(first.length, second.length))
+    if isinstance(first, TupleType) and isinstance(second, TupleType):
+        return len(first.elements) == len(second.elements) and all(
+            overlapping_types(a, b) for a, b in zip(first.elements, second.elements)
+        )
     return first == second
 
 
@@ -1256,6 +1279,8 @@ def substitute(annotation, arguments):
                             substitute(annotation.result, arguments), annotation.closure)
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
+    if isinstance(annotation, TupleType):
+        return TupleType(tuple(substitute(kind, arguments) for kind in annotation.elements))
     if isinstance(annotation, ArrayType):
         return ArrayType(substitute(annotation.element, arguments), substitute(annotation.length, arguments))
     if isinstance(annotation, AssociatedType):
@@ -1345,6 +1370,8 @@ class Program:
                                 self.normalize(annotation.result, seen), annotation.closure)
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
+        if isinstance(annotation, TupleType):
+            return TupleType(tuple(self.normalize(kind, seen) for kind in annotation.elements))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.normalize(annotation.element, seen), annotation.length)
         return annotation
@@ -1380,6 +1407,9 @@ class Program:
         return None
 
     def layout(self, annotation):
+        if isinstance(annotation, TupleType):
+            fields = tuple((str(index), kind) for index, kind in enumerate(annotation.elements))
+            return None, (Constructor("", annotation, "tuple", fields),)
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         declaration = self.types.get(name)
         if not declaration:
@@ -1432,6 +1462,10 @@ class Program:
             return (trait in self.derives.get(annotation.name, {})
                     and all(self.implements(arg, trait, assumed) for p, arg in
                             zip(self.type_parameters[annotation.name], annotation.arguments) if not p.const_type))
+        if isinstance(annotation, TupleType):
+            if trait == "Display" or (len(annotation.elements) > 12 and trait not in {"Copy", "Clone"}):
+                return False
+            return all(self.implements(kind, trait, assumed) for kind in annotation.elements)
         if isinstance(annotation, ArrayType):
             if trait == "Display":
                 return False
@@ -1521,6 +1555,8 @@ class Parser:
 
     def type_name(self, *, static_string=False, signature=None, output=False):
         token = self.advance()
+        if token.text == "_":
+            return None
         if token.text == "fn":
             self.expect("(")
             arguments = []
@@ -1583,8 +1619,19 @@ class Parser:
                 raise lifetime.error(f"undeclared or unsupported lifetime {lifetime.text}")
             return ReferenceType(self.type_name(), mutable, lifetime.text if lifetime else None)
         if token.text == "(":
+            if self.accept(")"):
+                return "()"
+            first = self.type_name(static_string=static_string, signature=signature, output=output)
+            if not self.accept(","):
+                self.expect(")")
+                return first
+            kinds = [first]
+            while self.current.text != ")":
+                kinds.append(self.type_name(static_string=static_string, signature=signature, output=output))
+                if not self.accept(","):
+                    break
             self.expect(")")
-            return "()"
+            return TupleType(tuple(kinds))
         if token.text == "!":
             return NEVER
         if ((IDENT.fullmatch(token.text) and token.text not in RESERVED)
@@ -2293,6 +2340,14 @@ class Parser:
             if self.accept(")"):
                 return Expr("literal", token, ("()", None))
             value = self.expression()
+            if self.accept(","):
+                items = [value]
+                while self.current.text != ")":
+                    items.append(self.expression())
+                    if not self.accept(","):
+                        break
+                self.expect(")")
+                return Expr("tuple", token, tuple(items))
             self.expect(")")
             return Expr("group", token, (value,))
         if word == "[":
@@ -2511,16 +2566,16 @@ class Parser:
         self.expect("}")
         return tuple(fields), rest
 
-    def pattern(self):
-        first = self.range_pattern()
+    def pattern(self, *, array_item=False):
+        first = self.range_pattern(array_item=array_item)
         alternatives = [first]
         while self.accept("|"):
-            alternatives.append(self.range_pattern())
+            alternatives.append(self.range_pattern(array_item=array_item))
         if len(alternatives) > 1:
             return Expr("or", first.token, tuple(alternatives))
         return first
 
-    def range_pattern(self):
+    def range_pattern(self, *, array_item=False):
         first = None if self.current.text in {"..", "..="} else self.simple_pattern()
         separator = self.accept("..") or self.accept("..=")
         if separator is None:
@@ -2528,7 +2583,7 @@ class Parser:
         if first is not None and first.kind != "literal":
             raise first.token.error("expected an integer range bound")
         last = None
-        if self.current.text not in {",", ")", "}", "=>", "if", "|", "=", ":"}:
+        if self.current.text not in {",", ")", "]", "}", "=>", "if", "|", "=", ":"}:
             last = self.simple_pattern()
         if last is not None and last.kind != "literal":
             raise last.token.error("expected an integer range bound")
@@ -2536,6 +2591,8 @@ class Parser:
             return Expr("rest", separator)
         if last is None and (first is None or separator.text == "..="):
             raise separator.error("expected an integer range bound")
+        if array_item and last is None:
+            raise separator.error("open-ended ranges in array patterns require parentheses")
         return Expr("pattern_range", separator, (first, last, separator.text == "..="))
 
     def simple_pattern(self):
@@ -2546,8 +2603,26 @@ class Parser:
             if self.accept(")"):
                 return Expr("literal", token, ("()", None))
             inner = self.pattern()
+            if self.accept(","):
+                items = [inner]
+                while self.current.text != ")":
+                    items.append(self.pattern())
+                    if not self.accept(","):
+                        break
+                self.expect(")")
+                return Expr("pattern_anonymous_tuple", token, tuple(items))
             self.expect(")")
+            if inner.kind == "rest":
+                return Expr("pattern_anonymous_tuple", token, (inner,))
             return inner
+        if token.text == "[":
+            items = []
+            while self.current.text != "]":
+                items.append(self.pattern(array_item=True))
+                if not self.accept(","):
+                    break
+            self.expect("]")
+            return Expr("pattern_array", token, tuple(items))
         literal = self.literal(self.advance(), negative=True) if token.text == "-" else self.literal(token)
         if literal:
             return literal
@@ -2705,6 +2780,8 @@ class CaptureContext:
     @staticmethod
     def mark_mutable(scope, expr):
         root = place_root(expr)
+        while root.kind == "deref":
+            root = place_root(root.args[0])
         if root.kind != "name" or scope.captures is None:
             return
         current = scope
@@ -2844,7 +2921,9 @@ class Pattern:
         if self.tag is None:
             yield {self.binding: value} if self.binding else {}
         elif isinstance(self.tag, Constructor):
-            if isinstance(value, Value) and value.constructor.path == self.tag.path:
+            if isinstance(value, ArrayValue) and self.tag.style == "array":
+                yield from self.field_bindings(tuple(value.items[int(name)] for name, _ in self.tag.fields))
+            elif isinstance(value, Value) and value.constructor.path == self.tag.path:
                 yield from self.field_bindings(value.fields)
         elif isinstance(self.tag, IntegerRange):
             if self.tag.contains(value):
@@ -2889,6 +2968,11 @@ def uncovered(matrix, types, program):
                 explicit.append((option, tuple(tail)))
     if annotation == "i32" and explicit:
         return uncovered_integer(explicit, default, remaining_types, program)
+    if isinstance(annotation, ArrayType) and explicit:
+        # Only positions mentioned by a pattern can distinguish its arms.
+        positions = sorted({int(name) for first, _ in explicit for name, _ in first.tag.fields})
+        fields = tuple((str(index), annotation.element) for index in positions)
+        signatures = [(Constructor("[]", annotation, "array", fields), (annotation.element,) * len(fields))]
     if signatures is None or (not explicit and signatures):
         missing = uncovered(default, remaining_types, program)
         return None if missing is None else (None, *missing)
@@ -2896,13 +2980,20 @@ def uncovered(matrix, types, program):
         wildcards = (Pattern(),) * len(fields)
         rows = [wildcards + tail for tail in default]
         tag = signature.path if isinstance(signature, Constructor) else signature
-        rows.extend(first.children + tail for first, tail in explicit
+        rows.extend(specialized_pattern(first, signature) + tail for first, tail in explicit
                     if (first.tag.path if isinstance(first.tag, Constructor) else first.tag) == tag)
         missing = uncovered(rows, (*fields, *remaining_types), program)
         if missing is not None:
             nested, tail = missing[:len(fields)], missing[len(fields):]
             return ((signature, nested), *tail)
     return None
+
+
+def specialized_pattern(pattern, signature):
+    if isinstance(signature, Constructor) and signature.style == "array":
+        selected = dict(zip((name for name, _ in pattern.tag.fields), pattern.children))
+        return tuple(selected.get(name, Pattern()) for name, _ in signature.fields)
+    return pattern.children
 
 
 def uncovered_integer(explicit, default, types, program):
@@ -2931,8 +3022,13 @@ def show_missing(witness):
     if tag.style == "unit":
         return tag.path
     fields = [show_missing(child) for child in children]
+    if tag.style == "array":
+        if len(fields) == tag.annotation.length.value:
+            return f"[{', '.join(fields)}]"
+        entries = ", ".join(f"{name}: {value}" for (name, _), value in zip(tag.fields, fields))
+        return f"array with elements {{{entries}}}"
     if tag.style == "tuple":
-        return f"{tag.path}({', '.join(fields)})"
+        return f"{tag.path}({', '.join(fields)})" if tag.path else tuple_text(fields)
     names = (name for name, _ in tag.fields)
     entries = ", ".join(f"{name}: {value}" for name, value in zip(names, fields))
     return f"{tag.path} {{ {entries} }}" if entries else f"{tag.path} {{}}"
@@ -3117,7 +3213,7 @@ class Checker:
             target_parameters = set(self.type_parts(impl.target))
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
-            if impl.trait is None and self.program.layout(impl.target) is None:
+            if impl.trait is None and (isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
                 raise impl.token.error("inherent impl requires a declared struct or enum")
             for previous in self.program.impls[:index]:
                 if previous.trait == impl.trait and overlapping_types(previous.target, impl.target):
@@ -3202,6 +3298,8 @@ class Checker:
                                 annotation.closure)
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
+        if isinstance(annotation, TupleType):
+            return TupleType(tuple(map(self.resolve, annotation.elements)))
         if isinstance(annotation, ArrayType):
             return ArrayType(self.resolve(annotation.element), self.resolve(annotation.length))
         if isinstance(annotation, ConstExpression):
@@ -3222,6 +3320,8 @@ class Checker:
             return any(self.occurs(variable, kind) for kind in (*annotation.parameters, annotation.result))
         if isinstance(annotation, AppliedType):
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
+        if isinstance(annotation, TupleType):
+            return any(self.occurs(variable, kind) for kind in annotation.elements)
         if isinstance(annotation, ArrayType):
             return self.occurs(variable, annotation.element) or self.occurs(variable, annotation.length)
         if isinstance(annotation, ConstExpression):
@@ -3257,6 +3357,11 @@ class Checker:
         if isinstance(actual, AppliedType) and isinstance(expected, AppliedType):
             if actual.name == expected.name and len(actual.arguments) == len(expected.arguments):
                 for left, right in zip(actual.arguments, expected.arguments):
+                    self.require(left, right, token)
+                return
+        if isinstance(actual, TupleType) and isinstance(expected, TupleType):
+            if len(actual.elements) == len(expected.elements):
+                for left, right in zip(actual.elements, expected.elements):
                     self.require(left, right, token)
                 return
         if isinstance(actual, ArrayType) and isinstance(expected, ArrayType):
@@ -3333,6 +3438,8 @@ class Checker:
             return variable
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.fill_holes(annotation.inner, token))
+        if isinstance(annotation, TupleType):
+            return TupleType(tuple(self.fill_holes(kind, token) for kind in annotation.elements))
         if isinstance(annotation, AppliedType):
             parameters = self.program.type_parameters.get(annotation.name, ())
             arguments = []
@@ -3401,8 +3508,8 @@ class Checker:
             function.result = self.resolve(function.result)
             for capture in function.captures:
                 kind = capture.annotation
-                if isinstance(kind, ReferenceType) or isinstance(kind, FunctionType) and kind.closure:
-                    raise capture.name.error("capturing a reference or another capturing closure is unsupported")
+                if isinstance(kind, FunctionType) and kind.closure:
+                    raise capture.name.error("capturing another capturing closure is unsupported")
             if isinstance(function.result, ReferenceType):
                 if function.captures:
                     raise function.name.error("reference results from capturing closures are unsupported")
@@ -3458,6 +3565,12 @@ class Checker:
             if isinstance(annotation.result, ReferenceType):
                 params = [(token, False, kind) for kind in annotation.parameters]
                 Parser.return_inputs(token, params, annotation.result, {})
+            return
+        if isinstance(annotation, TupleType):
+            for kind in annotation.elements:
+                if isinstance(kind, ReferenceType) or isinstance(kind, FunctionType) and kind.closure:
+                    raise token.error("reference and capturing closure elements in tuples are unsupported")
+                self.check_type(kind, token)
             return
         if isinstance(annotation, ArrayType):
             if isinstance(annotation.element, ReferenceType):
@@ -3551,6 +3664,8 @@ class Checker:
             return Checker.mentions_self(kind.inner, self_type)
         if isinstance(kind, ArrayType):
             return Checker.mentions_self(kind.element, self_type)
+        if isinstance(kind, TupleType):
+            return any(Checker.mentions_self(element, self_type) for element in kind.elements)
         if isinstance(kind, AppliedType):
             return any(Checker.mentions_self(arg, self_type) for arg in kind.arguments)
         return False
@@ -3585,6 +3700,9 @@ class Checker:
         elif isinstance(annotation, ArrayType):
             yield from Checker.type_parts(annotation.element)
             yield annotation.length
+        elif isinstance(annotation, TupleType):
+            for kind in annotation.elements:
+                yield from Checker.type_parts(kind)
         else:
             yield annotation
 
@@ -3634,12 +3752,27 @@ class Checker:
             raise token.error(f"missing fields: {', '.join(missing)}")
         return indices
 
+    @staticmethod
+    def positional_patterns(items, size, token, label):
+        rest = [index for index, child in enumerate(items) if child.kind == "rest"]
+        if len(rest) > 1:
+            raise items[rest[1]].token.error("a positional pattern can contain only one '..'")
+        if not rest:
+            if len(items) != size:
+                raise token.error(f"{label} takes {size} fields")
+            return tuple(enumerate(items))
+        if len(items) - 1 > size:
+            raise token.error(f"{label} takes {size} fields")
+        index = rest[0]
+        suffix = index + 1
+        return (*enumerate(items[:index]), *enumerate(items[suffix:], start=size - len(items) + suffix))
+
     def prepare_pattern(self, expr, annotation):
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "wild":
             return Pattern(), {}
         if kind == "rest":
-            raise token.error("'..' is only allowed within a tuple or record pattern")
+            raise token.error("'..' is only allowed within a tuple, array, or record pattern")
         if kind == "literal":
             actual, value = args
             if actual == "i32":
@@ -3678,24 +3811,41 @@ class Checker:
             kind = "pattern_unit"
             args = ()
         style = kind.removeprefix("pattern_")
-        ctor = self.constructor(expr, style, annotation)
-        self.require(ctor.annotation, annotation, token)
-        if style == "record":
-            fields, rest = args
-            indices = self.field_indices(ctor, fields, rest, token)
-            assignments = zip(indices, (value for _, value in fields))
+        if style == "array":
+            annotation = self.resolve(annotation)
+            if not isinstance(annotation, ArrayType):
+                raise token.error(f"expected an array pattern target, found {annotation}")
+            if not isinstance(annotation.length, ConstValue):
+                raise token.error("array pattern requires a fixed length")
+            pairs = self.positional_patterns(args, annotation.length.value, token, "array pattern")
+            pairs = tuple((index, child) for index, child in pairs if child.kind != "wild")
+            if not pairs:
+                return Pattern(), {}
+            fields = tuple((str(index), annotation.element) for index, _ in pairs)
+            ctor = Constructor("[]", annotation, "array", fields)
+            assignments = enumerate(child for _, child in pairs)
+        elif style == "anonymous_tuple":
+            annotation = self.resolve(annotation)
+            if annotation == "()" and len(args) == 1 and args[0].kind == "rest":
+                return Pattern(tag=("()", None)), {}
+            if isinstance(annotation, TypeVariable) and all(child.kind != "rest" for child in args):
+                elements = tuple(TypeVariable("tuple element", child.token) for child in args)
+                self.variables.extend(elements)
+                self.require(TupleType(elements), annotation, token)
+                annotation = self.resolve(annotation)
+            if not isinstance(annotation, TupleType):
+                raise token.error(f"expected a tuple pattern target, found {annotation}")
+            ctor = self.program.layout(annotation)[1][0]
+            assignments = self.positional_patterns(args, len(ctor.fields), token, "tuple pattern")
         else:
-            rest = [index for index, child in enumerate(args) if child.kind == "rest"]
-            if len(rest) > 1:
-                raise args[rest[1]].token.error("a tuple pattern can contain only one '..'")
-            if rest and len(args) - 1 <= len(ctor.fields):
-                index = rest[0]
-                omitted = len(ctor.fields) - len(args) + 1
-                wildcard = Expr("wild", args[index].token)
-                args = args[:index] + (wildcard,) * omitted + args[index + 1:]
-            if len(args) != len(ctor.fields):
-                raise token.error(f"{ctor.path} takes {len(ctor.fields)} fields")
-            assignments = enumerate(args)
+            ctor = self.constructor(expr, style, annotation)
+            self.require(ctor.annotation, annotation, token)
+            if style == "record":
+                fields, rest = args
+                indices = self.field_indices(ctor, fields, rest, token)
+                assignments = zip(indices, (value for _, value in fields))
+            else:
+                assignments = self.positional_patterns(args, len(ctor.fields), token, ctor.path)
         children = [Pattern()] * len(ctor.fields)
         bindings = {}
         for index, child in assignments:
@@ -3897,6 +4047,17 @@ class Checker:
             return args[0].const_type
         if kind in {"array", "array_repeat"}:
             return self.array_type(expr, scope, expected)
+        if kind == "tuple":
+            hint = self.resolve(expected)
+            types = hint.elements if isinstance(hint, TupleType) and len(hint.elements) == len(args) else (None,) * len(args)
+            elements = tuple(self.type_of(item, scope, kind) for item, kind in zip(args, types))
+            if NEVER in elements:
+                return NEVER
+            result = TupleType(elements)
+            self.check_type(result, token)
+            if hint is not None:
+                self.require(result, hint, token)
+            return self.resolve(result)
         if kind == "index":
             base, index = args
             annotation = self.type_of(base, scope)
@@ -4242,6 +4403,8 @@ class Checker:
             hint = self.resolve(parameter)
             actual = first if index == 0 and first is not None else self.type_of(expr_arg, scope, hint)
             self.require_argument(actual, parameter, expr_arg.token)
+            if isinstance(hint, ReferenceType) and hint.mutable:
+                CaptureContext.mark_mutable(scope, expr_arg)
             actual_types.append(actual)
         if expected is not None and defer_projection:
             self.require_argument(result, expected, token)
@@ -4678,7 +4841,15 @@ class Ownership:
             self.function = function
             self.owned_captures = set()
             for capture in function.captures:
-                local = Local(capture.name, capture.mutable, shared_capture=not capture.by_move)
+                loan = None
+                annotation = capture.annotation
+                if isinstance(annotation, ReferenceType):
+                    mutable = annotation.mutable and (capture.by_move or capture.mutable)
+                    referent = Local(replace(capture.name, text=f"*{capture.name.text}"), mutable,
+                                     static=annotation.lifetime == "'static")
+                    loan = Loan(Place(referent), mutable)
+                    cursor = self.emit(cursor, "declare", loan.place, capture.name)
+                local = Local(capture.name, capture.mutable, loan, shared_capture=not capture.by_move)
                 if capture.by_move:
                     self.owned_captures.add(local)
                 scope.bindings[capture.name.key] = local
@@ -4765,6 +4936,10 @@ class Ownership:
             return
         if kind == "borrow" and effect.loan.mutable and not place.holder and not place.local.mutable:
             raise token.error(f"cannot borrow immutable place {place.name!r} as mutable")
+        if place.holder and not place.holder.loan.mutable and (
+            kind == "write" or kind == "borrow" and effect.loan.mutable
+        ):
+            raise token.error(f"cannot modify {place.name!r} through a shared reference")
         if kind == "activate":
             parent = place.local.loan
             place = parent.place
@@ -4921,7 +5096,7 @@ class Ownership:
                 return False
             values = (value for _, value in expr.args[0]) if expr.kind == "record" else expr.args
             return all(self.promotable(value) for value in values)
-        if expr.kind in {"unary", "binary"}:
+        if expr.kind in {"unary", "binary", "tuple"}:
             return all(self.promotable(operand) for operand in expr.args)
         if expr.kind == "block":
             statements, tail = expr.args
@@ -5094,7 +5269,7 @@ class Ownership:
             return self.lower(args[0], scope, cursor, consume=False)
         if kind == "length":
             return self.lower(args[0], scope, cursor, consume=False)
-        if kind in {"array", "index", "array_repeat"}:
+        if kind in {"array", "tuple", "index", "array_repeat"}:
             for item in (args[:1] if kind == "array_repeat" else args):
                 cursor = self.lower(item, scope, cursor)
             return cursor
@@ -5225,9 +5400,15 @@ class Ownership:
         function = self.program.functions[expr.args[0]]
         leases = []
         for capture in function.captures:
-            place = Place(scope.find(capture.name))
+            local = scope.find(capture.name)
+            place = Place(local)
             if capture.by_move:
                 cursor = self.access(cursor, place, capture.annotation, capture.name, consume=True)
+                if local.loan:
+                    leases.append(local.loan)
+            elif isinstance(capture.annotation, ReferenceType):
+                cursor, lease = self.start_loan(cursor, self.referent(local), capture.mutable, capture.name)
+                leases.append(lease)
             else:
                 cursor, lease = self.start_loan(cursor, place, capture.mutable, capture.name)
                 leases.append(lease)
@@ -5427,7 +5608,7 @@ def display(value, debug):
             return name
         fields = [display(item, True) for item in value.fields]
         if ctor.style == "tuple":
-            return f"{name}({', '.join(fields)})"
+            return f"{name}({', '.join(fields)})" if name else tuple_text(fields)
         entries = ", ".join(f"{field}: {item}" for (field, _), item in zip(ctor.fields, fields))
         return f"{name} {{ {entries} }}"
     if value is None:
@@ -5619,6 +5800,10 @@ class Interpreter:
             return substitute(args[0], self.type_arguments).value
         if kind == "array":
             return ArrayValue(tuple(self.eval(item, scope) for item in args))
+        if kind == "tuple":
+            fields = tuple(self.eval(item, scope) for item in args)
+            kind = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
+            return Value(self.program.layout(kind)[1][0], fields)
         if kind == "array_repeat":
             value, length = args
             item = self.eval(value, scope)

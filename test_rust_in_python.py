@@ -1056,6 +1056,88 @@ VALID = [
             println!("{}", once());
         }
     """, "6\n"),
+    ("closures keep shared references alive across copies and moves", """
+        fn main() {
+            let mut n = 4;
+            let r = &n;
+            let f = || *r;
+            let g = f;
+            let move_reference = move || *r;
+            println!("{} {} {}", f(), g(), move_reference());
+            n = 6;
+            println!("{n}");
+        }
+    """, "4 4 4\n6\n"),
+    ("mutable reference captures can reborrow and take ownership", """
+        fn bump(n: &mut i32) { *n += 1; }
+        fn main() {
+            let mut n = 1;
+            let r = &mut n;
+            let mut by_borrow = || { bump(r); *r };
+            println!("{} {}", by_borrow(), by_borrow());
+            let mut by_move = move || { *r += 1; *r };
+            println!("{} {}", by_move(), by_move());
+            println!("{n}");
+        }
+    """, "2 3\n4 5\n5\n"),
+    ("tuple types support generics, methods, patterns, and nested fields", """
+        #[derive(Debug)]
+        struct Packet<T>((T,));
+        trait Get { fn value(&self) -> i32; }
+        impl<T> Get for (i32, T) { fn value(&self) -> i32 { self.0 } }
+        fn identity<T>(value: (T,)) -> (T,) { value }
+        fn main() {
+            let mut pair: (usize, (_, bool)) = (1, (3, false));
+            let old = pair;
+            pair.1.0 += 1;
+            let (first, (second, ..)) = pair;
+            let _ = match pair {
+                (x, (_, true)) => x,
+                (x, (_, false)) => x,
+            };
+            let (..) = ();
+            let p = Packet(identity((5,)));
+            println!("{first} {second} {old:?} {p:?}");
+            let inner: (i32,) = Default::default();
+            println!("{inner:?} {}", (7, true).value());
+        }
+    """, "1 4 (1, (3, false)) Packet((5,))\n(0,) 7\n"),
+    ("tuple destructuring and reassignment track partial moves", """
+        #[derive(Debug)]
+        struct Item(i32);
+        fn main() {
+            let mut pair = (Item(1), Item(2));
+            let (first, ..) = pair;
+            println!("{first:?} {:?}", pair.1);
+            pair.0 = Item(3);
+            println!("{pair:?}");
+        }
+    """, "Item(1) Item(2)\n(Item(3), Item(2))\n"),
+    ("array patterns match prefix, suffix, and sparse positions", """
+        fn main() {
+            let [x, .., y] = [6; 2048];
+            let data = [true, false, true];
+            let n = match data {
+                [false, ..] => 1,
+                [.., false] => 2,
+                [true, _, true] => 3,
+            };
+            assert!(matches!([1, 2], [..=1, (2..)]));
+            let empty: [i32; 0] = [];
+            let [] = empty;
+            println!("{x} {y} {n}");
+        }
+    """, "6 6 3\n"),
+    ("array patterns move disjoint elements", """
+        #[derive(Debug)]
+        struct Item(i32);
+        fn main() {
+            let values = [Item(1), Item(2)];
+            let [first, ..] = values;
+            let [.., last] = values;
+            println!("{first:?} {last:?}");
+        }
+    """, "Item(1) Item(2)\n"),
 ]
 
 INVALID = [
@@ -1528,6 +1610,54 @@ INVALID = [
         fn consume(item: Item) -> i32 { item.0 }
         fn main() { let saved = Item(6); let once = move || consume(saved); once(); once(); }
     """, "use of moved value 'once'"),
+    ("moving a shared reference into a closure preserves its loan", """
+        fn main() {
+            let mut n = 3;
+            let r = &n;
+            let f = move || *r;
+            n = 4;
+            println!("{}", f());
+        }
+    """, "immutably borrowed"),
+    ("mutably captured reference cannot be used before the closure's last call", """
+        fn main() {
+            let mut n = 3;
+            let r = &mut n;
+            let mut f = || { *r += 1; };
+            *r = 4;
+            f();
+        }
+    """, "mutably borrowed"),
+    ("tuple move prevents reading the entire tuple", """
+        #[derive(Debug)]
+        struct Item(i32);
+        fn main() {
+            let tuple = (Item(1), false);
+            let (owned, ..) = tuple;
+            println!("{tuple:?} {owned:?}");
+        }
+    """, "use of partially moved value"),
+    ("tuple patterns must cover nested elements", """
+        fn main() { match (1, false) { (_, true) => () } }
+    """, r"non-exhaustive match, missing \(_, false\)"),
+    ("array pattern needs the right number of elements", """
+        fn main() { let [a, b] = [1, 2, 3]; }
+    """, "array pattern takes 3 fields"),
+    ("array patterns need a fixed length", """
+        fn unknown<const N: usize>(values: [bool; N]) { let [..] = values; }
+        fn main() {}
+    """, "array pattern requires a fixed length"),
+    ("array match must cover all combinations", """
+        fn main() { match [true, true] { [false, ..] | [.., false] => () } }
+    """, r"non-exhaustive match, missing \[true, true\]"),
+    ("array pattern cannot move an already moved element", """
+        struct Item(i32);
+        fn main() {
+            let items = [Item(1), Item(2)];
+            let [first, ..] = items;
+            let [other, ..] = items;
+        }
+    """, "use of moved value 'items.0'"),
 ]
 
 
@@ -1550,18 +1680,21 @@ class InterpreterTests(unittest.TestCase):
             """, encoding="utf-8")
             bad = folder / "invalid.rs"
             bad.write_text("fn main() { let invalid: bool = 1; }", encoding="utf-8")
-            unsupported = folder / "capture.rs"
-            unsupported.write_text("fn main() { let x = 1; let r = &x; let f = || *r; println!(\"{}\", f()); }",
+            capture = folder / "capture.rs"
+            capture.write_text('fn main() { let x = 1; let r = &x; let f = || *r; println!("{}", f()); }',
+                               encoding="utf-8")
+            unsupported = folder / "slice.rs"
+            unsupported.write_text('fn main() { let numbers: &[i32] = &[1, 2]; println!("{}", numbers[0]); }',
                                    encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
-            report = subprocess.run([sys.executable, runner, "--json", root, bad, unsupported, panics],
+            report = subprocess.run([sys.executable, runner, "--json", root, bad, capture, unsupported, panics],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
-                             ["runtime_match", "both_rejected", "acceptance_mismatch", "runtime_match"])
+                             ["runtime_match", "both_rejected", "runtime_match", "acceptance_mismatch", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
 
     def test_valid_programs(self):
