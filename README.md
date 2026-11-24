@@ -37,6 +37,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Field access and mutation, destructuring, `if let`, `while let`, and `let-else`
 - Exhaustive `match` with nested patterns, alternatives, integer ranges, and guards
 - Shared and mutable pattern bindings, explicit `ref` and `ref mut`, and reference patterns
+- `@` bindings on ranges and structural subpatterns
 - Move and initialization checks across branches and loop iterations
 - Partial moves, assignment after a move, and selected `Clone`, `Copy`, and `Debug` derives
 - Shared and mutable references to locals, fields, and temporaries

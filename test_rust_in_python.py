@@ -1414,6 +1414,23 @@ VALID = [
             println!("{left} {} {a} {b} {temporary}", whole.right);
         }
     """, "5 3\n2 3 15 7 5\n"),
+    ("at bindings preserve the whole pattern value and its projections", """
+        struct Item(i32);
+        enum Choice { First(i32), Second(i32) }
+        fn main() {
+            let value = match 2 { n @ 1..=3 => n, _ => 0 };
+            let aggregate @ (header, _) = (value, Item(4));
+            let ref pair @ (ref left, ref right) = (3, 7);
+            let container = Some(Item(9));
+            let score = match &container {
+                whole @ Some(item) if whole.is_some() => item.0,
+                _ => 0,
+            };
+            let choice = Choice::Second(8);
+            let v = match choice { _c @ (Choice::First(n) | Choice::Second(n)) => n };
+            println!("{} {} {} {} {} {} {}", aggregate.1.0, header, pair.1, left, right, score, v);
+        }
+    """, "4 2 7 3 7 9 8\n"),
 ]
 
 INVALID = [
@@ -2069,6 +2086,19 @@ INVALID = [
             println!("{out}");
         }
     """, "temporary value dropped while borrowed"),
+    ("at bindings cannot both move a non-Copy value", """
+        struct Item(i32);
+        fn main() { let _whole @ _part = Item(1); }
+    """, "Item does not implement Copy"),
+    ("at bindings cannot overlap a mutable borrow", """
+        fn main() {
+            let mut pair = (1, 2);
+            let ref mut _whole @ (ref _left, _) = pair;
+        }
+    """, "overlapping mutable borrows"),
+    ("at binding names cannot repeat inside the subpattern", """
+        fn main() { let _x @ (_x, _) = (1, 2); }
+    """, "duplicate pattern binding"),
 ]
 
 
@@ -2124,11 +2154,19 @@ class InterpreterTests(unittest.TestCase):
                     println!("{first}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "binding_subpattern.rs"
-            unsupported.write_text('''
+            at_pattern = folder / "binding_subpattern.rs"
+            at_pattern.write_text('''
                 fn main() {
                     let value = match 2 { n @ 1..=3 => n, _ => 0 };
                     println!("{value}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "heap_vector.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let mut values = vec![1, 2];
+                    values.push(3);
+                    println!("{values:?}");
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2150,14 +2188,15 @@ class InterpreterTests(unittest.TestCase):
             ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, shared, mutable, explicit, unsupported, panics,
+                                     capture, slices, slice_pattern, shared, mutable, explicit, at_pattern, unsupported, panics,
                                      bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "runtime_match", "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "runtime_match", "acceptance_mismatch",
+                              "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)

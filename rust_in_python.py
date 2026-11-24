@@ -81,7 +81,7 @@ TOKEN = re.compile(
     r"'[A-Za-z_][A-Za-z_0-9]*|"
     rf'(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:{"|".join(INTEGER_WIDTHS)})?|'
     r'[A-Za-z_][A-Za-z_0-9]*|'
-    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%&|^\-]=|[{}()[\]#$?.:,;=!+*/%&<>|^\-]'
+    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%&|^\-]=|[{}()[\]#$@?.:,;=!+*/%&<>|^\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
@@ -2788,6 +2788,8 @@ class Parser:
 
     def range_pattern(self, *, array_item=False):
         first = None if self.current.text in {"..", "..="} else self.simple_pattern()
+        if first is not None and first.kind == "bind" and self.accept("@"):
+            return Expr("pattern_binding", first.token, (first, self.range_pattern(array_item=array_item)))
         separator = self.accept("..") or self.accept("..=")
         if separator is None:
             return first
@@ -3181,8 +3183,14 @@ class Pattern:
     binding: str | None = None
     alternatives: tuple = ()
     by_reference: bool = False
+    aliases: tuple = ()
 
     def bindings(self, value, address=None):
+        aliases = {alias.binding: address if alias.by_reference else value for alias in self.aliases}
+        for matched in self.match_value(value, address):
+            yield aliases | matched
+
+    def match_value(self, value, address):
         if self.alternatives:
             for alternative in self.alternatives:
                 yield from alternative.bindings(value, address)
@@ -4110,6 +4118,23 @@ class Checker:
         annotation = self.resolve(annotation)
         unit = self.program.constructors.get(token.text) if kind == "bind" else None
         structural = kind not in {"bind", "wild", "or"} or (unit and unit.style == "unit")
+        if kind == "pattern_binding":
+            name, subpattern = args
+            alias, own = self.prepare_pattern(name, annotation, borrowed=borrowed)
+            if not alias.binding:
+                raise token.error("the left side of '@' must bind a name")
+            pattern, nested = self.prepare_pattern(subpattern, annotation, borrowed=borrowed)
+            if alias.binding in nested:
+                raise token.error(f"duplicate pattern binding {token.text!r}")
+            if alias.by_reference or not self.implements(self.resolve(annotation), "Copy"):
+                for kind, _ in nested.values():
+                    if not isinstance(kind, ReferenceType):
+                        self.obligation(kind, "Copy", token)
+                    elif not alias.by_reference:
+                        self.obligation(annotation, "Copy", token)
+                    elif own[alias.binding][0].mutable or kind.mutable:
+                        raise token.error("overlapping mutable borrows in an '@' pattern")
+            return replace(pattern, aliases=(alias, *pattern.aliases)), own | nested
         if kind == "pattern_reference":
             mutable, operand = args
             if not isinstance(annotation, ReferenceType) or annotation.mutable != mutable:
@@ -6053,6 +6078,8 @@ class Ownership:
 
     def collect_pattern(self, pattern, place, access, annotation, *, opaque=False, projection=None):
         projection = projection if projection is not None else place
+        for alias in pattern.aliases:
+            self.collect_pattern(alias, place, access, annotation, opaque=opaque, projection=projection)
         if pattern.alternatives:
             for option in pattern.alternatives:
                 self.collect_pattern(option, place, access, annotation, opaque=opaque, projection=projection)
