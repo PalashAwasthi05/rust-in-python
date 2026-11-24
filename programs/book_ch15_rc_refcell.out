@@ -1,0 +1,38 @@
+0
+count after creating a = 1
+count after creating b = 2
+count after creating c = 3
+c starts with 4
+count after c goes out of scope = 2
+b = Cons(3, Cons(5, Cons(10, Nil)))
+a after = Cons(RefCell { value: 15 }, Nil)
+b after = Cons(RefCell { value: 3 }, Cons(RefCell { value: 15 }, Nil))
+c after = Cons(RefCell { value: 4 }, Cons(RefCell { value: 15 }, Nil))
+value 120 max 100
+messages sent: 3
+  Warning: You've used up over 75% of your quota!
+  Urgent warning: You've used up over 90% of your quota!
+  Error: You are over your quota!
+two shared borrows: [1] [1] try_borrow_mut ok? false
+after mutation [1, 2] try_borrow_mut ok? false
+a initial rc count = 1
+a next item = Some(RefCell { value: Nil })
+a rc count after b creation = 2
+b initial rc count = 1
+b next item = Some(2)
+b rc count after changing a = 2
+a rc count after changing a = 2
+leaf parent = None
+leaf strong = 1, weak = 0
+branch strong = 1, weak = 1
+leaf strong = 2, weak = 0
+leaf parent = Some(5)
+branch children = [3]
+dropping node 5
+leaf parent = None
+leaf strong = 1, weak = 0
+log: w0 w1 w2 (strong 4)
+strong after drop 1
+Ok("log: w0 w1 w2")
+end of main
+dropping node 3

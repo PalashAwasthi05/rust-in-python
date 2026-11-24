@@ -1,0 +1,18 @@
+0
+spawned thread computed 45
+Here's a vector: [1, 2, 3]
+Got: hi
+Got: hi
+Got: from
+Got: the
+Got: thread
+9 messages: [(0, 0), (0, 1), (0, 2), (1, 10), (1, 11), (1, 12), (2, 20), (2, 21), (2, 22)]
+m = 6
+Result: 10
+strong count back to 1
+squares [0, 1, 4, 9]
+readers see v1 and v1
+after write: v1-patched
+parallel sum = 5050
+scoped thread sees len 4
+after scope [1, 2, 3, 4, 5]

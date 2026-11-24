@@ -1,0 +1,17 @@
+0
+Tags(["rust", "book", "async"])
+1
+0
+<circle area=3.14>
+<rect 2x3 area=6.00>
+grown <circle area=12.57>
+grown <rect 4x6 area=24.00>
+rect bigger than circle? true
+largest rect 4x6
+value 19
+[("doubler", 0), ("offset", 1)]
+i32 7
+String "seven"
+something else
+true
+Any { .. }

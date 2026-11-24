@@ -1,0 +1,10 @@
+101
+Some(2) None
+reading index 2
+cleaning up risky
+value 3
+total 6
+about to panic
+reading index 99
+cleaning up risky
+cleaning up main
