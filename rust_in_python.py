@@ -1158,6 +1158,13 @@ def integer_conversions():
 
 
 STD_SOURCE = Path(__file__).with_name("std.rs").read_text(encoding="utf-8") + SCALAR_STD + integer_conversions()
+
+
+@functools.lru_cache(maxsize=None)
+def std_token_trees(edition):
+    """The standard library's token trees, lexed once per edition and process: tokens and trees are immutable."""
+    return token_trees(lex(STD_SOURCE, edition=edition, source_file="<std>"))[0]
+
 ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "Iterator"))
 INTO_ITERATOR = MODULE_SEPARATOR.join(("std", "iter", "IntoIterator"))
 LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
@@ -1336,7 +1343,7 @@ class Modules:
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
         self.units[STD_ROOT] = std
-        std.items = self.scan(std, token_trees(lex(STD_SOURCE, edition=edition, source_file="<std>"))[0])
+        std.items = self.scan(std, std_token_trees(edition))
 
     def register(self, unit, token, kind, boundary):
         if not is_identifier(token.text) or token.text in RESERVED_BY_EDITION[self.edition]:
@@ -2151,10 +2158,17 @@ class Constructor:
     visibility: tuple = ()
 
     def index(self, token):
+        index = self.positions.get(token.text)
+        if index is None:
+            raise token.error(f"{self.path or self.annotation} has no field {token.text!r}")
+        return index
+
+    @functools.cached_property
+    def positions(self):
+        positions = {}
         for index, (name, _) in enumerate(self.fields):
-            if name == token.text:
-                return index
-        raise token.error(f"{self.path or self.annotation} has no field {token.text!r}")
+            positions.setdefault(name, index)
+        return positions
 
 
 @dataclass(frozen=True)
@@ -2802,6 +2816,7 @@ class Program:
         raise AssertionError(ctor.path)
     lazy_items: dict = field(default_factory=dict)
     normalized: dict | None = None
+    layouts: dict | None = None
     dispatch_cache: dict = field(default_factory=dict)
 
     def add_prelude(self):
@@ -3087,6 +3102,18 @@ class Program:
         return True
 
     def layout(self, annotation):
+        if self.layouts is not None:
+            # After checking, types are fixed, so each annotation's layout is computed once.
+            try:
+                return self.layouts[annotation]
+            except KeyError:
+                result = self.layouts[annotation] = self.uncached_layout(annotation)
+                return result
+            except TypeError:
+                pass
+        return self.uncached_layout(annotation)
+
+    def uncached_layout(self, annotation):
         if isinstance(annotation, TupleType):
             fields = tuple((str(index), kind) for index, kind in enumerate(annotation.elements))
             return None, (Constructor("", annotation, "tuple", fields),)
@@ -5401,8 +5428,20 @@ class Address:
 
     def write(self, value):
         if self.fields:
-            value = self.binding.value.replace(self.fields, value)
+            current = self.binding.value
+            if type(current) in IN_PLACE_TYPES and refcount(current) <= SOLE_REFERENCES:
+                store_in_place(current, self.fields, value)
+                value = current
+            else:
+                value = current.replace(self.fields, value)
         self.binding.value = value
+
+    def unique_array(self):
+        """The array at this place if nothing else can observe it, so it can be mutated in place; otherwise None."""
+        current = self.binding.value
+        if type(current) in IN_PLACE_TYPES and refcount(current) <= SOLE_REFERENCES:
+            return unique_target(current, self.fields)
+        return None
 
 
 @dataclass(frozen=True)
@@ -5416,13 +5455,13 @@ class SliceAddress:
         return self.stop - self.start
 
     def child(self, token):
-        index = int(token.text)
+        index = token.value if token.__class__ is Offset else int(token.text)
         if not 0 <= index < self.length:
             raise RustPanic(f"index out of bounds: the len is {self.length} but the index is {index}")
-        return self.address.child(replace(token, text=str(self.start + index)))
+        return self.address.child(Offset(self.start + index))
 
     def read(self):
-        return ArrayValue(self.address.read().items[self.start:self.stop])
+        return ArrayValue(self.address.read().slice(self.start, self.stop))
 
     def write(self, value):
         if len(value.items) != self.length:
@@ -5549,24 +5588,145 @@ class Value:
         return Value(self.constructor, tuple(fields))
 
 
-@dataclass(frozen=True)
+class Offset:
+    """An array index in an Address path, standing in for a Token whose text is the decimal index."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    @property
+    def text(self):
+        return str(self.value)
+
+    def error(self, message):
+        return RustError(message)
+
+
 class ArrayValue:
-    items: tuple
+    """An array, Vec, or slice value. It behaves as an immutable tuple of items, except that an array nothing else
+    references is updated in place (Address.write, Address.unique_array): no one can observe the difference."""
+
+    __slots__ = ("_items", "_list")
+
+    def __init__(self, items):
+        self._items = items
+        self._list = None
+
+    @property
+    def items(self):
+        items = self._items
+        if items is None:
+            items = self._items = tuple(self._list)
+        return items
+
+    def __eq__(self, other):
+        if other.__class__ is not ArrayValue:
+            return NotImplemented
+        return self.items == other.items
+
+    def __hash__(self):
+        return hash((self.items,))
+
+    def __repr__(self):
+        return f"ArrayValue(items={self.items!r})"
+
+    def length(self):
+        return len(self._items if self._list is None else self._list)
+
+    def mutable_items(self):
+        """The item list, owned by this array alone; the caller must know nothing else references this array."""
+        items = self._list
+        if items is None:
+            items = self._list = list(self._items)
+        self._items = None
+        return items
+
+    def slice(self, start, stop):
+        return tuple(self._list[start:stop]) if self._items is None else self._items[start:stop]
 
     def index(self, token):
-        index = int(token.text)
-        if not 0 <= index < len(self.items):
-            raise RustPanic(f"index out of bounds: the len is {len(self.items)} but the index is {index}")
+        index = token.value if token.__class__ is Offset else int(token.text)
+        length = self.length()
+        if not 0 <= index < length:
+            raise RustPanic(f"index out of bounds: the len is {length} but the index is {index}")
         return index
 
     def at(self, token):
-        return self.items[self.index(token)]
+        index = self.index(token)
+        return self._items[index] if self._list is None else self._list[index]
 
     def replace(self, path, value):
         index = self.index(path[0])
-        items = list(self.items)
+        items = list(self._items if self._list is None else self._list)
         items[index] = items[index].replace(path[1:], value) if path[1:] else value
         return ArrayValue(tuple(items))
+
+
+refcount = getattr(sys, "getrefcount", None)
+
+
+def sole_references():
+    """What refcount reports for an object held by one container slot and one local variable, the shape every
+    in-place check below uses; 0 disables in-place updates where reference counts are unavailable."""
+    if refcount is None:
+        return 0
+    holder = [ArrayValue(())]
+    current = holder[0]
+    return refcount(current)
+
+
+SOLE_REFERENCES = sole_references()
+if refcount is None:
+    def refcount(value):
+        return SOLE_REFERENCES + 1
+
+
+IN_PLACE_TYPES = frozenset({ArrayValue, Value})
+
+
+def store_in_place(container, path, value):
+    """Address.write for a container only its owner references: mutate unshared parts, copy shared ones."""
+    name, rest = path[0], path[1:]
+    if type(container) is ArrayValue:
+        index = container.index(name)
+        items = container.mutable_items()
+        if not rest:
+            items[index] = value
+            return
+        child = items[index]
+        if type(child) in IN_PLACE_TYPES and refcount(child) <= SOLE_REFERENCES:
+            store_in_place(child, rest, value)
+        else:
+            items[index] = child.replace(rest, value)
+        return
+    index = container.constructor.index(name)
+    fields = container.fields
+    if rest and refcount(fields) <= SOLE_REFERENCES:
+        child = fields[index]
+        if type(child) in IN_PLACE_TYPES and refcount(child) <= SOLE_REFERENCES:
+            store_in_place(child, rest, value)
+            return
+    replacement = fields[index].replace(rest, value) if rest else value
+    object.__setattr__(container, "fields", (*fields[:index], replacement, *fields[index + 1:]))
+
+
+def unique_target(container, path):
+    """The array at path inside a container only its owner references, if every step is unshared; else None."""
+    for name in path:
+        if type(container) is ArrayValue:
+            items = container.mutable_items()
+            child = items[container.index(name)]
+        else:
+            fields = container.fields
+            if refcount(fields) > SOLE_REFERENCES:
+                return None
+            child = fields[container.constructor.index(name)]
+        if type(child) not in IN_PLACE_TYPES or refcount(child) > SOLE_REFERENCES:
+            return None
+        container = child
+    return container if type(container) is ArrayValue else None
 
 
 @dataclass(frozen=True)
@@ -6292,6 +6452,8 @@ class Checker:
         return replace(function, params=params, result=result, return_inputs=inputs)
 
     def resolve(self, annotation, *, defer_const=False):
+        if annotation.__class__ is str:
+            return annotation
         if isinstance(annotation, TypeVariable) and annotation in self.substitutions:
             result = self.resolve(self.substitutions[annotation], defer_const=defer_const)
             if not defer_const:
@@ -10979,7 +11141,8 @@ class Interpreter:
         global USER_FORMAT, MAP_ORDER
         USER_FORMAT = self.user_format
         MAP_ORDER = self.map_order
-        self.track_drops = any(impl.trait == DROP for impl in program.impls)
+        # The standard library's own Drop impls (RefCell guards) switch tracking on from RefCell::new instead.
+        self.track_drops = any(impl.trait == DROP and impl.token.source_file != "<std>" for impl in program.impls)
         self.implementations = {}
         self.temporaries = []
         self.program = program
@@ -11095,7 +11258,7 @@ class Interpreter:
             else:
                 values = stored.fields
         elif borrowed:
-            values = (collection.child(replace(token, text=str(index))) for index in range(len(stored.items)))
+            values = (collection.child(Offset(index)) for index in range(stored.length()))
         else:
             values = stored.items
         if iterator and iterator.reverse:
@@ -11518,7 +11681,7 @@ class Interpreter:
             for index, ((param, _, _), value) in enumerate(zip(function.params, values)):
                 if param.text == "_":
                     parameters[("_", index)] = Binding(value, False)
-        bindings = dict(environment or {}) | own
+        bindings = environment | own if environment else own
         previous = self.type_arguments
         self.type_arguments = {p: self.program.normalize(substitute(t, previous))
                                for p, t in (arguments or {}).items()}
@@ -11663,7 +11826,7 @@ class Interpreter:
             base, index = expr.args
             root = self.address(base, scope)
             offset = self.eval(index, scope)
-            return root.child(replace(expr.token, text=str(offset)))
+            return root.child(Offset(offset))
         if expr.kind == "range_index":
             base, first, last, inclusive = expr.args
             root = self.address(base, scope)
@@ -11694,7 +11857,8 @@ class Interpreter:
             self.temporaries.append(binding)
         return Address(binding)
 
-    def eval(self, expr, scope):
+    def eval_uncommon(self, expr, scope):
+        """The expression kinds that run rarely, split from eval so the hot kinds below skip these tests."""
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "exit_code":
             return ExitCodeValue(self.eval(args[0], scope))
@@ -11840,6 +12004,13 @@ class Interpreter:
             if token.text in {"as_slice", "as_mut_slice"}:
                 return address
             arguments = tuple(self.eval(arg, scope) for arg in args[1:])
+            target = address.unique_array() if token.text in {"push", "pop"} and type(address) is Address else None
+            if target is not None:
+                items = target.mutable_items()
+                if token.text == "push":
+                    items.append(arguments[0])
+                    return None
+                return self.option_value(expr, (items.pop(),) if items else ())
             items = address.read().items
             if token.text == "push":
                 address.write(ArrayValue((*items, arguments[0])))
@@ -11898,6 +12069,12 @@ class Interpreter:
             return DynAddress(value, self.program.concrete_type(concrete))
         if kind in {"slice_reference", "string_reference"}:
             return self.eval(args[0], scope)
+        return self.eval(expr, scope, True)
+
+    def eval(self, expr, scope, uncommon_done=False):
+        kind, token, args = expr.kind, expr.token, expr.args
+        if kind in UNCOMMON_EVAL_KINDS and not uncommon_done:
+            return self.eval_uncommon(expr, scope)
         if kind == "literal":
             if is_str_reference(args[0]):
                 return Address(Binding(args[1], False))
@@ -12168,12 +12345,14 @@ class Interpreter:
                 return COMPARE[token.text](ordering_number(order.fields[0]), 0)
             if token.text in COMPARE:
                 other = self.eval(right, scope)
+                if value.__class__ is int and other.__class__ is int:
+                    return COMPARE[token.text](value, other)
                 compared = self.compare(value, other, equality=token.text in {"==", "!="})
                 return token.text == "!=" if compared is None else COMPARE[token.text](compared, 0)
             return binary(token.text, value, self.eval(right, scope), token,
                           self.program.expr_types[id(expr)], runtime=True)
         if kind == "call":
-            values = tuple(self.eval(arg, scope) for arg in args)
+            values = tuple([self.eval(arg, scope) for arg in args])
             ctor = self.program.constructors.get(token.text)
             if ctor and ctor.style == "tuple":
                 return Value(self.runtime_constructor(expr, ctor), values)
@@ -12263,6 +12442,8 @@ class Interpreter:
             destination = sys.stderr if token.text in {"eprint", "eprintln"} else self.stdout
             print(rendered, end="\n" if token.text in {"println", "eprintln"} else "", file=destination)
             return None
+        if not uncommon_done:
+            return self.eval_uncommon(expr, scope)
         raise AssertionError(kind)
 
     def exit_status(self, value, annotation):
@@ -12279,6 +12460,15 @@ class Interpreter:
         impl, arguments = self.program.implementation(annotation, TERMINATION)
         result = self.call(impl.methods["report"].name.text, (value,), arguments)
         return result.status
+
+
+# The kinds eval_uncommon handles (a kind missing here still works, after eval's own tests fail).
+UNCOMMON_EVAL_KINDS = frozenset({
+    "exit_code", "process_exit", "box", "box_deref", "iterator_terminal", "iterator", "enum_cast", "chars_as_str",
+    "range_value", "lazy_adapter", "string_iterator", "reverse_iterator", "map_iterator", "function_pointer",
+    "closure_value", "indirect_call", "try", "enum_method", "vector_method", "string_method", "macro_definition",
+    "dyn_reference", "slice_reference", "string_reference",
+})
 
 
 DEMO = """\
@@ -12524,7 +12714,7 @@ def rust_vec_last(interpreter, result, vector):
     items = vector.read().items
     if not items:
         return interpreter.variant(result, "None")
-    return interpreter.variant(result, "Some", vector.child(Token(str(len(items) - 1), 0, 0)))
+    return interpreter.variant(result, "Some", vector.child(Offset(len(items) - 1)))
 
 
 ORDERING = MODULE_SEPARATOR.join(("std", "cmp", "Ordering"))
@@ -12543,7 +12733,7 @@ def text_of(value):
 
 
 def child(address, index):
-    return address.child(Token(str(index), 0, 0))
+    return address.child(Offset(index))
 
 
 def shared(value):
@@ -14724,6 +14914,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     Checker(program, modules).check()
     Ownership(program).check()
     program.normalized = {}
+    program.layouts = {}
     return program
 
 
@@ -14775,5 +14966,22 @@ def main():
     return 0
 
 
+def main_on_deep_stack():
+    """Run main on a thread with a large stack and a high recursion limit, since each Rust call nests several
+    Python frames: deeply recursive Rust programs then run instead of stopping at Python's default limits."""
+    import threading
+    sys.setrecursionlimit(DEEP_RECURSION_LIMIT)
+    threading.stack_size(DEEP_STACK_BYTES)
+    status = []
+    thread = threading.Thread(target=lambda: status.append(main()))
+    thread.start()
+    thread.join()
+    return status[0] if status else 1
+
+
+DEEP_RECURSION_LIMIT = 250_000
+DEEP_STACK_BYTES = 1 << 30
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_on_deep_stack())

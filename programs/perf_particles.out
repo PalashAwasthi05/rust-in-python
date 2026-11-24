@@ -1,0 +1,5 @@
+0
+bounces: 111
+centroid: (512, 348)
+Particle { x: 778, y: 147, vx: 1, vy: 0, bounces: 0 }
+Particle { x: 512, y: 489, vx: 1, vy: -2, bounces: 1 }
