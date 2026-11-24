@@ -598,6 +598,8 @@ class Modules:
         self.exported = {}
         self.macro_paths = {}
         self.constants = {}
+        self.const_functions = {}
+        self.active_const_functions = set()
         self.type_aliases = {}
         self.alias_names = set()
         root.items = self.scan(root, trees)
@@ -671,6 +673,24 @@ class Modules:
                 output.extend(items[start:])
                 break
             word = tree_text(items[index])
+            if word == "const" and index + 1 < len(items) and tree_text(items[index + 1]) == "fn":
+                end = self.item_end(items, index + 1, "fn")
+                if index + 2 >= len(items):
+                    raise items[index].error("expected a const function name")
+                name = items[index + 2]
+                if not isinstance(name, Token):
+                    raise items[index].error("expected a const function name")
+                original = unit.symbols.get(name.text)
+                if expanded and original and original.token is name:
+                    symbol = original
+                else:
+                    symbol = self.register(unit, name, "fn", boundary)
+                if expanded:
+                    self.const_functions[symbol.name] = (unit, items[index:end])
+                output.extend(kept_attributes)
+                output.extend(items[index:end])
+                index = end
+                continue
             if word == "mod" and index + 2 < len(items):
                 token, body = items[index + 1:index + 3]
                 if not isinstance(token, Token):
@@ -1047,6 +1067,14 @@ class Modules:
                 raise remaining[0][2]
             pending = [(unit, segment) for unit, segment, _ in remaining]
 
+    def read_const_function(self, name):
+        unit, segment = self.const_functions[name]
+        parser = Parser("", tokens=(*flatten_trees(segment), replace(segment[0], text="")),
+                        modules=self, unit=unit)
+        parser.expect("const")
+        parser.expect("fn")
+        return parser, parser.function(parser.declare_token(parser.identifier()))
+
 
 @dataclass
 class Expr:
@@ -1224,6 +1252,8 @@ class ConstExpression:
     integer: str | None = None
 
     def __str__(self):
+        if self.operator == "block":
+            return "{ " + "; ".join(map(str, self.operands)) + " }"
         if len(self.operands) == 1:
             return f"({self.operator}{self.operands[0]})"
         return f"({self.operands[0]} {self.operator} {self.operands[1]})"
@@ -1244,6 +1274,8 @@ def check_constant_kind(value, kind, token):
         return
     if kind == "char" and isinstance(value.value, Character):
         return
+    if kind in FLOAT_TYPES and isinstance(value.value, float):
+        return
     if kind in INTEGER_TYPES and type(value.value) is int:
         checked(value.value, token, kind)
         return
@@ -1255,6 +1287,8 @@ def fold_const(expression):
         return expression
     values = tuple(value.value for value in expression.operands)
     word, token, kind = expression.operator, expression.token, expression.kind
+    if word == "block":
+        return ConstValue(values[-1], kind)
     if word == "&&":
         result = values[0] and values[1]
     elif word == "||":
@@ -1919,7 +1953,8 @@ class Parser:
             if self.accept("use"):
                 self.trait_import()
                 continue
-            if self.accept("const"):
+            if self.current.text == "const" and self.peek() != "fn":
+                self.advance()
                 self.constant_item()
                 continue
             derives = self.attributes()
@@ -1936,11 +1971,15 @@ class Parser:
             if token := self.accept("impl"):
                 self.impl_item(program, token)
                 continue
+            constant = self.accept("const")
             self.expect("fn")
             name = self.declare_token(self.identifier())
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
-            program.functions[name.text] = self.function(name)
+            function = self.function(name)
+            if constant:
+                self.validate_const_function(function)
+            program.functions[name.text] = function
         return program
 
     def function(self, name, *, method=False, declaration=False):
@@ -2840,8 +2879,93 @@ class Parser:
         kind, value = literal.args
         return ConstValue(value, None if literal.unsuffixed else kind)
 
-    def const_expression(self, expr, hint=None):
+    def validate_const_function(self, function):
+        if function.name.text == "main":
+            raise function.name.error("main cannot be const")
+        if (function.type_parameters or function.result not in CONST_VALUE_TYPES
+                or any(kind not in CONST_VALUE_TYPES or name.text.startswith("@param:")
+                       for name, _, kind in function.params)):
+            raise function.name.error("const functions currently require scalar parameters and a scalar result")
+        arguments = tuple(TypeParameter(name.text, const_type=kind) for name, _, kind in function.params)
+        self.const_function_body(function, arguments)
+
+    def const_function_body(self, function, arguments):
+        token = function.name
+        if function.result not in CONST_VALUE_TYPES:
+            raise token.error("const functions currently require a scalar result")
+        if len(arguments) != len(function.params):
+            raise token.error(f"expected {len(function.params)} const function arguments")
+        active = self.modules.active_const_functions
+        if token.text in active:
+            raise token.error("recursive const functions are unsupported")
+        locals = {}
+        for (name, _, kind), argument in zip(function.params, arguments):
+            check_constant_kind(argument, kind, name)
+            if name.text != "_":
+                locals[name.key] = replace(argument, kind=kind) if isinstance(argument, ConstValue) else argument
+        active.add(token.text)
+        try:
+            value = self.const_expression(function.body, function.result, locals=locals)
+            check_constant_kind(value, function.result, token)
+            effects = tuple(arg for arg in arguments if not isinstance(arg, ConstValue))
+            if effects:
+                return ConstExpression("block", (*effects, value), function.result, token)
+            return replace(value, kind=function.result) if isinstance(value, ConstValue) else value
+        finally:
+            active.remove(token.text)
+
+    def const_expression(self, expr, hint=None, *, locals=None):
         expr = ungroup(expr)
+        if expr.kind == "name":
+            if locals is not None and expr.token.key in locals:
+                return locals[expr.token.key]
+            if expr.token.text in self.constants:
+                return self.constants[expr.token.text]
+        if expr.kind == "call" and expr.qualified is None and expr.type_arguments is None:
+            if self.modules is None or expr.token.text not in self.modules.const_functions:
+                raise expr.token.error("constant evaluation requires a const function")
+            parser, function = self.modules.read_const_function(expr.token.text)
+            if (len(expr.args) != len(function.params) or function.type_parameters
+                    or any(kind not in CONST_VALUE_TYPES for _, _, kind in function.params)):
+                raise expr.token.error("incompatible const function arguments")
+            arguments = tuple(self.const_expression(arg, kind, locals=locals)
+                              for arg, (_, _, kind) in zip(expr.args, function.params))
+            return parser.const_function_body(function, arguments)
+        if expr.kind == "block":
+            statements, tail = expr.args
+            if tail is None:
+                raise expr.token.error("constant block requires a result")
+            scope = {} if locals is None else dict(locals)
+            effects = []
+            for statement in statements:
+                if statement.kind == "macro_definition":
+                    continue
+                if statement.kind == "discard" and not statement.args[1]:
+                    effects.append(self.const_expression(statement.args[0], locals=scope))
+                    continue
+                if statement.kind != "let":
+                    raise statement.token.error("unsupported statement in a constant block")
+                pattern, annotation, initializer, fallback = statement.args
+                if (pattern.kind not in {"bind", "wild"} or pattern.args not in {(), (False,)}
+                        or initializer is None or fallback or annotation not in CONST_VALUE_TYPES | {None}):
+                    raise statement.token.error("constant bindings require an immutable scalar value")
+                value = self.const_expression(initializer, annotation, locals=scope)
+                kind = annotation or const_kind(value)
+                if kind is None and isinstance(value, ConstValue):
+                    kind = "f64" if isinstance(value.value, float) else "i32"
+                check_constant_kind(value, kind, statement.token)
+                if isinstance(value, ConstValue):
+                    value = replace(value, kind=kind)
+                effects.append(value)
+                if pattern.kind == "bind":
+                    scope[pattern.token.key] = value
+            value = self.const_expression(tail, hint, locals=scope)
+            effects = tuple(effect for effect in effects if not isinstance(effect, ConstValue))
+            if effects:
+                kind = const_kind(value) or hint or "i32"
+                check_constant_kind(value, kind, tail.token)
+                return ConstExpression("block", (*effects, value), kind, expr.token)
+            return value
         if expr.kind == "const_value":
             return expr.args[0]
         if expr.kind == "literal" and expr.args[0] in CONST_VALUE_TYPES:
@@ -2855,7 +2979,7 @@ class Parser:
             if target not in SCALAR_BOUNDS and target not in FLOAT_TYPES:
                 raise expr.token.error("constant cast requires a numeric or char target")
             preferred = "u8" if target == "char" else target
-            value = self.const_expression(operand, preferred)
+            value = self.const_expression(operand, preferred, locals=locals)
             actual = const_kind(value)
             if actual is None and isinstance(value, ConstValue) and isinstance(value.value, float):
                 actual = "f32" if isinstance(value.value, Float32) else "f64"
@@ -2864,13 +2988,13 @@ class Parser:
                 raise expr.token.error(f"cannot cast {actual} to {target}")
             return fold_const(ConstExpression("as", (value,), target, expr.token, actual))
         if expr.kind == "unary" and expr.token.text == "!":
-            value = self.const_expression(expr.args[0], hint)
+            value = self.const_expression(expr.args[0], hint, locals=locals)
             kind = const_kind(value) or hint or "i32"
             if kind != "bool" and kind not in INTEGER_TYPES:
                 raise expr.token.error(f"cannot negate {kind} with '!'")
             return fold_const(ConstExpression("!", (value,), kind, expr.token, kind))
         if expr.kind == "unary" and expr.token.text == "-":
-            value = self.const_expression(expr.args[0], hint)
+            value = self.const_expression(expr.args[0], hint, locals=locals)
             kind = const_kind(value) or hint
             if kind in INTEGER_TYPES and INTEGER_BOUNDS[kind][0] == 0:
                 raise expr.token.error(f"cannot negate {kind} with '-'")
@@ -2885,7 +3009,7 @@ class Parser:
             if kind in FLOAT_TYPES or kind in INTEGER_TYPES and kind.startswith("i"):
                 return ConstExpression("-", (value,), kind, expr.token)
         if expr.kind == "binary":
-            left, right = (self.const_expression(arg, hint) for arg in expr.args)
+            left, right = (self.const_expression(arg, hint, locals=locals) for arg in expr.args)
             word = expr.token.text
             left_kind, right_kind = const_kind(left), const_kind(right)
             if word in SHIFTS:

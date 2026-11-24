@@ -48,6 +48,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
 - Const generic parameters and fixed-size arrays with length inference, indexing, repeat literals, and patterns
+- Scalar `const fn` calls in constant items, array lengths, and runtime expressions
 - Borrowed slices, array-to-slice coercion, range indexing, and patterns on dereferenced slices
 - `Vec<T>`, `vec!`, indexing, slice views, and basic vector mutation
 - Destructuring `for` loops over ranges, arrays, vectors, borrowed slices, `Option`, and `Result`
@@ -240,9 +241,9 @@ Pass each crate's root source file. The interpreter loads sibling modules from t
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
-Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures remain incomplete.
+Function signatures can tie reference returns, including string slices, to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, nested references, and general reference capture in patterns remain incomplete.
 
-Generic bodies are checked against their declared trait bounds. Const parameters support `i32`, 64-bit `usize`, and `bool`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax.
+Generic bodies are checked against their declared trait bounds. Const parameters support integer widths, `bool`, and `char`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax. Scalar const functions support immutable bindings. Recursion, mutation, and general control flow in constant evaluation remain open.
 
 Trait objects currently use shared or mutable references. Generic associated types support type, const, and lifetime parameters, including lending projections on concrete receivers. Trait specialization and general borrow analysis for abstract lending projections remain open.
 

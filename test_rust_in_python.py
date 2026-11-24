@@ -14,6 +14,32 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("scalar const functions with forward references and runtime calls", """
+        mod sizing {
+            pub const fn width(x: usize) -> usize {
+                let doubled = x * 2;
+                doubled + super::PADDING
+            }
+        }
+        const SIZE: usize = sizing::width(3);
+        const PADDING: usize = 1;
+        use sizing::width;
+        type Grid = [u8; width(2)];
+        const fn alternate(n: u8) -> u8 { let mask: u8 = 3; n ^ mask }
+        fn main() {
+            let row: Grid = [alternate(4); width(2)];
+            let n: usize = 5;
+            println!("{} {} {} {}", SIZE, row.len(), row[0], width(n));
+        }
+    """, "7 5 7 11\n"),
+    ("const functions in dependent array lengths", """
+        #![feature(generic_const_exprs)]
+        const fn twice(n: usize) -> usize { n * 2 }
+        fn repeat<const N: usize>() -> [u8; twice(N)] where [(); twice(N)]: {
+            [7; twice(N)]
+        }
+        fn main() { println!("{:?}", repeat::<2>()); }
+    """, "[7, 7, 7, 7]\n"),
     ("irrefutable function and closure parameters", """
         struct Pair(i32, i32);
         struct Marker;
@@ -1740,6 +1766,16 @@ VALID = [
 ]
 
 INVALID = [
+    ("ordinary functions cannot be called from a const body", """
+        fn regular(x: i32) -> i32 { x }
+        const fn constant(x: i32) -> i32 { regular(x) }
+        fn main() {}
+    """, "constant evaluation requires a const function"),
+    ("constant function calls enforce argument types", """
+        const fn identity(x: i32) -> i32 { x }
+        const BAD: i32 = identity(true);
+        fn main() {}
+    """, "expected a i32 constant"),
     ("function parameters must be irrefutable", """
         fn get(Some(x): Option<i32>) -> i32 { x }
         fn main() {}
@@ -2684,10 +2720,10 @@ class InterpreterTests(unittest.TestCase):
             formatting.write_text('''
                 fn main() { println!("{:.2}", 1.234f64); }
             ''', encoding="utf-8")
-            unsupported = folder / "const_function.rs"
+            unsupported = folder / "static_item.rs"
             unsupported.write_text('''
-                const fn sum(a: i32, b: i32) -> i32 { a + b }
-                fn main() { println!("{}", sum(1, 2)); }
+                static NUMBER: i32 = 3;
+                fn main() { println!("{}", NUMBER); }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
