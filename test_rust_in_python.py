@@ -1393,6 +1393,27 @@ VALID = [
             match &mut empty { Two::Empty => println!("none"), _ => () }
         }
     """, "[5, 5, 8]\n4 6\nnone\n"),
+    ("explicit reference patterns borrow fields and extend let temporaries", """
+        struct Point { left: i32, right: i32 }
+        enum Duo { Pair(i32, i32) }
+        fn make() -> Point { Point { left: 2, right: 3 } }
+        fn promoted() -> &'static i32 { let ref r = 5; r }
+        fn main() {
+            let mut point = make();
+            let Point { ref mut left, right: ref other } = point;
+            *left += *other;
+            let &mut copied = left;
+            println!("{copied} {other}");
+            let Point { ref left, .. } = make();
+            let ref whole = make();
+            let mut pair = Duo::Pair(7, 8);
+            let Duo::Pair(ref mut a, ref mut b) = pair;
+            *a += *b;
+            *b -= 1;
+            let &temporary = promoted();
+            println!("{left} {} {a} {b} {temporary}", whole.right);
+        }
+    """, "5 3\n2 3 15 7 5\n"),
 ]
 
 INVALID = [
@@ -2030,6 +2051,24 @@ INVALID = [
             }
         }
     """, "in a pattern guard"),
+    ("an explicit mutable pattern needs a mutable source", """
+        fn main() {
+            let value = (1, 2);
+            let (ref mut first, _) = value;
+            *first = 3;
+        }
+    """, "cannot borrow immutable place"),
+    ("explicit reference patterns must match mutability", """
+        fn main() { let mut n = 1; let &value = &mut n; }
+    """, "reference pattern must match the reference's mutability"),
+    ("a reference to a match temporary cannot escape its statement", """
+        struct Point(i32);
+        fn make() -> Point { Point(3) }
+        fn main() {
+            let out = match make() { Point(ref n) => n };
+            println!("{out}");
+        }
+    """, "temporary value dropped while borrowed"),
 ]
 
 
@@ -2077,12 +2116,19 @@ class InterpreterTests(unittest.TestCase):
                     println!("{a:?}");
                 }
             ''', encoding="utf-8")
-            unsupported = folder / "explicit_ref_pattern.rs"
-            unsupported.write_text('''
+            explicit = folder / "explicit_ref_pattern.rs"
+            explicit.write_text('''
                 fn main() {
                     let tuple = (1, 2);
                     let (ref first, _) = tuple;
                     println!("{first}");
+                }
+            ''', encoding="utf-8")
+            unsupported = folder / "binding_subpattern.rs"
+            unsupported.write_text('''
+                fn main() {
+                    let value = match 2 { n @ 1..=3 => n, _ => 0 };
+                    println!("{value}");
                 }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
@@ -2104,14 +2150,14 @@ class InterpreterTests(unittest.TestCase):
             ''', encoding="utf-8")
             runner = Path(__file__).with_name("conformance.py")
             report = subprocess.run([sys.executable, runner, "--json", root, bad,
-                                     capture, slices, slice_pattern, shared, mutable, unsupported, panics,
+                                     capture, slices, slice_pattern, shared, mutable, explicit, unsupported, panics,
                                      bounds, overflow, shift],
                                     text=True, capture_output=True, timeout=40, check=False)
             self.assertEqual(report.returncode, 1, report.stderr)
             cases = json.loads(report.stdout)["cases"]
             self.assertEqual([case["outcome"] for case in cases],
                              ["runtime_match", "both_rejected", "runtime_match", "runtime_match", "runtime_match", "runtime_match",
-                              "runtime_match", "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match",
+                              "runtime_match", "runtime_match", "acceptance_mismatch", "runtime_match", "runtime_match", "runtime_match",
                               "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)

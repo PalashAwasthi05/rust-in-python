@@ -2295,7 +2295,7 @@ class Parser:
                     annotation = self.type_name()
                 value = self.expression() if self.accept("=") else None
                 otherwise = self.block() if value and self.accept("else") else None
-                if value is None and (annotation is None or pattern.kind != "bind"):
+                if value is None and (annotation is None or pattern.kind != "bind" or len(pattern.args) > 1):
                     raise pattern.token.error("uninitialized let requires a name and explicit type")
                 if otherwise and value.kind in BLOCK_EXPRESSIONS:
                     raise value.token.error("parenthesize this expression before let-else")
@@ -2761,14 +2761,15 @@ class Parser:
             if shorthand == "bind" and self.accept(".."):
                 rest = True
                 break
+            by_reference = shorthand == "bind" and bool(self.accept("ref"))
             mutable = shorthand == "bind" and bool(self.accept("mut"))
             name = self.identifier()
             if self.accept(":"):
-                if mutable:
-                    raise name.error("put 'mut' on the binding after ':'")
+                if mutable or by_reference:
+                    raise name.error("put the binding modifier after ':'")
                 value = parse_value()
             else:
-                args = (mutable,) if shorthand == "bind" else ()
+                args = (False, mutable) if by_reference else (mutable,) if shorthand == "bind" else ()
                 value = Expr(shorthand, name, args)
             fields.append((name, value))
             if not self.accept(","):
@@ -2809,6 +2810,9 @@ class Parser:
         token = self.advance()
         if token.text == "_":
             return Expr("wild", token)
+        if token.text == "&":
+            mutable = bool(self.accept("mut"))
+            return Expr("pattern_reference", token, (mutable, self.simple_pattern()))
         if token.text == "(":
             if self.accept(")"):
                 return Expr("literal", token, ("()", None))
@@ -2838,6 +2842,9 @@ class Parser:
             return literal
         if token.text == "mut":
             return Expr("bind", self.identifier(), (True,))
+        if token.text == "ref":
+            mutable = bool(self.accept("mut"))
+            return Expr("bind", self.identifier(), (False, mutable))
         if token.text not in {"crate", "self", "super"} and (
             not IDENT.fullmatch(token.text) or token.text in RESERVED
         ):
@@ -4103,6 +4110,13 @@ class Checker:
         annotation = self.resolve(annotation)
         unit = self.program.constructors.get(token.text) if kind == "bind" else None
         structural = kind not in {"bind", "wild", "or"} or (unit and unit.style == "unit")
+        if kind == "pattern_reference":
+            mutable, operand = args
+            if not isinstance(annotation, ReferenceType) or annotation.mutable != mutable:
+                raise token.error("reference pattern must match the reference's mutability")
+            inner, bindings = self.prepare_pattern(operand, annotation.inner)
+            ctor = Constructor("&", annotation, "reference", (("0", annotation.inner),))
+            return Pattern(tag=ctor, children=(inner,)), bindings
         if isinstance(annotation, ReferenceType) and structural:
             inner, bindings = self.prepare_pattern(expr, annotation.inner, borrowed=annotation.mutable)
             ctor = Constructor("&", annotation, "reference", (("0", annotation.inner),))
@@ -4152,13 +4166,15 @@ class Checker:
             return Pattern(alternatives=tuple(alternatives)), bindings
         if kind == "bind":
             if not unit or unit.style != "unit":
+                reference_mutability = args[1] if len(args) > 1 else borrowed if not args[0] else None
+                if reference_mutability is not None:
+                    reference = ReferenceType(annotation, reference_mutability)
+                    self.check_type(reference, token)
+                    return Pattern(binding=token.key, by_reference=True), {token.key: (reference, False)}
                 if isinstance(self.resolve(annotation), SliceType):
                     raise token.error("cannot bind an unsized slice value")
-                if borrowed is not None and not args[0]:
-                    return (Pattern(binding=token.key, by_reference=True),
-                            {token.key: (ReferenceType(annotation, borrowed), False)})
                 return Pattern(binding=token.key), {token.key: (annotation, args[0])}
-            if args[0]:
+            if args[0] or len(args) > 1:
                 raise token.error(f"cannot shadow unit struct {token.text!r}")
             kind = "pattern_unit"
             args = ()
@@ -5112,6 +5128,7 @@ class Local:
     loan: Loan | None = None
     static: bool = False
     shared_capture: bool = False
+    temporary: bool = False
 
 
 @dataclass(frozen=True)
@@ -5479,6 +5496,8 @@ class Ownership:
         parent = place.holder.loan if place.holder else None
         parents = (parent,) if parent else ()
         possible = parent.possible if parent else ()
+        if place.local.temporary:
+            expiring = expiring | {place.local}
         if parent:
             expiring = expiring | parent.expiring
         loan = Loan(Place(place.local, place.fields), mutable, parents, two_phase, possible, expiring)
@@ -5784,7 +5803,7 @@ class Ownership:
                 # Keep an address for type-checked expressions in the dead tail.
                 loan = Loan(Place(Local(source.token, annotation.mutable)), annotation.mutable)
                 return self.declare(source, types, scope, cursor, loan=loan)
-            cursor, origin, loan = self.lower_pattern_input(value, scope, cursor, extend_to=scope)
+            cursor, origin, loan = self.lower_pattern_input(value, scope, cursor, (source,), extend_to=scope)
             access = self.pattern_accesses(pattern, origin, value_type)
             cursor = self.read_pattern(cursor, access.tests | access.reads, source.token)
             if otherwise:
@@ -5793,10 +5812,10 @@ class Ownership:
             cursor = self.declare(source, types, scope, cursor, loan=loan, borrows=access.borrows)
             if loan and isinstance(annotation, ReferenceType) and annotation.lifetime == "'static":
                 cursor = self.emit(cursor, "static_reference", origin, source.token)
-            if loan and loan.expiring:
-                for name, (kind, _) in types.items():
-                    if isinstance(kind, ReferenceType):
-                        holder = Place(scope.find(source.token.binding(name)))
+            for name, (kind, _) in types.items():
+                if isinstance(kind, ReferenceType):
+                    holder = Place(scope.find(source.token.binding(name)))
+                    if holder.local.loan and holder.local.loan.expiring:
                         cursor = self.emit(cursor, "end_temporaries", holder, source.token)
             return cursor
         if kind == "match":
@@ -5924,7 +5943,7 @@ class Ownership:
             elif kind == "while_let":
                 condition, source, _ = args
                 target.in_condition = True
-                body_entry, origin, loan = self.lower_pattern_input(condition, scope, restart)
+                body_entry, origin, loan = self.lower_pattern_input(condition, scope, restart, (source,))
                 target.in_condition = False
                 pattern, types = self.program.patterns[id(source)]
                 annotation = self.annotation(condition)
@@ -5947,7 +5966,8 @@ class Ownership:
 
     def lower_match(self, expr, scope, cursor, *, result_type=None, extend_to=None):
         scrutinee, arms = expr.args
-        cursor, origin, scrutinee_loan = self.lower_pattern_input(scrutinee, scope, cursor)
+        cursor, origin, scrutinee_loan = self.lower_pattern_input(
+            scrutinee, scope, cursor, (source for source, _, _ in arms))
         finishes = []
         results = []
         prepared = []
@@ -5984,7 +6004,7 @@ class Ownership:
         loan = self.merge_loans(tuple(results), result_type.mutable) if result_type else None
         return self.join(*finishes), loan
 
-    def lower_pattern_input(self, expr, scope, cursor, *, extend_to=None):
+    def lower_pattern_input(self, expr, scope, cursor, sources, *, extend_to=None):
         cursor, origin = self.lower_address(expr, scope, cursor)
         if isinstance(self.annotation(expr), ReferenceType):
             if origin is not None:
@@ -5995,6 +6015,16 @@ class Ownership:
             return cursor, origin, loan
         if origin is None:
             cursor = self.lower(expr, scope, cursor)
+            references = [kind for source in sources for kind, _ in self.program.patterns[id(source)][1].values()
+                          if isinstance(kind, ReferenceType)]
+            if references:
+                promoted = not any(kind.mutable for kind in references) and self.promotable(expr)
+                local = Local(replace(expr.token, text="<pattern temporary>"), not promoted, static=promoted,
+                              temporary=extend_to is None and not promoted)
+                origin = Place(local)
+                cursor = self.emit(cursor, "declare", origin, expr.token)
+                if extend_to is not None and not promoted:
+                    extend_to.owned.add(local)
         return cursor, origin, None
 
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None, borrows=None):
@@ -6004,11 +6034,11 @@ class Ownership:
             carries_loan = isinstance(annotation, ReferenceType) or (isinstance(annotation, FunctionType) and annotation.closure)
             binding_loan = loan if carries_loan else None
             locations = borrows.get(name, ())
-            if locations and isinstance(annotation, ReferenceType) and annotation.mutable:
-                paths = [self.start_loan(cursor, place, True, source.token) for place in locations]
+            if locations and isinstance(annotation, ReferenceType):
+                paths = [self.start_loan(cursor, place, annotation.mutable, source.token) for place in locations]
                 branches, loans = zip(*paths)
                 cursor = branches[0] if len(branches) == 1 else self.join(*branches)
-                binding_loan = self.merge_loans(loans, True)
+                binding_loan = self.merge_loans(loans, annotation.mutable)
             local = Local(source.token.binding(name), mutable, binding_loan)
             scope.bindings[name] = local
             scope.owned.add(local)
@@ -6021,14 +6051,15 @@ class Ownership:
             self.collect_pattern(pattern, origin, access, annotation)
         return access
 
-    def collect_pattern(self, pattern, place, access, annotation, *, opaque=False):
+    def collect_pattern(self, pattern, place, access, annotation, *, opaque=False, projection=None):
+        projection = projection if projection is not None else place
         if pattern.alternatives:
             for option in pattern.alternatives:
-                self.collect_pattern(option, place, access, annotation, opaque=opaque)
+                self.collect_pattern(option, place, access, annotation, opaque=opaque, projection=projection)
         elif pattern.binding:
             if pattern.by_reference:
                 access.reads[place] = None
-                access.borrows.setdefault(pattern.binding, {})[place] = None
+                access.borrows.setdefault(pattern.binding, {})[projection] = None
             elif self.program.is_copy(annotation):
                 access.reads[place] = None
             else:
@@ -6044,7 +6075,7 @@ class Ownership:
             opaque = opaque or (variant and place.holder is None)
             for child, (field, kind) in zip(pattern.children, ctor.fields):
                 projected = place if opaque else place.child(field)
-                self.collect_pattern(child, projected, access, kind, opaque=opaque)
+                self.collect_pattern(child, projected, access, kind, opaque=opaque, projection=projection.child(field))
         elif isinstance(pattern.tag, SlicePattern):
             access.tests[place] = None
             for index, child in enumerate(pattern.children):
@@ -6180,9 +6211,9 @@ class Interpreter:
         self.stdout = stdout
         self.type_arguments = {}
 
-    def match_bindings(self, source, value):
+    def match_bindings(self, source, address):
         pattern, types = self.program.patterns[id(source)]
-        for bindings in pattern.bindings(value):
+        for bindings in pattern.bindings(address.read(), address):
             yield {name: Binding(item, types[name][1]) for name, item in bindings.items()}
 
     def placeholder(self, annotation):
@@ -6390,9 +6421,9 @@ class Interpreter:
             return Value(ctor, tuple(fields))
         if kind == "match":
             scrutinee, arms = args
-            value = self.eval(scrutinee, scope)
+            address = self.address(scrutinee, scope)
             for source, guard, body in arms:
-                for bindings in self.match_bindings(source, value):
+                for bindings in self.match_bindings(source, address):
                     inner = Scope(scope, bindings)
                     if guard is None or self.eval(guard, inner):
                         return self.eval(body, inner)
@@ -6413,8 +6444,7 @@ class Interpreter:
             if value is None:
                 scope.bindings[source.token.key] = Binding(self.placeholder(annotation), source.args[0])
                 return None
-            result = self.eval(value, scope)
-            bindings = next(self.match_bindings(source, result), None)
+            bindings = next(self.match_bindings(source, self.address(value, scope)), None)
             if bindings is None:
                 if otherwise:
                     self.eval(otherwise, scope)
@@ -6437,8 +6467,7 @@ class Interpreter:
                         return None
                     if kind == "while_let":
                         condition, source, _ = args
-                        value = self.eval(condition, scope)
-                        bindings = next(self.match_bindings(source, value), None)
+                        bindings = next(self.match_bindings(source, self.address(condition, scope)), None)
                         if bindings is None:
                             return None
                         inner = Scope(scope, bindings)
