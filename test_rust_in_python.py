@@ -11,7 +11,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from rust_in_python import DEMO, RustError, run
+from rust_in_python import DEMO, RustError, RustPanic, run
 
 
 VALID = [
@@ -3535,6 +3535,19 @@ class InterpreterTests(unittest.TestCase):
                               "runtime_match", "runtime_match", "runtime_match"])
             self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
             self.assertEqual(cases[-1]["run"]["python"]["status"], 101)
+
+    def test_program_corpus(self):
+        """Each programs/*.rs matches the exit status and output rustc recorded in its .out file."""
+        folder = Path(__file__).with_name("programs")
+        for source in sorted(folder.glob("*.rs")):
+            with self.subTest(program=source.name):
+                status, _, expected = source.with_suffix(".out").read_text(encoding="utf-8").partition("\n")
+                output = StringIO()
+                try:
+                    actual = run(source.read_text(encoding="utf-8"), output, source_path=source) or 0
+                except RustPanic:
+                    actual = 101
+                self.assertEqual((actual, output.getvalue()), (int(status), expected))
 
     def test_valid_programs(self):
         for name, source, expected in VALID:

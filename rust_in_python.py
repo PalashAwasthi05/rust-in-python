@@ -1966,13 +1966,33 @@ def overlapping_types(first, second):
 TRAIT_MODULES = {
     "Clone": "clone", "Copy": "marker", "Sized": "marker", "Default": "default",
     "Debug": "fmt", "Display": "fmt", "PartialEq": "cmp", "Eq": "cmp",
-    "PartialOrd": "cmp", "Ord": "cmp",
+    "PartialOrd": "cmp", "Ord": "cmp", "Fn": "ops", "FnMut": "ops", "FnOnce": "ops",
 }
+CALLABLE_TRAITS = ("Fn", "FnMut", "FnOnce")
+CALL_ITEM = "@call"
 SUPERTRAITS = {
     "Copy": {"Clone"}, "Eq": {"PartialEq"}, "PartialOrd": {"PartialEq"},
-    "Ord": {"Eq", "PartialOrd", "PartialEq"},
+    "Ord": {"Eq", "PartialOrd", "PartialEq"}, "Fn": {"FnMut", "FnOnce"}, "FnMut": {"FnOnce"},
 }
-DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized"}
+DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized", *CALLABLE_TRAITS}
+
+
+def callable_signature(annotation):
+    """Return the call signature a type promises through an Fn-family bound."""
+    if isinstance(annotation, FunctionType):
+        return annotation
+    if isinstance(annotation, TypeParameter):
+        bindings = annotation.associated_bindings.items()
+    elif isinstance(annotation, OpaqueType):
+        bindings = annotation.bindings
+    elif isinstance(annotation, DynType):
+        return dict(annotation.bindings).get(CALL_ITEM)
+    else:
+        return None
+    for binding, kind in bindings:
+        if binding.item == CALL_ITEM:
+            return kind
+    return None
 
 
 def substitute(annotation, arguments, *, defer_const=False):
@@ -2068,6 +2088,11 @@ class Program:
             bounds = self.trait_closure(annotation.owner.bounds)
             matches = [trait for name, trait in self.traits.items()
                        if name in bounds and annotation.item in trait.associated]
+            if len(matches) == 1:
+                return matches[0]
+        elif not isinstance(annotation.owner, TypeVariable):
+            matches = [trait for name, trait in self.traits.items()
+                       if annotation.item in trait.associated and self.implementation(annotation.owner, name)]
             if len(matches) == 1:
                 return matches[0]
         return None
@@ -2178,6 +2203,8 @@ class Program:
     def matches_associated_bounds(self, arguments):
         for parameter, argument in arguments.items():
             for binding, expected in parameter.associated_bindings.items():
+                if binding.item == CALL_ITEM:
+                    continue
                 trait = self.associated_trait(binding.bound, binding.item)
                 if trait is None:
                     return False
@@ -2224,11 +2251,18 @@ class Program:
         if annotation == EXIT_CODE and trait in {"Copy", "Clone", "Debug", "PartialEq"}:
             return True
         if is_box(annotation):
-            if trait in {"Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord"}:
+            if trait in {"Clone", "Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", *CALLABLE_TRAITS}:
                 return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
             if trait in {"Copy", "Default"}:
                 return False
         if isinstance(annotation, FunctionType):
+            if trait in CALLABLE_TRAITS:
+                if not annotation.closure or trait == "FnOnce":
+                    return True
+                closure = self.functions[annotation.closure]
+                if closure.consumes_captures:
+                    return False
+                return trait == "FnMut" or not any(capture.mutable for capture in closure.captures)
             if annotation.closure:
                 captures = self.functions[annotation.closure].captures
                 return trait in {"Copy", "Clone"} and all(
@@ -2413,7 +2447,12 @@ class Parser:
         if token.text == "dyn":
             trait = self.trait_path()
             bindings = []
-            if self.accept("<"):
+            if trait in CALLABLE_TRAITS and self.current.text == "(":
+                outer = self.argument_parameters
+                self.argument_parameters = None
+                bindings.append((CALL_ITEM, self.call_signature(signature)))
+                self.argument_parameters = outer
+            elif self.accept("<"):
                 while self.current.text != ">":
                     name = self.identifier()
                     self.expect("=")
@@ -2879,6 +2918,13 @@ class Parser:
             bound_signature = (signature or {}) | {lifetime.name: set() for lifetime in lifetimes}
             bound = self.trait_path()
             bounds.add(bound)
+            if bound in CALLABLE_TRAITS and self.current.text == "(":
+                signature_type = self.call_signature(bound_signature)
+                if bindings is not None:
+                    bindings[AssociatedBinding(bound, CALL_ITEM)] = signature_type
+                if not self.accept("+"):
+                    break
+                continue
             if lifetimes and bindings is None:
                 raise self.current.error("higher-ranked bounds require an associated type constraint here")
             if bindings is not None and self.accept("<"):
@@ -2901,6 +2947,17 @@ class Parser:
             if not self.accept("+"):
                 break
         return bounds
+
+    def call_signature(self, signature):
+        self.expect("(")
+        arguments = []
+        while self.current.text != ")":
+            arguments.append(self.type_name(signature=signature))
+            if not self.accept(","):
+                break
+        self.expect(")")
+        result = self.type_name(signature=signature) if self.accept("->") else "()"
+        return FunctionType(tuple(arguments), result)
 
     def bound_lifetimes(self, signature):
         self.expect("<")
@@ -4645,6 +4702,8 @@ class Checker:
         self.closures = []
         self.pointers = []
         self.indirect_calls = []
+        self.callable_hints = {}
+        self.callable_requirements = []
 
     def check(self):
         for alias in self.program.type_aliases.values():
@@ -4691,6 +4750,9 @@ class Checker:
                 self.variables.append(self.result)
                 for bound in sorted(function.result.bounds):
                     self.obligation(self.result, bound, function.name)
+                signature = callable_signature(function.result)
+                if signature is not None:
+                    self.callable_hints[self.result] = signature
                 self.program.opaque_witnesses[function.name.text] = self.result
             concrete = self.effective_function(function, tuple(kind for _, _, kind in function.params),
                                                self.resolve(self.result))
@@ -4715,6 +4777,9 @@ class Checker:
                     self.check_associated_binding(binding, expected, token)
 
     def check_associated_binding(self, binding, expected, token):
+        if binding.item == CALL_ITEM:
+            self.check_type(expected, token)
+            return None
         trait = self.program.associated_trait(binding.bound, binding.item)
         if trait is None:
             raise token.error(f"unknown or ambiguous associated item {binding.item!r} for {binding.bound}")
@@ -4800,7 +4865,8 @@ class Checker:
                 kind = definition.body
                 self.check_type(kind, impl.token)
                 resolved = self.resolve(kind)
-                if isinstance(resolved, AssociatedType):
+                if (isinstance(resolved, AssociatedType) and resolved.item == name
+                        and resolved.owner == impl.target):
                     raise impl.token.error("associated type cannot resolve to itself")
                 if (isinstance(resolved, ReferenceType) and resolved.lifetime != "'static"
                         and LifetimeArgument(resolved.lifetime) not in definition.parameters):
@@ -5025,11 +5091,44 @@ class Checker:
     def associated_requirements(self, arguments, token):
         for parameter, owner in arguments.items():
             for binding, expected in parameter.associated_bindings.items():
+                if binding.item == CALL_ITEM:
+                    self.require_callable(owner, substitute(expected, arguments), token)
+                    continue
                 trait = self.program.associated_trait(binding.bound, binding.item)
                 if trait is None:
                     raise token.error(f"unknown or ambiguous associated item {binding.item!r} for {binding.bound}")
                 projection = substitute(binding.project(owner, trait), arguments)
                 yield projection, substitute(expected, arguments), token
+
+    def require_callable(self, owner, signature, token):
+        """Tie a value's call signature to an Fn-family bound, now or once it is known."""
+        resolved = self.resolve(owner)
+        if isinstance(resolved, TypeVariable):
+            self.callable_hints[resolved] = signature
+            self.callable_requirements.append((resolved, signature, token))
+            return
+        while isinstance(resolved, ReferenceType) or is_box(resolved):
+            resolved = self.resolve(resolved.inner if isinstance(resolved, ReferenceType) else resolved.arguments[0])
+        actual = callable_signature(resolved)
+        if actual is None:
+            if resolved == NEVER:
+                return
+            raise token.error(f"expected a callable value, found {resolved}")
+        if len(actual.parameters) != len(signature.parameters):
+            raise token.error(f"expected a callable with {len(signature.parameters)} parameters")
+        for left, right in zip(actual.parameters, signature.parameters):
+            self.require(left, right, token)
+        self.require(actual.result, signature.result, token)
+
+    def solve_callables(self, *, final=False):
+        pending, self.callable_requirements = self.callable_requirements, []
+        for owner, signature, token in pending:
+            if isinstance(self.resolve(owner), TypeVariable):
+                if final:
+                    raise token.error("type annotations needed for a callable argument")
+                self.callable_requirements.append((owner, signature, token))
+            else:
+                self.require_callable(owner, signature, token)
 
     def solve_associated_equalities(self, requirements):
         pending = list(requirements)
@@ -5079,6 +5178,7 @@ class Checker:
         return annotation
 
     def finish_inference(self):
+        self.solve_callables()
         remaining_equalities = self.solve_associated_equalities(self.associated_equalities)
         for annotation, value, token in self.integer_literals:
             resolved = self.resolve(annotation)
@@ -5097,6 +5197,7 @@ class Checker:
                 raise token.error(f"expected a float, found {resolved}")
             float_literal_value(value, resolved, token)
         self.solve_associated_equalities(remaining_equalities)
+        self.solve_callables(final=True)
         for operand, token in self.unary_operands:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
@@ -5134,8 +5235,6 @@ class Checker:
             annotation = self.resolve(annotation)
             if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
                 raise token.error("references as generic type arguments are unsupported")
-            if isinstance(annotation, FunctionType) and annotation.closure:
-                raise token.error("capturing closures as generic type arguments are unsupported")
             if borrowing_iterator(annotation):
                 raise token.error("borrowed iterators as generic type arguments are unsupported")
         for annotation, trait, token in self.obligations:
@@ -5216,9 +5315,14 @@ class Checker:
             function = self.functions[name]
             witness = self.program.concrete_type(function.result)
             if (isinstance(witness, ReferenceType) or borrowing_iterator(witness)
-                    or isinstance(witness, FunctionType) and witness.closure):
+                    or isinstance(witness, FunctionType) and witness.closure and not all(
+                        capture.by_move and not isinstance(self.resolve(capture.annotation), ReferenceType)
+                        for capture in self.functions[witness.closure].captures)):
                 raise function.name.error("opaque returns of borrowed values or capturing closures are unsupported")
             for binding, expected in function.result.bindings:
+                if binding.item == CALL_ITEM:
+                    self.require_callable(witnesses[name], expected, function.name)
+                    continue
                 trait = self.program.associated_trait(binding.bound, binding.item)
                 projection = binding.project(witnesses[name], trait)
                 self.require_associated_equality(projection, expected, function.name)
@@ -5349,6 +5453,12 @@ class Checker:
             raise token.error(f"unsupported type {annotation!r}")
 
     def check_dyn(self, annotation, token):
+        if annotation.trait in CALLABLE_TRAITS:
+            signature = callable_signature(annotation)
+            if signature is None or len(annotation.bindings) != 1:
+                raise token.error(f"dyn {annotation.trait} needs a call signature")
+            self.check_type(signature, token)
+            return
         if annotation.trait not in self.program.traits:
             raise token.error(f"unknown object trait {annotation.trait!r}")
         traits = self.program.trait_closure({annotation.trait})
@@ -5422,6 +5532,18 @@ class Checker:
         elif isinstance(annotation, TupleType):
             for kind in annotation.elements:
                 yield from Checker.type_parts(kind, inline_only=inline_only)
+        elif isinstance(annotation, FunctionType):
+            if not inline_only:
+                for kind in (*annotation.parameters, annotation.result):
+                    yield from Checker.type_parts(kind)
+        elif isinstance(annotation, ReferenceType):
+            if not inline_only:
+                yield from Checker.type_parts(annotation.inner)
+        elif isinstance(annotation, (SliceType,)):
+            yield from Checker.type_parts(annotation.element, inline_only=inline_only)
+        elif isinstance(annotation, AssociatedType):
+            yield from Checker.type_parts(annotation.owner, inline_only=inline_only)
+            yield annotation
         else:
             yield annotation
 
@@ -5833,6 +5955,9 @@ class Checker:
     def check_dyn_conversion(self, actual, target, token):
         self.check_dyn(target, token)
         self.obligation(actual, target.trait, token)
+        if target.trait in CALLABLE_TRAITS:
+            self.require_callable(actual, callable_signature(target), token)
+            return
         for name, kind in target.bindings:
             trait = self.program.associated_trait(target.trait, name)
             if trait is None:
@@ -6632,6 +6757,7 @@ class Checker:
                 CaptureContext.mark_mutable(scope, expr_arg)
             actual_types.append(actual)
         self.solve_associated_equalities(self.associated_requirements(arguments, token))
+        self.solve_callables()
         if expected is not None and defer_projection:
             self.require_argument(result, expected, token)
         self.program.call_types[id(expr)] = (params, arguments)
@@ -6649,6 +6775,10 @@ class Checker:
         if callee == NEVER:
             expr.kind, expr.args = "group", (expr.args[0],)
             return NEVER
+        while isinstance(callee, ReferenceType) or is_box(callee):
+            callee = self.resolve(callee.inner if isinstance(callee, ReferenceType) else callee.arguments[0])
+        if not isinstance(callee, FunctionType) and callable_signature(callee) is not None:
+            callee = self.resolve(callable_signature(callee))
         if not isinstance(callee, FunctionType):
             raise expr.token.error(f"expected a callable value, found {callee}")
         token = expr.token
@@ -6661,6 +6791,11 @@ class Checker:
     def closure_type(self, expr, scope, expected):
         raw, declared, body, by_move = expr.args
         hint = self.resolve(expected)
+        if isinstance(hint, TypeVariable) and hint in self.callable_hints:
+            hint = self.resolve(self.callable_hints[hint])
+        elif is_box(hint) or isinstance(hint, (TypeParameter, OpaqueType, DynType)):
+            inner = hint.arguments[0] if is_box(hint) else hint
+            hint = callable_signature(self.resolve(inner)) or hint
         if isinstance(hint, FunctionType) and len(hint.parameters) != len(raw):
             raise expr.token.error("closure has a different parameter count")
         params = []
@@ -7711,8 +7846,11 @@ class Ownership:
                 if lease:
                     cursor, holder = self.keep_loan(cursor, lease, pointer.token)
                     temporaries.append((holder, pointer.token))
-            else:
+            elif isinstance(annotation, FunctionType):
                 cursor = self.lower(pointer, scope, cursor)
+            else:
+                once = not self.program.implements(annotation, "FnMut")
+                cursor = self.lower(pointer, scope, cursor, consume=once)
         function = self.program.call_functions.get(id(expr))
         expected, _ = self.program.call_types[id(expr)]
         passed = {}
@@ -8867,6 +9005,8 @@ class Interpreter:
                                         for parameter, value in arguments.items()}, environment)
         if kind == "indirect_call":
             callee = self.eval(args[0], scope)
+            while isinstance(callee, (Address, BoxValue, DynAddress)):
+                callee = callee.read()
             values = tuple(self.eval(argument, scope) for argument in args[1:])
             return self.call(callee.name, values, callee.arguments, callee.environment)
         if kind == "try":
