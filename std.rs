@@ -83,6 +83,7 @@ pub mod intrinsics {
     pub fn lazy_elements<C, R>(items: C) -> R;
     pub fn duration_debug(nanos: u128, f: &mut crate::fmt::Formatter) -> crate::fmt::Result;
     pub fn hash_value<T>(value: &T) -> u64;
+    pub fn pad_text(text: &str, width: Option<usize>, precision: Option<usize>, fill: char, align: u8) -> String;
     pub fn clock_nanos() -> u128;
     pub fn wall_nanos() -> u128;
     pub fn emit(text: &str, error: bool);
@@ -1035,9 +1036,50 @@ pub mod fmt {
         fn fmt(&self, f: &mut Formatter) -> Result { f.write_str("an error occurred when formatting an argument") }
     }
 
-    pub struct Formatter { buf: String, alternate: bool }
+    pub struct Formatter {
+        buf: String,
+        alternate: bool,
+        width: Option<usize>,
+        precision: Option<usize>,
+        fill: char,
+        align: u8,
+        sign_plus: bool,
+        sign_aware_zero_pad: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Alignment { Left, Right, Center }
 
     impl Formatter {
+        pub fn width(&self) -> Option<usize> { self.width }
+        pub fn precision(&self) -> Option<usize> { self.precision }
+        pub fn fill(&self) -> char { self.fill }
+        pub fn sign_plus(&self) -> bool { self.sign_plus }
+        pub fn sign_minus(&self) -> bool { false }
+        pub fn sign_aware_zero_pad(&self) -> bool { self.sign_aware_zero_pad }
+        pub fn align(&self) -> Option<Alignment> {
+            match self.align { 1 => Some(Alignment::Left), 2 => Some(Alignment::Right), 3 => Some(Alignment::Center), _ => None }
+        }
+        pub fn debug_struct(&mut self, name: &str) -> DebugStruct<'_> {
+            self.buf.push_str(name);
+            DebugStruct { fmt: self, fields: 0, closer: '}' }
+        }
+        pub fn debug_tuple(&mut self, name: &str) -> DebugTuple<'_> {
+            self.buf.push_str(name);
+            DebugTuple { inner: DebugStruct { fmt: self, fields: 0, closer: ')' } }
+        }
+        pub fn debug_list(&mut self) -> DebugList<'_> {
+            self.buf.push_str("[");
+            DebugList { inner: DebugStruct { fmt: self, fields: 0, closer: ']' } }
+        }
+        pub fn debug_set(&mut self) -> DebugList<'_> {
+            self.buf.push_str("{");
+            DebugList { inner: DebugStruct { fmt: self, fields: 0, closer: 's' } }
+        }
+        pub fn debug_map(&mut self) -> DebugMap<'_> {
+            self.buf.push_str("{");
+            DebugMap { inner: DebugStruct { fmt: self, fields: 0, closer: 'm' } }
+        }
         pub fn write_str(&mut self, data: &str) -> Result {
             self.buf.push_str(data);
             Ok(())
@@ -1050,12 +1092,98 @@ pub mod fmt {
             self.buf.push(c);
             Ok(())
         }
-        pub fn pad(&mut self, data: &str) -> Result { self.write_str(data) }
+        pub fn pad(&mut self, data: &str) -> Result {
+            let text = crate::intrinsics::pad_text(data, self.width, self.precision, self.fill, self.align);
+            self.buf.push_str(&text);
+            Ok(())
+        }
         pub fn alternate(&self) -> bool { self.alternate }
     }
 
     pub trait Display {
         fn fmt(&self, f: &mut Formatter) -> Result;
+    }
+
+    // One builder serves debug_struct, debug_tuple, debug_list, debug_set, and debug_map.
+    pub struct DebugStruct<'a> { fmt: &'a mut Formatter, fields: usize, closer: char }
+    pub struct DebugTuple<'a> { inner: DebugStruct<'a> }
+    pub struct DebugList<'a> { inner: DebugStruct<'a> }
+    pub type DebugSet<'a> = DebugList<'a>;
+    pub struct DebugMap<'a> { inner: DebugStruct<'a> }
+
+    impl<'a> DebugTuple<'a> {
+        pub fn field(&mut self, value: &dyn Debug) -> &mut DebugTuple<'a> { self.inner.item(None, value); self }
+        pub fn finish(&mut self) -> Result { self.inner.finish() }
+    }
+    impl<'a> DebugList<'a> {
+        pub fn entry(&mut self, value: &dyn Debug) -> &mut DebugList<'a> { self.inner.item(None, value); self }
+        pub fn entries<D: Debug, I: IntoIterator<Item = D>>(&mut self, entries: I) -> &mut DebugList<'a> {
+            for entry in entries { self.inner.item(None, &entry); }
+            self
+        }
+        pub fn finish(&mut self) -> Result { self.inner.finish() }
+    }
+    impl<'a> DebugMap<'a> {
+        pub fn entry(&mut self, key: &dyn Debug, value: &dyn Debug) -> &mut DebugMap<'a> {
+            let key = format!("{:?}", key);
+            self.inner.item(Some(&key), value);
+            self
+        }
+        pub fn entries<K: Debug, V: Debug, I: IntoIterator<Item = (K, V)>>(&mut self, entries: I) -> &mut DebugMap<'a> {
+            for (key, value) in entries {
+                let key = format!("{:?}", key);
+                self.inner.item(Some(&key), &value);
+            }
+            self
+        }
+        pub fn finish(&mut self) -> Result { self.inner.finish() }
+    }
+
+    impl<'a> DebugStruct<'a> {
+        fn item(&mut self, name: Option<&str>, value: &dyn Debug) {
+            let alternate = self.fmt.alternate;
+            let named = self.closer == '}';
+            let text = if alternate { format!("{:#?}", value).replace("\n", "\n    ") } else { format!("{:?}", value) };
+            if alternate {
+                if self.fields == 0 {
+                    self.fmt.buf.push_str(if named { " {\n" } else if self.closer == ')' { "(\n" } else { "\n" });
+                }
+                self.fmt.buf.push_str("    ");
+            } else if self.fields == 0 {
+                self.fmt.buf.push_str(if named { " { " } else if self.closer == ')' { "(" } else { "" });
+            } else {
+                self.fmt.buf.push_str(", ");
+            }
+            if let Some(name) = name {
+                self.fmt.buf.push_str(name);
+                self.fmt.buf.push_str(": ");
+            }
+            self.fmt.buf.push_str(&text);
+            if alternate { self.fmt.buf.push_str(",\n"); }
+            self.fields += 1;
+        }
+        pub fn field(&mut self, name: &str, value: &dyn Debug) -> &mut DebugStruct<'a> {
+            self.item(Some(name), value);
+            self
+        }
+        pub fn finish_non_exhaustive(&mut self) -> Result {
+            if self.fmt.alternate {
+                self.fmt.buf.push_str(if self.fields == 0 { " {\n    ..\n}" } else { "    ..\n}" });
+            } else {
+                self.fmt.buf.push_str(if self.fields == 0 { " { .. }" } else { ", .. }" });
+            }
+            Ok(())
+        }
+        pub fn finish(&mut self) -> Result {
+            let alternate = self.fmt.alternate && self.fields > 0;
+            match self.closer {
+                '}' => { if self.fields > 0 { self.fmt.buf.push_str(if alternate { "}" } else { " }" }); } }
+                ')' => { if self.fields > 0 { self.fmt.buf.push_str(")"); } }
+                ']' => self.fmt.buf.push_str("]"),
+                _ => self.fmt.buf.push_str("}"),
+            }
+            Ok(())
+        }
     }
 
     pub trait Debug {

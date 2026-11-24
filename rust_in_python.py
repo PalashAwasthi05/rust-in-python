@@ -10365,8 +10365,13 @@ def pretty_debug(value, indent=0):
 
 
 def format_value(value, annotation, spec):
-    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress)):
+    while isinstance(value, (Address, DynAddress, SliceAddress, StringAddress, BoxValue, RcValue)):
         value = value.read()
+    if USER_FORMAT is not None and isinstance(value, Value) and spec.kind in {"", "?"}:
+        # A Display or Debug impl decides its own padding; Rust ignores width unless the impl uses it.
+        text = USER_FORMAT(value, spec.kind == "?", alternate=spec.alternate, spec=spec)
+        if text is not None:
+            return text
     kind = spec.kind
     numeric = annotation in NUMBER_TYPES
     prefix = ""
@@ -10876,7 +10881,20 @@ class Interpreter:
         parts.append(text[start:])
         return parts
 
-    def user_format(self, value, debug, alternate=False):
+    def formatter_value(self, alternate=False, spec=None):
+        ctor = self.program.layout(FORMATTER)[1][0]
+        count = AppliedType(OPTION, ("usize",))
+
+        def optional(number):
+            return self.variant(count, "None") if number is None else self.variant(count, "Some", number)
+        width = spec.width if spec is not None and isinstance(spec.width, int) and spec.width else None
+        precision = spec.precision if spec is not None and isinstance(spec.precision, int) else None
+        align = {"<": 1, ">": 2, "^": 3}.get(spec.align if spec is not None else None, 0)
+        return Value(ctor, ("", alternate, optional(width), optional(precision),
+                            Character(spec.fill if spec is not None else " "), align,
+                            bool(spec is not None and spec.sign == "+"), bool(spec is not None and spec.zero)))
+
+    def user_format(self, value, debug, alternate=False, spec=None):
         """Format a value through a Display or Debug impl written in Rust, if it has one."""
         trait = "Debug" if debug else "Display"
         if trait not in self.program.traits:
@@ -10885,18 +10903,25 @@ class Interpreter:
         if implementation is None:
             return None
         impl, arguments = implementation
-        ctor = self.program.layout(FORMATTER)[1][0]
-        formatter = Address(Binding(Value(ctor, ("", alternate)), True))
+        formatter = Address(Binding(self.formatter_value(alternate or bool(spec and spec.alternate), spec), True))
         result = self.call(impl.methods["fmt"].name.text, (Address(Binding(value, False)), formatter), arguments)
         if result.constructor.path.endswith("::Err"):
             raise RustPanic("a formatting trait implementation returned an error when the underlying stream did not")
         return formatter.read().fields[0]
 
     def builtin_fmt(self, value, formatter, debug, result):
+        """`x.fmt(f)` for a built-in x, honouring the formatter's width, fill, and precision as Rust does."""
         stored = formatter.read()
-        alternate = stored.fields[1]
-        text = pretty_debug(value) if debug and alternate else display(value, debug)
-        formatter.write(Value(stored.constructor, (stored.fields[0] + text, alternate)))
+        buffer, alternate, width, precision, fill, align, plus, zero = stored.fields
+        spec = FormatSpec("?" if debug else "", str(fill), {1: "<", 2: ">", 3: "^"}.get(align),
+                          "+" if plus else None, alternate, zero,
+                          width.fields[0] if width.fields else 0, precision.fields[0] if precision.fields else None)
+        while isinstance(value, (Address, DynAddress, BoxValue, RcValue)):
+            value = value.read()
+        annotation = ("f64" if isinstance(value, float) else "i64" if isinstance(value, int)
+                      and not isinstance(value, bool) else None)
+        text = format_value(value, annotation, spec)
+        formatter.write(Value(stored.constructor, (buffer + text, *stored.fields[1:])))
         return self.variant(result, "Ok", None)
 
     def trait_iteration(self, value, annotation):
@@ -14016,6 +14041,18 @@ def rust_discriminant(interpreter, result, value):
     variants = interpreter.program.layout(target.constructor.annotation)[1]
     index = next(position for position, ctor in enumerate(variants) if ctor.path == target.constructor.path)
     return Value(interpreter.program.layout(result)[1][0], (index,))
+
+
+@intrinsic
+def rust_pad_text(interpreter, result, text, width, precision, fill, align):
+    value = text_of(text)
+    if precision.fields:
+        value = value[:precision.fields[0]]
+    if not width.fields or len(value) >= width.fields[0]:
+        return value
+    gap = width.fields[0] - len(value)
+    left = gap if align == 2 else gap // 2 if align == 3 else 0
+    return str(fill) * left + value + str(fill) * (gap - left)
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
