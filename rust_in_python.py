@@ -1374,6 +1374,7 @@ class TypeParameter:
     bounds: set = field(default_factory=set)
     const_type: str | None = None
     anonymous: bool = False
+    associated_bindings: dict = field(default_factory=dict)
 
     def __str__(self):
         return self.name
@@ -1791,10 +1792,17 @@ class Program:
             trait = self.projection_trait(annotation)
             if trait:
                 annotation = replace(annotation, trait=trait.name.text)
+                if annotation in seen:
+                    return annotation
                 if isinstance(owner, OpaqueType):
-                    for bound, item, kind in owner.bindings:
-                        if item == annotation.item and self.associated_trait(bound, item) is trait:
-                            return self.normalize(kind, (*seen, annotation))
+                    bindings = owner.bindings
+                elif isinstance(owner, TypeParameter):
+                    bindings = ((bound, item, kind) for (bound, item), kind in owner.associated_bindings.items())
+                else:
+                    bindings = ()
+                for bound, item, kind in bindings:
+                    if item == annotation.item and self.associated_trait(bound, item) is trait:
+                        return self.normalize(kind, (*seen, annotation))
                 if not isinstance(owner, (TypeParameter, TypeVariable)):
                     implementation = self.implementation(owner, trait.name.text)
                     if implementation:
@@ -1864,9 +1872,20 @@ class Program:
             ) and all(
                 self.implements(arguments[parameter], bound, seen=(*seen, key))
                 for parameter in impl.parameters for bound in parameter.bounds
-            ):
+            ) and self.matches_associated_bounds(arguments):
                 return impl, arguments
         return None
+
+    def matches_associated_bounds(self, arguments):
+        for parameter, argument in arguments.items():
+            for (bound, item), expected in parameter.associated_bindings.items():
+                trait = self.associated_trait(bound, item)
+                if trait is None:
+                    return False
+                actual = self.normalize(AssociatedType(argument, item, trait.name.text))
+                if actual != self.normalize(substitute(expected, arguments)):
+                    return False
+        return True
 
     def layout(self, annotation):
         if isinstance(annotation, TupleType):
@@ -2059,11 +2078,12 @@ class Parser:
         if token.text == "impl":
             if self.argument_parameters is None and not self.fragment:
                 raise token.error("impl Trait requires a function argument in this position")
-            bounds = self.trait_bounds()
+            bindings = {}
+            bounds = self.trait_bounds(bindings=bindings, signature=signature)
             if self.fragment:
-                return TypeParameter("impl Trait", bounds, anonymous=True)
+                return TypeParameter("impl Trait", bounds, anonymous=True, associated_bindings=bindings)
             name = f"@argument:{len(self.argument_parameters)}"
-            parameter = TypeParameter(name, bounds, anonymous=True)
+            parameter = TypeParameter(name, bounds, anonymous=True, associated_bindings=bindings)
             self.argument_parameters[name] = parameter
             self.type_parameters[name] = parameter
             return parameter
@@ -2452,6 +2472,8 @@ class Parser:
         types = {}
         if not self.accept("<"):
             return lifetimes, types
+        outer = self.type_parameters
+        self.type_parameters = dict(outer)
         while self.current.text != ">":
             token = self.advance()
             if LIFETIME.fullmatch(token.text) and token.text not in {"'static", "'_"}:
@@ -2470,16 +2492,21 @@ class Parser:
                 if kind not in CONST_TYPES:
                     raise token.error("unsupported const parameter type")
                 types[name.text] = TypeParameter(name.text, const_type=kind)
+                self.type_parameters[name.text] = types[name.text]
             elif IDENT.fullmatch(token.text) and token.text not in RESERVED:
                 if token.text in types:
                     raise token.error(f"duplicate type parameter {token.text}")
-                bounds = self.trait_bounds() if self.accept(":") else set()
-                types[token.text] = TypeParameter(token.text, bounds)
+                parameter = TypeParameter(token.text)
+                types[token.text] = self.type_parameters[token.text] = parameter
+                if self.accept(":"):
+                    parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
+                                                            signature=lifetimes))
             else:
                 raise token.error("expected a lifetime or type parameter")
             if not self.accept(","):
                 break
         self.expect(">")
+        self.type_parameters = outer
         for bounds in lifetimes.values():
             self.require_lifetimes(bounds, lifetimes)
         return lifetimes, types
@@ -2567,7 +2594,9 @@ class Parser:
                     raise lhs.error("method Self bounds currently support Sized")
                 self.sized_receiver = True
             elif lhs.text in self.type_parameters:
-                self.type_parameters[lhs.text].bounds.update(self.trait_bounds())
+                parameter = self.type_parameters[lhs.text]
+                parameter.bounds.update(self.trait_bounds(bindings=parameter.associated_bindings,
+                                                          signature=lifetimes))
             else:
                 raise lhs.error(f"unknown type parameter {lhs.text}")
             if not self.accept(","):
@@ -4179,6 +4208,7 @@ class Checker:
         self.substitutions = {}
         self.variables = []
         self.obligations = []
+        self.associated_equalities = []
         self.generic_arguments = []
         self.numeric_operands = []
         self.unary_operands = []
@@ -4255,6 +4285,18 @@ class Checker:
             for name in parameter.bounds:
                 if name not in TRAIT_MODULES and name not in self.program.traits:
                     raise token.error(f"unknown trait {name!r}")
+            if isinstance(parameter, TypeParameter):
+                for (bound, item), expected in parameter.associated_bindings.items():
+                    self.check_associated_binding(bound, item, expected, token)
+
+    def check_associated_binding(self, bound, item, expected, token):
+        trait = self.program.associated_trait(bound, item)
+        if trait is None:
+            raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
+        if trait.associated[item].parameters:
+            raise token.error("generic associated type bindings require specialization")
+        self.check_type(expected, token)
+        return trait
 
     def check_implementations(self):
         for trait in self.program.traits.values():
@@ -4326,6 +4368,12 @@ class Checker:
                                for first, second in zip(required.method_parameters, method.method_parameters))):
                     raise method.name.error(f"method {name!r} has incompatible generic parameters")
                 bindings.update(zip(required.method_parameters, method.method_parameters))
+                for declared, provided in zip(required.method_parameters, method.method_parameters):
+                    expected = {key: self.resolve(substitute(kind, bindings))
+                                for key, kind in declared.associated_bindings.items()}
+                    actual = {key: self.resolve(kind) for key, kind in provided.associated_bindings.items()}
+                    if actual != expected:
+                        raise method.name.error(f"method {name!r} has incompatible associated type bounds")
                 required_types = tuple(self.resolve(substitute(kind, bindings)) for _, _, kind in required.params)
                 actual_types = tuple(self.resolve(kind) for _, _, kind in method.params)
                 required_result = self.resolve(substitute(required.result, bindings))
@@ -4388,7 +4436,8 @@ class Checker:
         if isinstance(annotation, AssociatedType):
             projected = replace(annotation, owner=self.resolve(annotation.owner),
                                 arguments=tuple(map(self.resolve, annotation.arguments)))
-            return self.program.normalize(projected)
+            normalized = self.program.normalize(projected)
+            return normalized if isinstance(normalized, AssociatedType) else self.resolve(normalized)
         return annotation
 
     def occurs(self, variable, annotation):
@@ -4513,7 +4562,30 @@ class Checker:
                 self.generic_arguments.append((argument, token))
             for trait in sorted(parameter.bounds):
                 self.obligation(argument, trait, token)
+        self.associated_equalities.extend(self.associated_requirements(arguments, token))
         return arguments
+
+    def associated_requirements(self, arguments, token):
+        for parameter, owner in arguments.items():
+            for (bound, item), expected in parameter.associated_bindings.items():
+                trait = self.program.associated_trait(bound, item)
+                if trait is None:
+                    raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
+                yield AssociatedType(owner, item, trait.name.text), substitute(expected, arguments), token
+
+    def solve_associated_equalities(self, requirements):
+        pending = list(requirements)
+        while pending:
+            remaining = []
+            for projection, expected, token in pending:
+                if isinstance(self.resolve(projection.owner), TypeVariable):
+                    remaining.append((projection, expected, token))
+                else:
+                    self.require(projection, expected, token)
+            if len(remaining) == len(pending):
+                return remaining
+            pending = remaining
+        return pending
 
     def fill_holes(self, annotation, token):
         if annotation is None:
@@ -4542,6 +4614,7 @@ class Checker:
         return annotation
 
     def finish_inference(self):
+        remaining_equalities = self.solve_associated_equalities(self.associated_equalities)
         for annotation, value, token in self.integer_literals:
             resolved = self.resolve(annotation)
             if isinstance(resolved, TypeVariable):
@@ -4558,6 +4631,7 @@ class Checker:
             if resolved not in FLOAT_TYPES:
                 raise token.error(f"expected a float, found {resolved}")
             float_literal_value(value, resolved, token)
+        self.solve_associated_equalities(remaining_equalities)
         for operand, token in self.unary_operands:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
@@ -4724,12 +4798,7 @@ class Checker:
         if isinstance(annotation, OpaqueType):
             self.check_bounds((annotation,), token)
             for bound, item, expected in annotation.bindings:
-                trait = self.program.associated_trait(bound, item)
-                if trait is None:
-                    raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
-                if trait.associated[item].parameters:
-                    raise token.error("generic associated type bindings require specialization")
-                self.check_type(expected, token)
+                self.check_associated_binding(bound, item, expected, token)
             return
         if isinstance(annotation, FunctionType):
             for kind in annotation.parameters:
@@ -4812,6 +4881,8 @@ class Checker:
                 self.generic_arguments.append((argument, token))
                 for trait in sorted(parameter.bounds):
                     self.obligation(argument, trait, token)
+            arguments = dict(zip(parameters, annotation.arguments))
+            self.associated_equalities.extend(self.associated_requirements(arguments, token))
             return
         if self.program.type_parameters.get(annotation):
             count = len(self.program.type_parameters[annotation])
@@ -5936,6 +6007,7 @@ class Checker:
             if isinstance(hint, ReferenceType) and hint.mutable:
                 CaptureContext.mark_mutable(scope, expr_arg)
             actual_types.append(actual)
+        self.solve_associated_equalities(self.associated_requirements(arguments, token))
         if expected is not None and defer_projection:
             self.require_argument(result, expected, token)
         self.program.call_types[id(expr)] = (params, arguments)

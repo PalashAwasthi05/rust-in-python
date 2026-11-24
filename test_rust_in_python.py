@@ -14,6 +14,33 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("associated type constraints infer generic results and select blanket implementations", """
+        trait Read { type Item; fn read(&self) -> Self::Item; }
+        struct Packet<T: Copy>(T);
+        impl<T: Copy> Read for Packet<T> {
+            type Item = T;
+            fn read(&self) -> T { self.0 }
+        }
+        trait Echo { fn echo(&self) -> u8; }
+        impl<T> Echo for T where T: Read<Item = u8> {
+            fn echo(&self) -> u8 { self.read() }
+        }
+        fn get<T, U>(source: T) -> U where T: Read<Item = U> { source.read() }
+        fn bytes(source: impl Read<Item = u8>) -> u8 { source.read() }
+        fn wide<T: Read<Item = u16>>(source: T) -> u16 { source.read() }
+        fn hide() -> impl Read<Item = u8> { Packet(13u8) }
+        fn main() {
+            let inferred = get(Packet(5u32));
+            println!("{} {} {} {}", inferred, bytes(Packet(7u8)), wide(Packet(11u16)), hide().echo());
+        }
+    """, "5 7 11 13\n"),
+    ("bounded generic structs accept matching associated types", """
+        trait Read { type Item; }
+        struct Source;
+        impl Read for Source { type Item = u8; }
+        struct Envelope<T: Read<Item = u8>>(T);
+        fn main() { let _: Envelope<Source> = Envelope(Source); }
+    """, ""),
     ("opaque associated bindings are visible after specialization", """
         trait Read { type Item; fn read(&self) -> Self::Item; }
         trait Source: Read {}
@@ -1921,6 +1948,29 @@ VALID = [
 ]
 
 INVALID = [
+    ("argument position impl trait enforces associated equality", """
+        trait Read { type Item; }
+        struct Source;
+        impl Read for Source { type Item = u16; }
+        fn byte(_: impl Read<Item = u8>) {}
+        fn main() { byte(Source); }
+    """, "expected u8, found u16"),
+    ("associated binding controls blanket implementation selection", """
+        trait Read { type Item; }
+        trait Marker {}
+        struct Source;
+        impl Read for Source { type Item = u16; }
+        impl<T: Read<Item = u8>> Marker for T {}
+        fn byte(_: impl Marker) {}
+        fn main() { byte(Source); }
+    """, "Source does not implement Marker"),
+    ("explicit type arguments enforce a struct's associated bindings", """
+        trait Read { type Item; }
+        struct Source;
+        impl Read for Source { type Item = u16; }
+        struct Envelope<T: Read<Item = u8>>(T);
+        fn main() { let _envelope: Envelope<Source>; }
+    """, "expected u8, found u16"),
     ("opaque associated bindings enforce the return type's projection", """
         trait Read { type Item; }
         struct Unit;
