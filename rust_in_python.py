@@ -17,6 +17,7 @@ import argparse
 from collections import deque
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+import functools
 import json
 import math
 import operator
@@ -123,7 +124,7 @@ PRECEDENCE = {
 }
 BITWISE = {"&": operator.and_, "|": operator.or_, "^": operator.xor}
 SHIFTS = {"<<", ">>"}
-BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
+BLOCK_EXPRESSIONS = {"block", "inline_const", "if", "while", "while_let", "loop", "for", "match"}
 PRIMITIVES = CONST_VALUE_TYPES | {"()"}
 NEVER = "!"
 SCALAR_CONSTANTS = {f"{kind}::{name}": (result, value)
@@ -1254,6 +1255,9 @@ class ConstExpression:
     def __str__(self):
         if self.operator == "block":
             return "{ " + "; ".join(map(str, self.operands)) + " }"
+        if self.operator == "if":
+            condition, yes, no = self.operands
+            return f"(if {condition} {{ {yes} }} else {{ {no} }})"
         if len(self.operands) == 1:
             return f"({self.operator}{self.operands[0]})"
         return f"({self.operands[0]} {self.operator} {self.operands[1]})"
@@ -1282,8 +1286,8 @@ def check_constant_kind(value, kind, token):
     raise token.error(f"expected a {kind} constant")
 
 
-def fold_const(expression):
-    if not all(isinstance(value, ConstValue) for value in expression.operands):
+def fold_const(expression, *, defer_const=False):
+    if defer_const or not all(isinstance(value, ConstValue) for value in expression.operands):
         return expression
     values = tuple(value.value for value in expression.operands)
     word, token, kind = expression.operator, expression.token, expression.kind
@@ -1309,6 +1313,24 @@ def fold_const(expression):
     else:
         result = binary(word, *values, token, expression.integer or kind)
     return ConstValue(result, kind)
+
+
+def resolve_const_operands(expression, resolve, *, defer_const=False):
+    operands = expression.operands
+    word = expression.operator
+    if word in {"if", "&&", "||"}:
+        first = resolve(operands[0], defer_const=defer_const)
+        if isinstance(first, ConstValue) and not defer_const:
+            if word == "if":
+                value = resolve(operands[1] if first.value else operands[2])
+                return replace(value, kind=expression.kind) if isinstance(value, ConstValue) else value
+            if first.value == (word == "||"):
+                return first
+            return resolve(operands[1])
+        operands = (first, *(resolve(value, defer_const=True) for value in operands[1:]))
+        return replace(expression, operands=operands)
+    operands = tuple(resolve(value, defer_const=defer_const) for value in operands)
+    return fold_const(replace(expression, operands=operands), defer_const=defer_const)
 
 
 @dataclass(frozen=True)
@@ -1477,10 +1499,10 @@ SUPERTRAITS = {
 DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized"}
 
 
-def substitute(annotation, arguments):
+def substitute(annotation, arguments, *, defer_const=False):
     if isinstance(annotation, ConstExpression):
-        return fold_const(replace(annotation, operands=tuple(substitute(value, arguments)
-                                                            for value in annotation.operands)))
+        return resolve_const_operands(annotation, functools.partial(substitute, arguments=arguments),
+                                      defer_const=defer_const)
     if isinstance(annotation, ReferenceType):
         lifetime = arguments.get(LifetimeArgument(annotation.lifetime), None) if annotation.lifetime else None
         return replace(annotation, inner=substitute(annotation.inner, arguments),
@@ -2580,6 +2602,8 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word == "const" and self.current.text == "{":
+            return Expr("inline_const", token, (self.block(),))
         if word == "@vec":
             close = DELIMITERS[self.advance().text]
             if self.accept(close):
@@ -2889,7 +2913,7 @@ class Parser:
         arguments = tuple(TypeParameter(name.text, const_type=kind) for name, _, kind in function.params)
         self.const_function_body(function, arguments)
 
-    def const_function_body(self, function, arguments):
+    def const_function_body(self, function, arguments, *, defer_const=False):
         token = function.name
         if function.result not in CONST_VALUE_TYPES:
             raise token.error("const functions currently require a scalar result")
@@ -2905,7 +2929,7 @@ class Parser:
                 locals[name.key] = replace(argument, kind=kind) if isinstance(argument, ConstValue) else argument
         active.add(token.text)
         try:
-            value = self.const_expression(function.body, function.result, locals=locals)
+            value = self.const_expression(function.body, function.result, locals=locals, defer_const=defer_const)
             check_constant_kind(value, function.result, token)
             effects = tuple(arg for arg in arguments if not isinstance(arg, ConstValue))
             if effects:
@@ -2914,8 +2938,11 @@ class Parser:
         finally:
             active.remove(token.text)
 
-    def const_expression(self, expr, hint=None, *, locals=None):
+    def const_expression(self, expr, hint=None, *, locals=None, defer_const=False):
         expr = ungroup(expr)
+        read = functools.partial(self.const_expression, locals=locals, defer_const=defer_const)
+        if expr.kind == "inline_const":
+            return read(expr.args[0], hint, locals=None)
         if expr.kind == "name":
             if locals is not None and expr.token.key in locals:
                 return locals[expr.token.key]
@@ -2928,20 +2955,21 @@ class Parser:
             if (len(expr.args) != len(function.params) or function.type_parameters
                     or any(kind not in CONST_VALUE_TYPES for _, _, kind in function.params)):
                 raise expr.token.error("incompatible const function arguments")
-            arguments = tuple(self.const_expression(arg, kind, locals=locals)
+            arguments = tuple(read(arg, kind)
                               for arg, (_, _, kind) in zip(expr.args, function.params))
-            return parser.const_function_body(function, arguments)
+            return parser.const_function_body(function, arguments, defer_const=defer_const)
         if expr.kind == "block":
             statements, tail = expr.args
             if tail is None:
                 raise expr.token.error("constant block requires a result")
             scope = {} if locals is None else dict(locals)
+            read = functools.partial(self.const_expression, locals=scope, defer_const=defer_const)
             effects = []
             for statement in statements:
                 if statement.kind == "macro_definition":
                     continue
                 if statement.kind == "discard" and not statement.args[1]:
-                    effects.append(self.const_expression(statement.args[0], locals=scope))
+                    effects.append(read(statement.args[0]))
                     continue
                 if statement.kind != "let":
                     raise statement.token.error("unsupported statement in a constant block")
@@ -2949,7 +2977,7 @@ class Parser:
                 if (pattern.kind not in {"bind", "wild"} or pattern.args not in {(), (False,)}
                         or initializer is None or fallback or annotation not in CONST_VALUE_TYPES | {None}):
                     raise statement.token.error("constant bindings require an immutable scalar value")
-                value = self.const_expression(initializer, annotation, locals=scope)
+                value = read(initializer, annotation)
                 kind = annotation or const_kind(value)
                 if kind is None and isinstance(value, ConstValue):
                     kind = "f64" if isinstance(value.value, float) else "i32"
@@ -2959,13 +2987,28 @@ class Parser:
                 effects.append(value)
                 if pattern.kind == "bind":
                     scope[pattern.token.key] = value
-            value = self.const_expression(tail, hint, locals=scope)
+            value = read(tail, hint)
             effects = tuple(effect for effect in effects if not isinstance(effect, ConstValue))
             if effects:
                 kind = const_kind(value) or hint or "i32"
                 check_constant_kind(value, kind, tail.token)
                 return ConstExpression("block", (*effects, value), kind, expr.token)
             return value
+        if expr.kind == "if":
+            test, yes, no = expr.args
+            if no is None:
+                raise expr.token.error("scalar constant conditionals require an else branch")
+            condition = read(test, "bool")
+            check_constant_kind(condition, "bool", test.token)
+            left = read(yes, hint, defer_const=True)
+            right = read(no, hint or const_kind(left), defer_const=True)
+            kind = const_kind(left) or const_kind(right) or hint
+            if kind is None:
+                kind = "f64" if isinstance(left.value, float) else "i32"
+            check_constant_kind(left, kind, yes.token)
+            check_constant_kind(right, kind, no.token)
+            choice = ConstExpression("if", (condition, left, right), kind, expr.token)
+            return substitute(choice, {}, defer_const=defer_const)
         if expr.kind == "const_value":
             return expr.args[0]
         if expr.kind == "literal" and expr.args[0] in CONST_VALUE_TYPES:
@@ -2979,51 +3022,71 @@ class Parser:
             if target not in SCALAR_BOUNDS and target not in FLOAT_TYPES:
                 raise expr.token.error("constant cast requires a numeric or char target")
             preferred = "u8" if target == "char" else target
-            value = self.const_expression(operand, preferred, locals=locals)
+            value = read(operand, preferred)
             actual = const_kind(value)
             if actual is None and isinstance(value, ConstValue) and isinstance(value.value, float):
                 actual = "f32" if isinstance(value.value, Float32) else "f64"
             actual = actual or (preferred if preferred in INTEGER_TYPES else "i32")
             if not scalar_cast_supported(actual, target):
                 raise expr.token.error(f"cannot cast {actual} to {target}")
-            return fold_const(ConstExpression("as", (value,), target, expr.token, actual))
+            return fold_const(ConstExpression("as", (value,), target, expr.token, actual),
+                              defer_const=defer_const)
         if expr.kind == "unary" and expr.token.text == "!":
-            value = self.const_expression(expr.args[0], hint, locals=locals)
+            value = read(expr.args[0], hint)
             kind = const_kind(value) or hint or "i32"
             if kind != "bool" and kind not in INTEGER_TYPES:
                 raise expr.token.error(f"cannot negate {kind} with '!'")
-            return fold_const(ConstExpression("!", (value,), kind, expr.token, kind))
+            return fold_const(ConstExpression("!", (value,), kind, expr.token, kind),
+                              defer_const=defer_const)
         if expr.kind == "unary" and expr.token.text == "-":
-            value = self.const_expression(expr.args[0], hint, locals=locals)
+            operand = expr.args[0]
+            value = read(operand, hint)
             kind = const_kind(value) or hint
             if kind in INTEGER_TYPES and INTEGER_BOUNDS[kind][0] == 0:
                 raise expr.token.error(f"cannot negate {kind} with '-'")
-            if isinstance(value, ConstValue) and type(value.value) is int:
+            signed_literal = ungroup(operand).kind == "literal"
+            if isinstance(value, ConstValue) and type(value.value) is int and (not defer_const or signed_literal):
                 result = -value.value
                 if kind in INTEGER_TYPES:
                     checked(result, expr.token, kind)
                 return ConstValue(result, value.kind)
-            if isinstance(value, ConstValue) and isinstance(value.value, float):
+            if isinstance(value, ConstValue) and isinstance(value.value, float) and not defer_const:
                 width = kind if kind in FLOAT_TYPES else "f32" if isinstance(value.value, Float32) else "f64"
                 return ConstValue(rounded_float(-value.value, width), value.kind)
+            if kind is None and isinstance(value, ConstValue):
+                kind = "f64" if isinstance(value.value, float) else "i32"
             if kind in FLOAT_TYPES or kind in INTEGER_TYPES and kind.startswith("i"):
+                check_constant_kind(value, kind, expr.token)
                 return ConstExpression("-", (value,), kind, expr.token)
         if expr.kind == "binary":
-            left, right = (self.const_expression(arg, hint, locals=locals) for arg in expr.args)
             word = expr.token.text
+            if word in {"&&", "||"}:
+                left = read(expr.args[0], "bool")
+                right = read(expr.args[1], "bool", defer_const=True)
+                check_constant_kind(left, "bool", expr.args[0].token)
+                check_constant_kind(right, "bool", expr.args[1].token)
+                branch = ConstExpression(word, (left, right), "bool", expr.token)
+                return substitute(branch, {}, defer_const=defer_const)
+            left, right = (read(arg, hint) for arg in expr.args)
             left_kind, right_kind = const_kind(left), const_kind(right)
             if word in SHIFTS:
                 kind = left_kind or (hint if hint in INTEGER_TYPES else "i32")
                 if kind not in INTEGER_TYPES or (right_kind and right_kind not in INTEGER_TYPES):
                     raise expr.token.error("shift operands must be integers")
-                return fold_const(ConstExpression(word, (left, right), kind, expr.token, kind))
-            if not all(isinstance(arg, ConstValue) for arg in (left, right)):
-                kind = left_kind or right_kind or hint or "i32"
+                return fold_const(ConstExpression(word, (left, right), kind, expr.token, kind),
+                                  defer_const=defer_const)
+            if defer_const or not all(isinstance(arg, ConstValue) for arg in (left, right)):
+                kind = left_kind or right_kind
+                if kind is None:
+                    floating = isinstance(left, ConstValue) and isinstance(left.value, float)
+                    kind = hint if hint in NUMBER_TYPES else "f64" if floating else "i32"
                 if left_kind and right_kind and left_kind != right_kind:
                     raise expr.token.error("constant operands have different types")
                 if kind == "char" and (left_kind != kind or right_kind != kind):
                     raise expr.token.error("character comparison requires two characters")
-                if word in COMPARE or (kind == "bool" and word in {"&&", "||", *BITWISE}):
+                check_constant_kind(left, kind, expr.args[0].token)
+                check_constant_kind(right, kind, expr.args[1].token)
+                if word in COMPARE or (kind == "bool" and word in BITWISE):
                     return ConstExpression(word, (left, right), "bool", expr.token, kind)
                 if ((kind in INTEGER_TYPES and word in {*ARITHMETIC, "/", "%"})
                         or (kind in FLOAT_TYPES and word in FLOAT_OPERATORS)):
@@ -3031,9 +3094,6 @@ class Parser:
             if all(isinstance(arg, ConstValue) for arg in (left, right)):
                 if left.boolean and right.boolean and word in BITWISE:
                     return ConstValue(BITWISE[word](left.value, right.value), "bool")
-                if left.boolean and right.boolean and word in {"&&", "||"}:
-                    return ConstValue((left.value and right.value) if word == "&&"
-                                      else (left.value or right.value), "bool")
                 if word in COMPARE and left.boolean == right.boolean and (
                     not left.kind or not right.kind or left.kind == right.kind
                 ):
@@ -3860,8 +3920,9 @@ def unify_exits(exits, expect=require):
 
 
 class Checker:
-    def __init__(self, program):
+    def __init__(self, program, modules):
         self.program = program
+        self.modules = modules
         self.functions = program.functions
         self.result = "()"
         self.loops = []
@@ -4034,10 +4095,11 @@ class Checker:
             inputs = Parser.return_inputs(function.name, params, result, function.lifetimes)
         return replace(function, params=params, result=result, return_inputs=inputs)
 
-    def resolve(self, annotation):
+    def resolve(self, annotation, *, defer_const=False):
         if isinstance(annotation, TypeVariable) and annotation in self.substitutions:
-            result = self.resolve(self.substitutions[annotation])
-            self.substitutions[annotation] = result
+            result = self.resolve(self.substitutions[annotation], defer_const=defer_const)
+            if not defer_const:
+                self.substitutions[annotation] = result
             return result
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.resolve(annotation.inner))
@@ -4055,7 +4117,7 @@ class Checker:
         if isinstance(annotation, SliceType):
             return SliceType(self.resolve(annotation.element))
         if isinstance(annotation, ConstExpression):
-            return fold_const(replace(annotation, operands=tuple(map(self.resolve, annotation.operands))))
+            return resolve_const_operands(annotation, self.resolve, defer_const=defer_const)
         if isinstance(annotation, DynType):
             return DynType(annotation.trait, tuple((name, self.resolve(value)) for name, value in annotation.bindings))
         if isinstance(annotation, AssociatedType):
@@ -4985,8 +5047,21 @@ class Checker:
             return annotation
         if kind == "byte_string":
             return ReferenceType(ArrayType("u8", ConstValue(len(args), "usize")), False, "'static")
+        if kind == "inline_const":
+            hint = self.resolve(expected)
+            hint = hint if hint in CONST_VALUE_TYPES else None
+            parser = Parser("", modules=self.modules, unit=self.modules.units[token.module])
+            value = parser.const_expression(args[0], hint)
+            annotation = const_kind(value) or hint
+            if annotation is None:
+                annotation = "f64" if isinstance(value.value, float) else "i32"
+            check_constant_kind(value, annotation, token)
+            if isinstance(value, ConstValue):
+                value = replace(value, kind=annotation)
+            expr.kind, expr.args = "const_value", (value,)
+            return annotation
         if kind == "const_value":
-            return args[0].const_type
+            return const_kind(args[0])
         if kind in {"array", "array_repeat", "vector", "vector_repeat"}:
             return self.sequence_type(expr, scope, expected)
         if kind == "tuple":
@@ -8074,7 +8149,7 @@ def compile_program(source, *, proc_extern=(), source_path=None):
                                               if symbol and symbol.kind == "fn"}
         program.constants_in_scope[unit.path] = {name: modules.constants[symbol.name] for name, symbol in symbols.items()
                                                  if symbol and symbol.kind == "const"}
-    Checker(program).check()
+    Checker(program, modules).check()
     Ownership(program).check()
     return program
 

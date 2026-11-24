@@ -14,6 +14,28 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("conditional constant functions evaluate only the selected branch", """
+        #![feature(generic_const_exprs)]
+        const fn width(n: usize) -> usize { if n == 0 { 1 } else { 8 / n } }
+        const fn test(n: usize) -> bool { n == 0 || 8 / n == 4 }
+        fn repeat<const N: usize>() -> [u8; width(N)] where [(); width(N)]: {
+            [7; width(N)]
+        }
+        const YES: bool = test(0);
+        const NO: bool = test(1);
+        const EDGE: i8 = if YES { -128i8 } else { 0 };
+        fn main() { println!("{:?} {:?} {YES} {NO} {EDGE}", repeat::<0>(), repeat::<2>()); }
+    """, "[7] [7, 7, 7, 7] true false -128\n"),
+    ("inline constant blocks with generic parameters", """
+        fn limit<const N: usize>() -> usize {
+            const { let adjustment: usize = 2; N + adjustment }
+        }
+        fn main() {
+            let tiny: u8 = const { 17 };
+            let divisor: usize = const { if false { 1 } else { 2 } };
+            println!("{} {} {}", limit::<3>(), tiny, divisor);
+        }
+    """, "5 17 2\n"),
     ("scalar const functions with forward references and runtime calls", """
         mod sizing {
             pub const fn width(x: usize) -> usize {
@@ -1766,6 +1788,23 @@ VALID = [
 ]
 
 INVALID = [
+    ("a selected constant branch reports arithmetic failure", """
+        const fn quotient(n: usize) -> usize { if n == 4 { 2 } else { 8 / n } }
+        const QUOTIENT: usize = quotient(0);
+        fn main() {}
+    """, "division by zero"),
+    ("inline const cannot read a runtime local", """
+        fn main() {
+            let runtime = 42;
+            let value: i32 = const { runtime + 1 };
+        }
+    """, "unsupported constant expression"),
+    ("all constant branches must have the same type", """
+        const fn pick(flag: bool) -> u8 {
+            if flag { 3u8 } else { true }
+        }
+        fn main() {}
+    """, "expected a u8 constant"),
     ("ordinary functions cannot be called from a const body", """
         fn regular(x: i32) -> i32 { x }
         const fn constant(x: i32) -> i32 { regular(x) }
