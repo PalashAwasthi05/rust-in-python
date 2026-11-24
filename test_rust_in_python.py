@@ -356,6 +356,106 @@ VALID = [
             println!("{missing}");
         }
     """, ""),
+    ("elided reference returned from a field", """
+        struct Pair { left: i32, right: i32 }
+        fn left(value: &mut Pair) -> &mut i32 { &mut value.left }
+        fn main() {
+            let mut pair = Pair { left: 1, right: 2 };
+            *left(&mut pair) += 2;
+            let selected = left(&mut pair);
+            *selected += 1;
+            println!("{} {}", pair.left, pair.right);
+        }
+    """, "4 2\n"),
+    ("named lifetime ties multiple inputs through match", """
+        fn pick<'a>(first: &'a i32, second: &'a i32, flag: bool) -> &'a i32 {
+            match flag { true => first, false => second }
+        }
+        fn main() {
+            let a = 1;
+            let b = 2;
+            let chosen = pick(&a, &b, false);
+            println!("{chosen}");
+        }
+    """, "2\n"),
+    ("outlives bounds are transitive", """
+        fn choose<'a, 'b: 'a, 'c>(a: &'a i32, b: &'b i32, c: &'c i32) -> &'a i32
+        where 'c: 'b {
+            c
+        }
+        fn main() { println!("{}", choose(&1, &2, &3)); }
+    """, "3\n"),
+    ("early reference return and promoted fallback", """
+        fn pick(first: &'_ i32, flag: bool) -> &'_ i32 {
+            if flag { return first; }
+            &42
+        }
+        fn main() { println!("{} {}", pick(&1, true), pick(&2, false)); }
+    """, "1 42\n"),
+    ("immutable static references and constant promotion", """
+        fn number() -> &'static i32 { &{ 6 * 7 } }
+        fn keep(value: &'static i32) -> &'static i32 { value }
+        fn main() {
+            let data: &'static i32 = keep(number());
+            println!("{data}");
+        }
+    """, "42\n"),
+    ("mutable return shares its lifetime with an immutable parameter", """
+        fn pick<'a>(ignored: &'a i32, chosen: &'a mut i32) -> &'a mut i32 { chosen }
+        fn main() {
+            let other = 1;
+            let mut value = 2;
+            let chosen = pick(&other, &mut value);
+            println!("{other}");
+            *chosen += 1;
+            println!("{value}");
+        }
+    """, "1\n3\n"),
+    ("unused returned reference to an argument temporary", """
+        fn make() -> i32 { 7 }
+        fn same(value: &i32) -> &i32 { value }
+        fn main() {
+            let _unused = same(&make());
+            println!("{}", same(&make()));
+        }
+    """, "7\n"),
+    ("explicitly extended temporary survives later call", """
+        fn make() -> i32 { 7 }
+        fn same(value: &i32) -> &i32 { value }
+        fn main() {
+            let temp = { &make() };
+            let borrowed = same(temp);
+            println!("{borrowed}");
+        }
+    """, "7\n"),
+    ("returned reborrow ends before parent reference is reused", """
+        fn same(value: &mut i32) -> &mut i32 { &mut *value }
+        fn main() {
+            let mut value = 1;
+            let parent = &mut value;
+            let child = same(parent);
+            *child += 1;
+            *parent += 2;
+            println!("{value}");
+        }
+    """, "4\n"),
+    ("borrowed owner initialized on its own control-flow path", """
+        struct Item(i32);
+        fn drop_item(_: Item) {}
+        fn choose(flag: bool) {
+            let first = Item(1);
+            let second = Item(2);
+            let borrowed = if flag {
+                drop_item(first);
+                &second
+            } else {
+                drop_item(second);
+                &first
+            };
+            println!("{}", borrowed.0);
+        }
+        fn main() { choose(true); choose(false); }
+    """, "2\n1\n"),
 ]
 
 INVALID = [
@@ -549,6 +649,68 @@ INVALID = [
     ("format arguments retain loans together", """
         fn main() { let mut value = 1; println!("{:?} {:?}", &mut value, &value); }
     """, "mutably borrowed"),
+    ("ambiguous output lifetime even with same named input lifetimes", """
+        fn same<'a>(first: &'a i32, second: &'a i32) -> &i32 { second }
+        fn main() {}
+    """, "missing lifetime for reference return"),
+    ("cannot explicitly return a reference to a local", """
+        fn bad(input: &i32) -> &i32 { let local = 1; return &local; }
+        fn main() {}
+    """, "cannot return a reference to 'local'"),
+    ("cannot return shorter unrelated lifetime", """
+        fn bad<'a, 'b>(first: &'a i32, second: &'b i32) -> &'a i32 { second }
+        fn main() {}
+    """, "with the declared lifetime"),
+    ("mutable field return keeps whole loan from call", """
+        struct Pair { left: i32, right: i32 }
+        fn left(value: &mut Pair) -> &mut i32 { &mut value.left }
+        fn main() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let selected = left(&mut pair);
+            pair.right = 3;
+            *selected += 1;
+        }
+    """, "mutably borrowed"),
+    ("shared return keeps both possible input loans", """
+        fn pick<'a>(a: &'a i32, b: &'a i32) -> &'a i32 { a }
+        fn main() {
+            let a = 1;
+            let mut b = 2;
+            let selected = pick(&a, &b);
+            b = 3;
+            println!("{selected}");
+        }
+    """, "immutably borrowed"),
+    ("return through a call cannot extend a temporary", """
+        fn make() -> i32 { 7 }
+        fn same(value: &i32) -> &i32 { value }
+        fn main() { let reference = same(&make()); println!("{reference}"); }
+    """, "temporary value dropped while borrowed"),
+    ("return through a call cannot extend a mutable literal", """
+        fn same(value: &mut i32) -> &mut i32 { value }
+        fn main() { let reference = same(&mut 7); *reference += 1; }
+    """, "temporary value dropped while borrowed"),
+    ("borrowed match binding stays within its arm", """
+        fn main() { let reference = match 1 { value => &value }; println!("{reference}"); }
+    """, "outlives its block"),
+    ("extended temporary stays within defining block", """
+        fn make() -> i32 { 7 }
+        fn main() {
+            let reference = { let inner = &make(); inner };
+            println!("{reference}");
+        }
+    """, "outlives its block"),
+    ("local does not satisfy static parameter", """
+        fn keep(reference: &'static i32) -> &'static i32 { reference }
+        fn main() { let value = 3; let _ignored = keep(&value); }
+    """, "does not live for 'static"),
+    ("wildcard annotation still requires static lifetime", """
+        fn main() {
+            let value = 3;
+            let borrowed = &value;
+            let _: &'static i32 = borrowed;
+        }
+    """, "does not live for 'static"),
 ]
 
 

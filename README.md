@@ -39,6 +39,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Partial moves, assignment after a move, and selected `Clone`, `Copy`, and `Debug` derives
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
+- Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -98,8 +99,27 @@ fn main() {
 
 The implicit mutable reborrow activates when `add` is called, so the second argument can read the old balance. The program prints `6`. No interest was charged.
 
+## Return something borrowed
+
+```rust
+struct Pair { left: i32, right: i32 }
+
+fn left(pair: &mut Pair) -> &mut i32 {
+    &mut pair.left
+}
+
+fn main() {
+    let mut pair = Pair { left: 3, right: 5 };
+    let borrowed = left(&mut pair);
+    *borrowed += 1;
+    println!("{}", pair.left);
+}
+```
+
+The returned reference keeps the argument borrowed until its last use. The program prints `4`.
+
 ## Scope
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
-Reference values can be bound to locals and passed as function arguments. The reference implementation still needs reassignment, pattern binding modes, reference fields and returns, and named lifetime inference. Generics, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are also incomplete.
+Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. The reference implementation still needs reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures. Generics, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are also incomplete.

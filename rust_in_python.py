@@ -8,15 +8,15 @@ Supported syntax: functions, let bindings, mut, blocks, if/else,
 while, loop, for over integer ranges, return, break, continue, scalar operators,
 exhaustive match, and println!. Integers use checked i32 arithmetic.
 This subset checks moves, initialization, and local shared and mutable loans.
-References in aggregates, reference returns, and the standard library are
-outside its scope.
+Reference returns support elision and named lifetimes on function signatures.
+References in aggregates and the standard library are outside its scope.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import operator
 from pathlib import Path
 import re
@@ -106,6 +106,7 @@ class Function:
     params: list
     result: str
     body: Expr
+    return_inputs: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class Constructor:
 class ReferenceType:
     inner: object
     mutable: bool
+    lifetime: str | None = field(default=None, compare=False)
 
     def __str__(self):
         prefix = "&mut " if self.mutable else "&"
@@ -176,20 +178,28 @@ class Parser:
             return self.advance()
         raise token.error("expected an identifier")
 
-    def type_name(self, *, static_string=False):
+    def type_name(self, *, static_string=False, signature=None, output=False):
         token = self.advance()
         if token.text in {"i32", "bool"}:
             return token.text
         if token.text == "&":
-            lifetime = self.accept("'static")
+            lifetime = self.advance() if self.current.text.startswith("'") else None
+            if lifetime and lifetime.text == "'_":
+                lifetime = None
             mutable = bool(self.accept("mut"))
             if not mutable and self.accept("str"):
-                if static_string and not lifetime:
+                if lifetime and lifetime.text != "'static":
+                    raise lifetime.error("named lifetimes on string slices are unsupported")
+                if (static_string or output) and not lifetime:
                     raise token.error("this position requires &'static str")
                 return "&str"
-            if static_string or lifetime:
-                raise token.error("references in fields and return types are unsupported")
-            return ReferenceType(self.type_name(), mutable)
+            if static_string:
+                raise token.error("references in fields are unsupported")
+            if lifetime and lifetime.text == "'static" and mutable:
+                raise lifetime.error("mutable 'static references are unsupported")
+            if lifetime and lifetime.text != "'static" and (signature is None or lifetime.text not in signature):
+                raise lifetime.error(f"undeclared or unsupported lifetime {lifetime.text}")
+            return ReferenceType(self.type_name(), mutable, lifetime.text if lifetime else None)
         if token.text == "(":
             self.expect(")")
             return "()"
@@ -214,6 +224,7 @@ class Parser:
             name = self.identifier()
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
+            lifetimes = self.lifetime_parameters()
             self.expect("(")
             params = []
             while self.current.text != ")":
@@ -222,13 +233,97 @@ class Parser:
                 if mutable and param.text == "_":
                     raise param.error("wildcard parameters cannot be mutable")
                 self.expect(":")
-                params.append((param, mutable, self.type_name()))
+                params.append((param, mutable, self.type_name(signature=lifetimes)))
                 if not self.accept(","):
                     break
             self.expect(")")
-            result = self.type_name(static_string=True) if self.accept("->") else "()"
-            program.functions[name.text] = Function(name, params, result, self.block())
+            result = self.type_name(signature=lifetimes, output=True) if self.accept("->") else "()"
+            self.lifetime_where_clause(lifetimes)
+            return_inputs = self.return_inputs(name, params, result, lifetimes)
+            program.functions[name.text] = Function(name, params, result, self.block(), return_inputs)
         return program
+
+    def lifetime_parameters(self):
+        lifetimes = {}
+        if not self.accept("<"):
+            return lifetimes
+        while self.current.text != ">":
+            token = self.advance()
+            if not token.text.startswith("'") or token.text in {"'static", "'_"}:
+                raise token.error("expected a lifetime parameter")
+            if token.text in lifetimes:
+                raise token.error(f"duplicate lifetime {token.text}")
+            lifetimes[token.text] = self.lifetime_bounds() if self.accept(":") else set()
+            if not self.accept(","):
+                break
+        self.expect(">")
+        for bounds in lifetimes.values():
+            self.require_lifetimes(bounds, lifetimes)
+        return lifetimes
+
+    def lifetime_bounds(self):
+        bounds = set()
+        while True:
+            token = self.advance()
+            if not token.text.startswith("'"):
+                raise token.error("expected a lifetime bound")
+            bounds.add(token)
+            if not self.accept("+"):
+                break
+        return bounds
+
+    @staticmethod
+    def require_lifetimes(tokens, lifetimes):
+        for token in tokens:
+            if token.text not in lifetimes:
+                raise token.error(f"undeclared or unsupported lifetime {token.text}")
+
+    def lifetime_where_clause(self, lifetimes):
+        if not self.accept("where"):
+            return
+        while self.current.text != "{":
+            lhs = self.advance()
+            self.require_lifetimes((lhs,), lifetimes)
+            self.expect(":")
+            bounds = self.lifetime_bounds()
+            self.require_lifetimes(bounds, lifetimes)
+            lifetimes[lhs.text].update(bounds)
+            if not self.accept(","):
+                break
+
+    @staticmethod
+    def return_inputs(name, params, result, lifetimes):
+        if not isinstance(result, ReferenceType) or result.lifetime == "'static":
+            return ()
+        regions = {}
+        input_count = 0
+        for index, (_, _, annotation) in enumerate(params):
+            if isinstance(annotation, ReferenceType):
+                input_count += 1
+                lifetime = annotation.lifetime if annotation.lifetime else index
+                regions.setdefault(lifetime, []).append(index)
+            elif annotation == "&str":
+                # String slices count for elision even though their lifetime
+                # metadata is outside the sized-reference implementation.
+                regions[index] = []
+                input_count += 1
+        if result.lifetime is None:
+            if input_count != 1:
+                raise name.error("missing lifetime for reference return")
+            region = next(iter(regions))
+        else:
+            region = result.lifetime
+        permitted = {region}
+        while True:
+            longer = {lifetime for lifetime, bounds in lifetimes.items()
+                      if any(bound.text in permitted for bound in bounds)}
+            if longer <= permitted:
+                break
+            permitted.update(longer)
+        inputs = sorted(index for lifetime in permitted for index in regions.get(lifetime, ()))
+        if not inputs:
+            raise name.error("return lifetime must be tied to a reference input")
+        return tuple(inputs)
 
     def attributes(self):
         derives = {}
@@ -634,6 +729,7 @@ class Binding:
 class Scope:
     parent: Scope | None = None
     bindings: dict = field(default_factory=dict)
+    owned: set = field(default_factory=set)
 
     def find(self, token):
         scope = self
@@ -663,7 +759,10 @@ def place_root(expr):
 
 
 def reference_source(expr):
-    return ungroup(expr).kind in {"name", "borrow"}
+    expr = ungroup(expr)
+    return expr.kind in {"name", "borrow", "call", "if", "match"} or (
+        expr.kind == "block" and not expr.label
+    )
 
 
 def shared_coercion(actual, expected):
@@ -925,7 +1024,8 @@ class Checker:
             self.result = function.result
             self.check_type(self.result, function.name, allow_never=True)
             result = self.type_of(function.body, scope)
-            require(result, function.result, function.body.token)
+            if not shared_coercion(result, function.result):
+                require(result, function.result, function.body.token)
 
     def check_derives(self, annotation):
         derives = self.program.derives[annotation]
@@ -1083,9 +1183,9 @@ class Checker:
             else:
                 coverage.append((pattern,))
             actual = self.type_of(body, inner)
-            if result == NEVER:
+            if result == NEVER or shared_coercion(result, actual):
                 result = actual
-            else:
+            elif not shared_coercion(actual, result):
                 require(actual, result, body.token)
         missing = uncovered(coverage, (annotation,), self.program)
         if missing is not None:
@@ -1143,7 +1243,7 @@ class Checker:
         else:
             result = self.check_expr(expr, scope)
         if isinstance(result, ReferenceType) and not reference_source(expr):
-            raise expr.token.error("reference values must come from a borrow or a local binding")
+            raise expr.token.error(f"reference result from {expr.kind} is unsupported")
         self.program.expr_types[id(expr)] = result
         return result
 
@@ -1266,16 +1366,17 @@ class Checker:
             require(test, "bool", condition.token)
             left = self.type_of(yes, scope)
             right = self.type_of(no, scope) if no else "()"
-            if left != NEVER:
+            if left != NEVER and not (shared_coercion(left, right) or shared_coercion(right, left)):
                 require(right, left, token)
             if test == NEVER:
                 return NEVER
-            return right if left == NEVER else left
+            return right if left == NEVER or shared_coercion(left, right) else left
         if kind in {"while", "while_let", "loop", "for"}:
             return self.loop_type(expr, scope)
         if kind == "return":
             actual = self.type_of(args[0], scope) if args[0] else "()"
-            require(actual, self.result, token)
+            if not shared_coercion(actual, self.result):
+                require(actual, self.result, token)
             return NEVER
         if kind in {"break", "continue"}:
             target = find_control(self.loops, expr)
@@ -1375,6 +1476,7 @@ class Local:
     token: Token
     mutable: bool
     loan: Loan | None = None
+    static: bool = False
 
 
 @dataclass(frozen=True)
@@ -1390,7 +1492,13 @@ class Place:
         return self.local is other.local and other.fields[:len(self.fields)] == self.fields
 
     def overlaps(self, other):
-        return self.contains(other) or other.contains(self)
+        return any(left.contains(right) or right.contains(left)
+                   for left in self.regions() for right in other.regions())
+
+    def regions(self):
+        if self.holder and self.holder.loan.possible:
+            return self.holder.loan.possible
+        return (self,)
 
     @property
     def name(self):
@@ -1401,14 +1509,24 @@ class Place:
 class Loan:
     place: Place
     mutable: bool
-    parent: Loan | None = None
+    parents: tuple = ()
     two_phase: bool = False
+    possible: tuple = ()
+    expiring: frozenset = frozenset()
 
     def ancestors(self):
-        loan = self
-        while loan:
+        visited = set()
+        pending = [self]
+        while pending:
+            loan = pending.pop()
+            if loan in visited:
+                continue
+            visited.add(loan)
             yield loan
-            loan = loan.parent
+            pending.extend(loan.parents)
+
+    def regions(self):
+        return self.possible or (self.place,)
 
 
 @dataclass(frozen=True)
@@ -1417,9 +1535,10 @@ class Effect:
     place: Place
     token: Token
     loan: Loan | None = None
+    roots: frozenset = frozenset()
 
     def reference_uses(self):
-        if self.kind in {"declare", "uninitialized"}:
+        if self.kind in {"declare", "uninitialized", "end_temporaries"}:
             return set()
         if self.place.holder:
             return {self.place.holder}
@@ -1446,6 +1565,8 @@ class MoveState:
         if effect is None:
             return self
         kind, place = effect.kind, effect.place
+        if kind == "write" and place.holder:
+            return self
         if kind == "move":
             return MoveState(self.missing | {(place, "moved")}, self.written)
         if kind in {"declare", "uninitialized", "write"}:
@@ -1459,6 +1580,17 @@ class MoveState:
         if effect is None:
             return
         kind, place, token = effect.kind, effect.place, effect.token
+        if kind == "return_reference":
+            for owner in place.local.loan.regions():
+                if owner.local not in effect.roots and not owner.local.static:
+                    raise token.error(f"cannot return a reference to {owner.name!r} with the declared lifetime")
+        if kind == "static_reference":
+            if any(not owner.local.static for owner in place.local.loan.regions()):
+                raise token.error("reference does not live for 'static")
+        if kind == "block_reference":
+            for owner in place.local.loan.regions():
+                if owner.local in effect.roots:
+                    raise token.error(f"reference to {owner.name!r} outlives its block")
         if place.holder and any(item == Place(place.holder) for item, _ in self.missing):
             raise token.error(f"use of moved reference {place.holder.token.text!r}")
         if kind == "deref_move":
@@ -1467,7 +1599,10 @@ class MoveState:
             raise token.error(f"cannot move out of {place.name!r} in a pattern guard")
         if kind == "guard_write":
             raise token.error(f"cannot assign to {place.name!r} in a pattern guard")
-        if kind in {"read", "move", "borrow"}:
+        # The referent was initialized when borrowed. Only the holder can
+        # have moved since then. Checking its candidate owners after a branch
+        # would mix the referent on one path with moves from another path.
+        if kind in {"read", "move", "borrow"} and not place.holder:
             unavailable = [(item, reason) for item, reason in self.missing if place.overlaps(item)]
             if unavailable:
                 item, reason = min(unavailable, key=lambda entry: (len(entry[0].fields), entry[0].name, entry[1]))
@@ -1475,11 +1610,12 @@ class MoveState:
                     raise token.error(f"use of {reason} value {item.name!r}")
                 raise token.error(f"use of partially {reason} value {place.name!r} ({item.name})")
         if kind == "write":
-            if not place.local.mutable and (place.fields or place.local in self.written):
+            if not place.holder and not place.local.mutable and (place.fields or place.local in self.written):
                 raise token.error(f"cannot assign to immutable binding {place.local.token.text!r}")
-            for item, reason in sorted(self.missing, key=lambda entry: (entry[0].name, entry[1])):
-                if item != place and item.contains(place):
-                    raise token.error(f"cannot assign to a field of {reason} value {item.name!r}")
+            if not place.holder:
+                for item, reason in sorted(self.missing, key=lambda entry: (entry[0].name, entry[1])):
+                    if item != place and item.contains(place):
+                        raise token.error(f"cannot assign to a field of {reason} value {item.name!r}")
 
 
 class Ownership:
@@ -1497,18 +1633,22 @@ class Ownership:
             scope = Scope()
             entry = FlowNode()
             cursor = entry
-            for token, mutable, annotation in function.params:
+            self.return_roots = set()
+            for index, (token, mutable, annotation) in enumerate(function.params):
                 if token.text == "_":
                     continue
                 loan = None
                 if isinstance(annotation, ReferenceType):
-                    referent = Local(Token(f"*{token.text}", token.line, token.column), annotation.mutable)
+                    referent = Local(Token(f"*{token.text}", token.line, token.column), annotation.mutable,
+                                     static=annotation.lifetime == "'static")
                     loan = Loan(Place(referent), annotation.mutable)
+                    if index in function.return_inputs:
+                        self.return_roots.add(referent)
                     cursor = self.emit(cursor, "declare", loan.place, token)
                 local = Local(token, mutable, loan)
                 scope.bindings[token.text] = local
                 cursor = self.emit(cursor, "declare", Place(local), token)
-            self.lower(function.body, scope, cursor)
+            self.lower_return(function.body, scope, cursor)
             self.check_graph(entry)
 
     @staticmethod
@@ -1568,15 +1708,21 @@ class Ownership:
     @staticmethod
     def validate_loans(effect, live):
         kind, place, token = effect.kind, effect.place, effect.token
+        if kind == "end_temporaries":
+            if place.local.loan in live:
+                raise token.error("temporary value dropped while borrowed")
+            return
         if kind not in {"read", "write", "move", "borrow", "activate"}:
             return
-        if kind == "borrow" and effect.loan.mutable and not place.local.mutable:
+        if kind == "borrow" and effect.loan.mutable and not place.holder and not place.local.mutable:
             raise token.error(f"cannot borrow immutable place {place.name!r} as mutable")
         if kind == "activate":
             parent = place.local.loan
             place = parent.place
+            regions = parent.regions()
         else:
             parent = place.holder.loan if place.holder else None
+            regions = place.regions()
         permitted = set(parent.ancestors()) if parent else set()
         reference = place.local.loan
         if kind == "move" and reference:
@@ -1587,19 +1733,21 @@ class Ownership:
         )
         for loan in live - permitted:
             active_mutable = loan.mutable and not loan.two_phase
-            if place.overlaps(loan.place) and (exclusive or active_mutable):
+            overlapping = next((origin for origin in loan.regions()
+                                if any(region.overlaps(origin) for region in regions)), None)
+            if overlapping is not None and (exclusive or active_mutable):
                 action = {"read": "read", "write": "assign to", "move": "move",
                           "borrow": "borrow", "activate": "borrow"}[kind]
                 mode = "mutably" if active_mutable else "immutably"
-                raise token.error(f"cannot {action} {place.name!r} while {loan.place.name!r} is {mode} borrowed")
+                raise token.error(f"cannot {action} {place.name!r} while {overlapping.name!r} is {mode} borrowed")
 
     @staticmethod
     def connect(source, target):
         if source is not None:
             source.edges.append(target)
 
-    def emit(self, cursor, kind, place, token, *, loan=None):
-        node = FlowNode(Effect(kind, place, token, loan))
+    def emit(self, cursor, kind, place, token, *, loan=None, roots=frozenset()):
+        node = FlowNode(Effect(kind, place, token, loan, roots))
         self.connect(cursor, node)
         return node
 
@@ -1625,7 +1773,7 @@ class Ownership:
             value = ungroup(expr.args[0])
             if value.kind == "name":
                 return cursor, self.referent(scope.find(value.token))
-            if value.kind == "borrow":
+            if isinstance(self.annotation(value), ReferenceType):
                 cursor, loan = self.lower_reference(value, scope, cursor)
                 cursor, holder = self.keep_loan(cursor, loan, value.token)
                 return cursor, self.referent(holder.local)
@@ -1646,30 +1794,115 @@ class Ownership:
         owner = holder.loan.place
         return Place(owner.local, owner.fields, holder)
 
-    def start_loan(self, cursor, place, mutable, token, *, two_phase=False):
+    def start_loan(self, cursor, place, mutable, token, *, two_phase=False, expiring=frozenset()):
         parent = place.holder.loan if place.holder else None
-        loan = Loan(Place(place.local, place.fields), mutable, parent, two_phase)
+        parents = (parent,) if parent else ()
+        possible = parent.possible if parent else ()
+        if parent:
+            expiring = expiring | parent.expiring
+        loan = Loan(Place(place.local, place.fields), mutable, parents, two_phase, possible, expiring)
         protected = self.guard_borrows + self.guard_tests
         if mutable and (place.local in self.guarded or any(place.overlaps(item) for item in protected)):
             return self.emit(cursor, "guard_write", place, token), loan
         return self.emit(cursor, "borrow", place, token, loan=loan), loan
 
-    def lower_reference(self, expr, scope, cursor, *, reborrow=None, two_phase=False):
+    def lower_reference(self, expr, scope, cursor, *, reborrow=None, two_phase=False, extend_to=None):
         expr = ungroup(expr)
+        annotation = self.annotation(expr)
+        if annotation == NEVER:
+            return self.lower(expr, scope, cursor), None
+        if expr.kind == "call":
+            return self.lower_call(expr.token, expr.args, scope, cursor)
+        if expr.kind == "block":
+            statements, tail = expr.args
+            inner = Scope(scope)
+            for statement in statements:
+                cursor = self.lower(statement, inner, cursor)
+            cursor, loan = self.lower_reference(tail, inner, cursor, extend_to=extend_to)
+            return self.leave_reference_scope(cursor, loan, inner, tail.token), loan
+        if expr.kind == "if":
+            condition, yes, no = expr.args
+            cursor = self.lower(condition, scope, cursor)
+            yes_end, yes_loan = self.lower_reference(yes, scope, cursor, extend_to=extend_to)
+            no_end, no_loan = self.lower_reference(no, scope, cursor, extend_to=extend_to)
+            loans = tuple(loan for loan in (yes_loan, no_loan) if loan)
+            return self.join(yes_end, no_end), self.merge_loans(loans, annotation.mutable)
+        if expr.kind == "match":
+            return self.lower_match(expr, scope, cursor, result_type=annotation, extend_to=extend_to)
         if expr.kind == "borrow":
             target, mutable = expr.args
             cursor, place = self.lower_address(target, scope, cursor)
+            expiring = frozenset()
             if place is None:
                 cursor = self.lower(target, scope, cursor)
-                local = Local(Token("<temporary value>", expr.token.line, expr.token.column), True)
+                promoted = not mutable and self.promotable(target)
+                local = Local(Token("<temporary value>", expr.token.line, expr.token.column),
+                              not promoted, static=promoted)
                 place = Place(local)
                 cursor = self.emit(cursor, "declare", place, expr.token)
-            return self.start_loan(cursor, place, mutable, expr.token)
+                if not promoted:
+                    if extend_to is None:
+                        expiring = frozenset({local})
+                    else:
+                        extend_to.owned.add(local)
+            return self.start_loan(cursor, place, mutable, expr.token, expiring=expiring)
         holder = scope.find(expr.token)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
                                    two_phase=two_phase)
         return self.lower(expr, scope, cursor), holder.loan
+
+    def promotable(self, expr):
+        expr = ungroup(expr)
+        if expr.kind == "literal":
+            return True
+        if expr.kind in {"name", "call", "record"}:
+            ctor = self.program.constructors.get(expr.token.text)
+            style = {"name": "unit", "call": "tuple", "record": "record"}[expr.kind]
+            if not ctor or ctor.style != style:
+                return False
+            values = (value for _, value in expr.args[0]) if expr.kind == "record" else expr.args
+            return all(self.promotable(value) for value in values)
+        if expr.kind in {"unary", "binary"}:
+            return all(self.promotable(operand) for operand in expr.args)
+        if expr.kind == "block":
+            statements, tail = expr.args
+            return not statements and (tail is None or self.promotable(tail))
+        return False
+
+    @staticmethod
+    def merge_loans(loans, mutable, *, from_call=False):
+        if not loans:
+            return None
+        if not from_call and all(loan is loans[0] for loan in loans):
+            return loans[0]
+        origins = tuple(dict.fromkeys(
+            place for loan in loans if not mutable or loan.mutable for place in loan.regions()
+        ))
+        # A diverging callee can declare a mutable result tied only to shared
+        # inputs. A conservative placeholder keeps dead continuations lowerable.
+        if not origins:
+            origins = loans[0].regions()
+        # At a call boundary a reserved argument borrow has already activated.
+        parents = tuple(replace(loan, two_phase=False) if loan.two_phase else loan for loan in loans)
+        expiring = frozenset().union(*(loan.expiring for loan in loans))
+        return Loan(origins[0], mutable, parents, possible=origins, expiring=expiring)
+
+    def leave_reference_scope(self, cursor, loan, scope, token):
+        if loan and any(origin.local in scope.owned for origin in loan.regions()):
+            cursor, holder = self.keep_loan(cursor, loan, token)
+            cursor = self.emit(cursor, "block_reference", holder, token, roots=frozenset(scope.owned))
+        return cursor
+
+    def lower_return(self, expr, scope, cursor):
+        if not isinstance(self.annotation(expr), ReferenceType):
+            return self.lower(expr, scope, cursor)
+        cursor, loan = self.lower_reference(expr, scope, cursor)
+        if loan:
+            cursor, holder = self.keep_loan(cursor, loan, expr.token)
+            cursor = self.emit(cursor, "return_reference", holder, expr.token,
+                               roots=frozenset(self.return_roots))
+        return cursor
 
     def keep_loan(self, cursor, loan, token):
         holder = Local(Token("<temporary reference>", token.line, token.column), False, loan)
@@ -1680,13 +1913,17 @@ class Ownership:
         function = self.program.functions.get(token.text)
         expected = [annotation for _, _, annotation in function.params] if function else [None] * len(args)
         temporaries = []
-        for expr, annotation in zip(args, expected):
+        passed = {}
+        for index, (expr, annotation) in enumerate(zip(args, expected)):
             if isinstance(annotation, ReferenceType) and self.annotation(expr) != NEVER:
                 cursor, loan = self.lower_reference(
                     expr, scope, cursor, reborrow=annotation, two_phase=annotation.mutable
                 )
                 cursor, holder = self.keep_loan(cursor, loan, expr.token)
+                if annotation.lifetime == "'static":
+                    cursor = self.emit(cursor, "static_reference", holder, expr.token)
                 temporaries.append((holder, expr.token))
+                passed[index] = loan
             else:
                 cursor = self.lower(expr, scope, cursor)
         # Activate implicit mutable reborrows after all arguments have been
@@ -1696,7 +1933,14 @@ class Ownership:
                 cursor = self.emit(cursor, "activate", holder, at)
         for holder, at in temporaries:
             cursor = self.emit(cursor, "read", holder, at)
-        return cursor
+        if function and function.return_inputs and all(index in passed for index in function.return_inputs):
+            loans = tuple(passed[index] for index in function.return_inputs)
+            return cursor, self.merge_loans(loans, function.result.mutable, from_call=True)
+        if function and isinstance(function.result, ReferenceType) and function.result.lifetime == "'static":
+            place = Place(Local(token, function.result.mutable, static=True))
+            cursor = self.emit(cursor, "declare", place, token)
+            return cursor, Loan(place, function.result.mutable)
+        return cursor, None
 
     def lower_print(self, token, args, scope, cursor):
         if not args:
@@ -1706,7 +1950,7 @@ class Ownership:
         for value in values:
             if isinstance(self.annotation(value), ReferenceType):
                 reference = ungroup(value)
-                if reference.kind == "borrow":
+                if reference.kind != "name":
                     cursor, loan = self.lower_reference(reference, scope, cursor)
                 else:
                     holder = scope.find(reference.token)
@@ -1776,11 +2020,20 @@ class Ownership:
             if value is None:
                 return self.declare(source, types, scope, cursor, initialized=False)
             if isinstance(self.annotation(value), ReferenceType):
-                if not types and ungroup(value).kind == "name":
+                static = isinstance(annotation, ReferenceType) and annotation.lifetime == "'static"
+                if not types and not static and ungroup(value).kind == "name":
                     return cursor
                 coercion = annotation if shared_coercion(self.annotation(value), annotation) else None
-                cursor, loan = self.lower_reference(value, scope, cursor, reborrow=coercion)
-                return self.declare(source, types, scope, cursor, loan=loan)
+                cursor, loan = self.lower_reference(value, scope, cursor, reborrow=coercion,
+                                                   extend_to=scope)
+                cursor = self.declare(source, types, scope, cursor, loan=loan)
+                if loan and static:
+                    cursor, holder = self.keep_loan(cursor, loan, source.token)
+                    cursor = self.emit(cursor, "static_reference", holder, source.token)
+                if loan and loan.expiring and types:
+                    holder = Place(scope.find(source.token))
+                    cursor = self.emit(cursor, "end_temporaries", holder, source.token)
+                return cursor
             if self.annotation(value) == NEVER and isinstance(annotation, ReferenceType):
                 cursor = self.lower(value, scope, cursor)
                 # Keep an address for type-checked expressions in the dead tail.
@@ -1796,7 +2049,8 @@ class Ownership:
             cursor = self.move_pattern(cursor, moves, source.token)
             return self.declare(source, types, scope, cursor)
         if kind == "match":
-            return self.lower_match(expr, scope, cursor)
+            end, _ = self.lower_match(expr, scope, cursor)
+            return end
         if kind == "discard":
             return self.lower(args[0], scope, cursor)
         if kind == "if":
@@ -1809,7 +2063,7 @@ class Ownership:
             return self.lower_loop(expr, scope, cursor)
         if kind == "return":
             if args[0]:
-                self.lower(args[0], scope, cursor)
+                self.lower_return(args[0], scope, cursor)
             return None
         if kind in {"break", "continue"}:
             target = find_control(self.loops, expr)
@@ -1841,7 +2095,7 @@ class Ownership:
                 cursor = self.lower(value, scope, cursor)
             return cursor
         if kind == "call":
-            cursor = self.lower_call(token, args, scope, cursor)
+            cursor, _ = self.lower_call(token, args, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
         if kind == "print":
             return self.lower_print(token, args, scope, cursor)
@@ -1891,12 +2145,13 @@ class Ownership:
             self.loops.pop()
         return finish
 
-    def lower_match(self, expr, scope, cursor):
+    def lower_match(self, expr, scope, cursor, *, result_type=None, extend_to=None):
         scrutinee, arms = expr.args
         cursor, origin = self.lower_address(scrutinee, scope, cursor)
         if origin is None:
             cursor = self.lower(scrutinee, scope, cursor)
         finishes = []
+        results = []
         prepared = []
         protected = {}
         for source, guard, body in arms:
@@ -1921,14 +2176,22 @@ class Ownership:
             else:
                 cursor = tested
             ready = self.move_pattern(ready, moves, source.token)
-            finishes.append(self.lower(body, inner, ready))
-        return self.join(*finishes)
+            if result_type:
+                end, loan = self.lower_reference(body, inner, ready, extend_to=extend_to)
+                finishes.append(self.leave_reference_scope(end, loan, inner, body.token))
+                if loan:
+                    results.append(loan)
+            else:
+                finishes.append(self.lower(body, inner, ready))
+        loan = self.merge_loans(tuple(results), result_type.mutable) if result_type else None
+        return self.join(*finishes), loan
 
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None):
         action = "declare" if initialized else "uninitialized"
         for name, (_, mutable) in types.items():
             local = Local(Token(name, source.token.line, source.token.column), mutable, loan)
             scope.bindings[name] = local
+            scope.owned.add(local)
             cursor = self.emit(cursor, action, Place(local), source.token)
         return cursor
 
