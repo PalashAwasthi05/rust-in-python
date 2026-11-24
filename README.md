@@ -29,7 +29,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 
 ## What runs
 
-- Functions and recursion
+- Functions and recursion, including destructured function and closure parameters
 - Typed bindings, mutability, and block expressions
 - Conditionals, labeled loops and blocks, integer ranges, and value-producing `break`
 - Named, tuple, and unit structs, plus enums with payloads
@@ -43,7 +43,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
-- Generic functions, structs, and enums with inferred and explicit type arguments
+- Generic functions, structs, and enums with inferred and explicit type arguments, plus argument-position `impl Trait`
 - Type aliases in type positions, including lifetime, type, and const parameters
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
 - User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items

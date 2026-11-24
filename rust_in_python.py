@@ -1171,6 +1171,7 @@ class TypeParameter:
     name: str
     bounds: set = field(default_factory=set)
     const_type: str | None = None
+    anonymous: bool = False
 
     def __str__(self):
         return self.name
@@ -1707,6 +1708,7 @@ class Parser:
         self.constants = modules.constants if modules else {}
         self.current = next(self.tokens)
         self.type_parameters = {}
+        self.argument_parameters = None
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
         if unit:
             self.trait_names.update(unit.trait_imports)
@@ -1769,6 +1771,8 @@ class Parser:
         if token.text == "_":
             return None
         if token.text == "fn":
+            outer = self.argument_parameters
+            self.argument_parameters = None
             self.expect("(")
             arguments = []
             while self.current.text != ")":
@@ -1777,9 +1781,21 @@ class Parser:
                     break
             self.expect(")")
             result = self.type_name(signature=signature) if self.accept("->") else "()"
+            self.argument_parameters = outer
             if static_string and isinstance(result, ReferenceType) and not is_static_str(result):
                 raise token.error("reference-returning function pointer fields are unsupported")
             return FunctionType(tuple(arguments), result)
+        if token.text == "impl":
+            if self.argument_parameters is None and not self.fragment:
+                raise token.error("impl Trait requires a function argument in this position")
+            bounds = self.trait_bounds()
+            if self.fragment:
+                return TypeParameter("impl Trait", bounds, anonymous=True)
+            name = f"@argument:{len(self.argument_parameters)}"
+            parameter = TypeParameter(name, bounds, anonymous=True)
+            self.argument_parameters[name] = parameter
+            self.type_parameters[name] = parameter
+            return parameter
         if token.text == "dyn":
             trait = self.trait_path()
             bindings = []
@@ -1931,24 +1947,25 @@ class Parser:
         outer_parameters = self.type_parameters
         lifetimes, parameters = self.generic_parameters()
         self.type_parameters = outer_parameters | parameters
+        self.argument_parameters = parameters
         self.expect("(")
         params = []
+        pattern_bindings = []
         receiver = False
         while self.current.text != ")":
             if method and not params and self.is_self_parameter():
                 param, mutable, annotation = self.self_parameter(lifetimes)
                 receiver = True
             else:
-                mutable = bool(self.accept("mut"))
-                param = self.accept("_") or self.identifier()
-                if mutable and param.text == "_":
-                    raise param.error("wildcard parameters cannot be mutable")
+                pattern = self.range_pattern()
+                param, mutable = self.parameter_binding(pattern, params, pattern_bindings)
                 self.expect(":")
                 annotation = self.type_name(signature=lifetimes)
             params.append((param, mutable, annotation))
             if not self.accept(","):
                 break
         self.expect(")")
+        self.argument_parameters = None
         result = self.type_name(signature=lifetimes) if self.accept("->") else "()"
         self.sized_receiver = False
         self.where_clause(lifetimes)
@@ -1958,6 +1975,11 @@ class Parser:
         else:
             return_inputs = self.return_inputs(name, params, result, lifetimes)
         body = None if declaration and self.accept(";") else self.block()
+        if pattern_bindings:
+            if body is None:
+                raise pattern_bindings[0].token.error("parameter patterns require a function body")
+            statements, tail = body.args
+            body.args = ([*pattern_bindings, *statements], tail)
         function = Function(name, params, result, body, return_inputs, tuple(self.type_parameters.values()),
                             method_parameters=tuple(parameters.values()) if method else (),
                             lifetimes=lifetimes, self_sized=sized_receiver)
@@ -2686,10 +2708,11 @@ class Parser:
 
     def closure(self, token, opening):
         params = []
+        pattern_bindings = []
         if opening == "|":
             while self.current.text != "|":
-                mutable = bool(self.accept("mut"))
-                name = self.accept("_") or self.identifier()
+                pattern = self.range_pattern()
+                name, mutable = self.parameter_binding(pattern, params, pattern_bindings)
                 annotation = self.type_name() if self.accept(":") else None
                 params.append((name, mutable, annotation))
                 if not self.accept(","):
@@ -2697,7 +2720,21 @@ class Parser:
             self.expect("|")
         result = self.type_name() if self.accept("->") else None
         body = self.block() if result is not None else self.expression()
+        if pattern_bindings:
+            body = Expr("block", body.token, (pattern_bindings, body))
         return Expr("closure", token, (params, result, body, token.text == "move"))
+
+    def parameter_binding(self, pattern, params, pattern_bindings):
+        if pattern.kind == "wild":
+            return pattern.token, False
+        if pattern.kind == "bind" and len(pattern.args) == 1:
+            symbol = self.modules.resolve((pattern.token.text,), self.unit, pattern.token) if self.unit else None
+            if not symbol or symbol.kind != "unit_struct":
+                return pattern.token, pattern.args[0]
+        hidden = replace(pattern.token, text=f"@param:{len(params)}")
+        initializer = Expr("name", hidden)
+        pattern_bindings.append(Expr("parameter_let", pattern.token, (pattern, None, initializer, None)))
+        return hidden, True
 
     @staticmethod
     def literal(token, negative=False):
@@ -3839,7 +3876,7 @@ class Checker:
                     continue
                 bindings = {trait.self_type: impl.target}
                 if (len(required.method_parameters) != len(method.method_parameters)
-                        or any(first.bounds != second.bounds or first.const_type != second.const_type
+                        or any(not self.same_parameter_kind(first, second)
                                for first, second in zip(required.method_parameters, method.method_parameters))):
                     raise method.name.error(f"method {name!r} has incompatible generic parameters")
                 bindings.update(zip(required.method_parameters, method.method_parameters))
@@ -3860,7 +3897,8 @@ class Checker:
     def same_parameter_kind(first, second):
         if isinstance(first, LifetimeArgument) or isinstance(second, LifetimeArgument):
             return isinstance(first, LifetimeArgument) and isinstance(second, LifetimeArgument)
-        return first.const_type == second.const_type and first.bounds == second.bounds
+        return (first.const_type == second.const_type and first.bounds == second.bounds
+                and first.anonymous == second.anonymous)
 
     def effective_function(self, function, types, result):
         if not isinstance(function.result, AssociatedType) or not isinstance(result, ReferenceType):
@@ -3999,11 +4037,13 @@ class Checker:
         check_constant_kind(self.resolve(value), kind, token)
 
     def specialize(self, parameters, explicit, token):
-        if explicit is not None and (not parameters or len(explicit) != len(parameters)):
-            raise token.error(f"{token.text} expects {len(parameters)} type arguments")
+        visible_count = sum(not parameter.anonymous for parameter in parameters)
+        if explicit is not None and (not visible_count or len(explicit) != visible_count):
+            raise token.error(f"{token.text} expects {visible_count} type arguments")
+        explicit_arguments = iter(explicit or ())
         arguments = {}
-        for index, parameter in enumerate(parameters):
-            argument = explicit[index] if explicit is not None else None
+        for parameter in parameters:
+            argument = None if parameter.anonymous else next(explicit_arguments, None)
             if argument is None:
                 argument = TypeVariable(parameter.name, token, parameter.const_type)
                 self.variables.append(argument)
@@ -4433,6 +4473,12 @@ class Checker:
             return replace(pattern, aliases=(alias, *pattern.aliases)), own | nested
         if kind == "pattern_reference":
             mutable, operand = args
+            if isinstance(annotation, TypeVariable):
+                inner = TypeVariable("referent", token)
+                self.variables.append(inner)
+                reference = ReferenceType(inner, mutable)
+                self.require(annotation, reference, token)
+                annotation = reference
             if not isinstance(annotation, ReferenceType) or annotation.mutable != mutable:
                 raise token.error("reference pattern must match the reference's mutability")
             inner, bindings = self.prepare_pattern(operand, annotation.inner)
@@ -4938,8 +4984,10 @@ class Checker:
                 diverges |= self.type_of(statement, inner) == NEVER
             result = self.type_of(tail, inner, expected) if tail else "()"
             return NEVER if diverges else result
-        if kind == "let":
+        if kind in {"let", "parameter_let"}:
             source, annotation, value, otherwise = args
+            parameter = kind == "parameter_let"
+            expr.kind = "let"
             if annotation is not None:
                 annotation = self.fill_holes(annotation, token)
                 self.check_type(annotation, token)
@@ -4961,8 +5009,11 @@ class Checker:
             else:
                 missing = uncovered([(pattern,)], (self.resolve(annotation),), self.program)
                 if missing is not None:
-                    raise token.error(f"refutable let pattern, missing {show_missing(missing[0])}")
+                    position = "parameter" if parameter else "let"
+                    raise token.error(f"refutable {position} pattern, missing {show_missing(missing[0])}")
             for name, (kind, mutable) in bindings.items():
+                if parameter and (name in scope.bindings or name in scope.parent.bindings):
+                    raise token.error(f"duplicate parameter {token.binding(name).text!r}")
                 scope.bindings[name] = Binding(kind, mutable)
             return NEVER if actual == NEVER else "()"
         if kind == "discard":

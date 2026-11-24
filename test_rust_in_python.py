@@ -14,6 +14,48 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("irrefutable function and closure parameters", """
+        struct Pair(i32, i32);
+        struct Marker;
+        struct Data { values: [i32; 3] }
+        fn total(Pair(mut a, b): Pair, Data { values: [c, .., d] }: Data) -> i32 {
+            a += 1;
+            a + b + c + d
+        }
+        fn edit(Pair(ref mut left, _): Pair) -> i32 {
+            *left += 2;
+            *left
+        }
+        fn borrow(Pair(left, _): &Pair) -> &i32 { left }
+        fn marker(Marker: Marker) -> bool { true }
+        fn main() {
+            let p = Pair(5, 6);
+            let add = |(a, b)| a + b;
+            let square = |&x| x * x;
+            println!("{} {} {} {} {} {}", total(Pair(1, 2), Data { values: [3, 4, 5] }),
+                     edit(Pair(0, 1)), borrow(&p), add((1, 8)), square(&4), marker(Marker));
+        }
+    """, "12 2 5 9 16 true\n"),
+    ("argument position impl Trait", """
+        trait Number { fn value(&self) -> i32; }
+        struct Wrapped(i32);
+        impl Number for Wrapped { fn value(&self) -> i32 { self.0 } }
+        impl Number for i32 { fn value(&self) -> i32 { *self } }
+        macro_rules! reader {
+            ($kind:ty) => { fn first(input: [$kind; 1]) -> i32 { input[0].value() } };
+        }
+        reader!(impl Number);
+        fn total<T: Copy>(prefix: T, a: impl Number, b: &impl Number) -> (T, i32) {
+            (prefix, a.value() + b.value())
+        }
+        trait Combine { fn combine(&self, other: impl Number) -> i32; }
+        impl Combine for Wrapped {
+            fn combine(&self, other: impl Number) -> i32 { self.0 + other.value() }
+        }
+        fn main() {
+            println!("{:?} {} {}", total::<u8>(8, Wrapped(3), &4), Wrapped(2).combine(9), first([Wrapped(6)]));
+        }
+    """, "(8, 7) 11 6\n"),
     ("factorial", DEMO, "1! = 1\n2! = 2\n3! = 6\n4! = 24\n5! = 120\n6! = 720\n"),
     ("legacy loops and arithmetic", """
         fn main() {
@@ -1698,6 +1740,24 @@ VALID = [
 ]
 
 INVALID = [
+    ("function parameters must be irrefutable", """
+        fn get(Some(x): Option<i32>) -> i32 { x }
+        fn main() {}
+    """, "refutable parameter pattern"),
+    ("parameter bindings cannot repeat across arguments", """
+        fn get((left, _): (i32, i32), left: i32) -> i32 { left }
+        fn main() {}
+    """, "duplicate parameter 'left'"),
+    ("anonymous impl Trait cannot be supplied explicitly", """
+        fn copy<T: Copy>(first: T, second: impl Copy) {}
+        fn main() { copy::<bool, i32>(true, 3); }
+    """, "expects 1 type arguments"),
+    ("anonymous impl Trait in a trait method is part of its signature", """
+        struct Unit;
+        trait Sink { fn write(&self, v: impl Copy); }
+        impl Sink for Unit { fn write<T: Copy>(&self, v: T) {} }
+        fn main() {}
+    """, "incompatible generic parameters"),
     ("missing variant", """
         enum E { A, B }
         fn main() { match E::A { E::A => () } }
@@ -2624,10 +2684,10 @@ class InterpreterTests(unittest.TestCase):
             formatting.write_text('''
                 fn main() { println!("{:.2}", 1.234f64); }
             ''', encoding="utf-8")
-            unsupported = folder / "parameter_pattern.rs"
+            unsupported = folder / "const_function.rs"
             unsupported.write_text('''
-                fn sum((a, b): (i32, i32)) -> i32 { a + b }
-                fn main() { println!("{}", sum((1, 2))); }
+                const fn sum(a: i32, b: i32) -> i32 { a + b }
+                fn main() { println!("{}", sum(1, 2)); }
             ''', encoding="utf-8")
             panics = folder / "panics.rs"
             panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
