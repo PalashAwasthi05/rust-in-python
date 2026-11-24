@@ -1562,6 +1562,19 @@ class AssociatedType:
 
 
 @dataclass(frozen=True)
+class AssociatedBinding:
+    bound: str
+    item: str
+    arguments: tuple = ()
+
+    def map_arguments(self, transform):
+        return replace(self, arguments=tuple(map(transform, self.arguments)))
+
+    def project(self, owner, trait):
+        return AssociatedType(owner, self.item, trait.name.text, self.arguments)
+
+
+@dataclass(frozen=True)
 class LifetimeArgument:
     name: str
 
@@ -1703,8 +1716,8 @@ def substitute(annotation, arguments, *, defer_const=False):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
     if isinstance(annotation, OpaqueType):
         return replace(annotation, arguments=tuple(substitute(arg, arguments) for arg in annotation.arguments),
-                       bindings=tuple((bound, item, substitute(kind, arguments))
-                                      for bound, item, kind in annotation.bindings))
+                       bindings=tuple((binding.map_arguments(functools.partial(substitute, arguments=arguments)),
+                                       substitute(kind, arguments)) for binding, kind in annotation.bindings))
     if isinstance(annotation, TupleType):
         return TupleType(tuple(substitute(kind, arguments) for kind in annotation.elements))
     if isinstance(annotation, ArrayType):
@@ -1797,11 +1810,12 @@ class Program:
                 if isinstance(owner, OpaqueType):
                     bindings = owner.bindings
                 elif isinstance(owner, TypeParameter):
-                    bindings = ((bound, item, kind) for (bound, item), kind in owner.associated_bindings.items())
+                    bindings = owner.associated_bindings.items()
                 else:
                     bindings = ()
-                for bound, item, kind in bindings:
-                    if item == annotation.item and self.associated_trait(bound, item) is trait:
+                for binding, kind in bindings:
+                    if (binding.item == annotation.item and binding.arguments == annotation.arguments
+                            and self.associated_trait(binding.bound, binding.item) is trait):
                         return self.normalize(kind, (*seen, annotation))
                 if not isinstance(owner, (TypeParameter, TypeVariable)):
                     implementation = self.implementation(owner, trait.name.text)
@@ -1825,8 +1839,8 @@ class Program:
             return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
         if isinstance(annotation, OpaqueType):
             return replace(annotation, arguments=tuple(self.normalize(arg, seen) for arg in annotation.arguments),
-                           bindings=tuple((bound, item, self.normalize(kind, seen))
-                                          for bound, item, kind in annotation.bindings))
+                           bindings=tuple((binding.map_arguments(functools.partial(self.normalize, seen=seen)),
+                                           self.normalize(kind, seen)) for binding, kind in annotation.bindings))
         if isinstance(annotation, TupleType):
             return TupleType(tuple(self.normalize(kind, seen) for kind in annotation.elements))
         if isinstance(annotation, ArrayType):
@@ -1878,11 +1892,11 @@ class Program:
 
     def matches_associated_bounds(self, arguments):
         for parameter, argument in arguments.items():
-            for (bound, item), expected in parameter.associated_bindings.items():
-                trait = self.associated_trait(bound, item)
+            for binding, expected in parameter.associated_bindings.items():
+                trait = self.associated_trait(binding.bound, binding.item)
                 if trait is None:
                     return False
-                actual = self.normalize(AssociatedType(argument, item, trait.name.text))
+                actual = self.normalize(substitute(binding.project(argument, trait), arguments))
                 if actual != self.normalize(substitute(expected, arguments)):
                     return False
         return True
@@ -2270,7 +2284,7 @@ class Parser:
                 bindings = {}
                 bounds = self.trait_bounds(bindings=bindings, signature=lifetimes)
                 result = OpaqueType(name.text, frozenset(bounds), tuple(self.type_parameters.values()),
-                                    tuple((bound, item, kind) for (bound, item), kind in bindings.items()))
+                                    tuple(bindings.items()))
             else:
                 result = self.type_name(signature=lifetimes)
         self.sized_receiver = False
@@ -2541,8 +2555,14 @@ class Parser:
             if bindings is not None and self.accept("<"):
                 while self.current.text != ">":
                     name = self.identifier()
+                    arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
+                    for argument in arguments:
+                        if isinstance(argument, LifetimeArgument) and argument.name not in {"'static", "'_"} and (
+                            signature is None or argument.name not in signature
+                        ):
+                            raise name.error(f"undeclared lifetime {argument.name}")
                     self.expect("=")
-                    key = bound, name.text
+                    key = AssociatedBinding(bound, name.text, arguments)
                     if key in bindings:
                         raise name.error(f"duplicate associated type binding {name.text!r}")
                     bindings[key] = self.type_name(signature=signature)
@@ -4286,17 +4306,31 @@ class Checker:
                 if name not in TRAIT_MODULES and name not in self.program.traits:
                     raise token.error(f"unknown trait {name!r}")
             if isinstance(parameter, TypeParameter):
-                for (bound, item), expected in parameter.associated_bindings.items():
-                    self.check_associated_binding(bound, item, expected, token)
+                for binding, expected in parameter.associated_bindings.items():
+                    self.check_associated_binding(binding, expected, token)
 
-    def check_associated_binding(self, bound, item, expected, token):
-        trait = self.program.associated_trait(bound, item)
+    def check_associated_binding(self, binding, expected, token):
+        trait = self.program.associated_trait(binding.bound, binding.item)
         if trait is None:
-            raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
-        if trait.associated[item].parameters:
-            raise token.error("generic associated type bindings require specialization")
+            raise token.error(f"unknown or ambiguous associated item {binding.item!r} for {binding.bound}")
+        self.check_associated_arguments(trait, binding.item, binding.arguments, token)
         self.check_type(expected, token)
         return trait
+
+    def check_associated_arguments(self, trait, item, arguments, token):
+        parameters = trait.associated[item].parameters
+        if len(parameters) != len(arguments):
+            raise token.error(f"{item} expects {len(parameters)} generic arguments")
+        for parameter, argument in zip(parameters, arguments):
+            if isinstance(parameter, LifetimeArgument):
+                if not isinstance(argument, LifetimeArgument):
+                    raise token.error(f"{item} expects a lifetime argument")
+            elif parameter.const_type:
+                self.check_const(argument, parameter.const_type, token)
+            else:
+                self.check_type(argument, token)
+                for bound in parameter.bounds:
+                    self.obligation(argument, bound, token)
 
     def check_implementations(self):
         for trait in self.program.traits.values():
@@ -4369,9 +4403,13 @@ class Checker:
                     raise method.name.error(f"method {name!r} has incompatible generic parameters")
                 bindings.update(zip(required.method_parameters, method.method_parameters))
                 for declared, provided in zip(required.method_parameters, method.method_parameters):
-                    expected = {key: self.resolve(substitute(kind, bindings))
+                    def substitute_parameter(kind):
+                        return self.resolve(substitute(kind, bindings))
+
+                    expected = {key.map_arguments(substitute_parameter): substitute_parameter(kind)
                                 for key, kind in declared.associated_bindings.items()}
-                    actual = {key: self.resolve(kind) for key, kind in provided.associated_bindings.items()}
+                    actual = {key.map_arguments(self.resolve): self.resolve(kind)
+                              for key, kind in provided.associated_bindings.items()}
                     if actual != expected:
                         raise method.name.error(f"method {name!r} has incompatible associated type bounds")
                 required_types = tuple(self.resolve(substitute(kind, bindings)) for _, _, kind in required.params)
@@ -4421,8 +4459,8 @@ class Checker:
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
         if isinstance(annotation, OpaqueType):
             return replace(annotation, arguments=tuple(self.resolve(arg) for arg in annotation.arguments),
-                           bindings=tuple((bound, item, self.resolve(kind))
-                                          for bound, item, kind in annotation.bindings))
+                           bindings=tuple((binding.map_arguments(self.resolve), self.resolve(kind))
+                                          for binding, kind in annotation.bindings))
         if isinstance(annotation, TupleType):
             return TupleType(tuple(map(self.resolve, annotation.elements)))
         if isinstance(annotation, ArrayType):
@@ -4567,11 +4605,12 @@ class Checker:
 
     def associated_requirements(self, arguments, token):
         for parameter, owner in arguments.items():
-            for (bound, item), expected in parameter.associated_bindings.items():
-                trait = self.program.associated_trait(bound, item)
+            for binding, expected in parameter.associated_bindings.items():
+                trait = self.program.associated_trait(binding.bound, binding.item)
                 if trait is None:
-                    raise token.error(f"unknown or ambiguous associated item {item!r} for {bound}")
-                yield AssociatedType(owner, item, trait.name.text), substitute(expected, arguments), token
+                    raise token.error(f"unknown or ambiguous associated item {binding.item!r} for {binding.bound}")
+                projection = substitute(binding.project(owner, trait), arguments)
+                yield projection, substitute(expected, arguments), token
 
     def solve_associated_equalities(self, requirements):
         pending = list(requirements)
@@ -4753,9 +4792,9 @@ class Checker:
             if (isinstance(witness, ReferenceType) or borrowing_iterator(witness)
                     or isinstance(witness, FunctionType) and witness.closure):
                 raise function.name.error("opaque returns of borrowed values or capturing closures are unsupported")
-            for bound, item, expected in function.result.bindings:
-                trait = self.program.associated_trait(bound, item)
-                projection = AssociatedType(witnesses[name], item, trait.name.text)
+            for binding, expected in function.result.bindings:
+                trait = self.program.associated_trait(binding.bound, binding.item)
+                projection = binding.project(witnesses[name], trait)
                 self.require(projection, expected, function.name)
 
     def resolve_pattern(self, pattern):
@@ -4797,8 +4836,8 @@ class Checker:
             return
         if isinstance(annotation, OpaqueType):
             self.check_bounds((annotation,), token)
-            for bound, item, expected in annotation.bindings:
-                self.check_associated_binding(bound, item, expected, token)
+            for binding, expected in annotation.bindings:
+                self.check_associated_binding(binding, expected, token)
             return
         if isinstance(annotation, FunctionType):
             for kind in annotation.parameters:
@@ -4832,19 +4871,7 @@ class Checker:
             if not trait:
                 raise token.error(f"unknown or ambiguous associated type {annotation}")
             self.obligation(annotation.owner, trait.name.text, token)
-            parameters = trait.associated[annotation.item].parameters
-            if len(parameters) != len(annotation.arguments):
-                raise token.error(f"{annotation.item} expects {len(parameters)} generic arguments")
-            for parameter, argument in zip(parameters, annotation.arguments):
-                if isinstance(parameter, LifetimeArgument):
-                    if not isinstance(argument, LifetimeArgument):
-                        raise token.error(f"{annotation.item} expects a lifetime argument")
-                elif parameter.const_type:
-                    self.check_const(argument, parameter.const_type, token)
-                else:
-                    self.check_type(argument, token)
-                    for bound in parameter.bounds:
-                        self.obligation(argument, bound, token)
+            self.check_associated_arguments(trait, annotation.item, annotation.arguments, token)
             return
         if isinstance(annotation, ReferenceType):
             if isinstance(annotation.inner, ReferenceType) and not is_static_str(annotation.inner):

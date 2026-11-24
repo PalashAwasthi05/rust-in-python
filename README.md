@@ -58,7 +58,8 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Iterator `collect` into `Vec` and `String`, plus `count` and checked integer `sum`
 - Declarative `macro_rules!` with multiple arms, fragment forwarding, repetitions, and matcher follow-set checks
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
-- Generic associated types and const expressions evaluated at specialization
+- Generic associated types with equality constraints on specific type, const, or lifetime arguments
+- Const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros

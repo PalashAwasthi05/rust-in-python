@@ -14,6 +14,35 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("const generic associated bindings normalize exact specializations", """
+        trait Read {
+            type Item<const N: usize>;
+            fn read<const N: usize>(&self) -> Self::Item<N>;
+        }
+        struct Packet(u8);
+        impl Read for Packet {
+            type Item<const N: usize> = [u8; N];
+            fn read<const N: usize>(&self) -> [u8; N] { [self.0; N] }
+        }
+        fn get<const N: usize>(source: impl Read<Item<N> = [u8; N]>) -> [u8; N] {
+            source.read::<N>()
+        }
+        fn packet(n: u8) -> impl Read<Item<2> = [u8; 2], Item<3> = [u8; 3]> { Packet(n) }
+        fn main() {
+            let source = packet(4);
+            println!("{:?} {:?} {:?}", get::<1>(Packet(9)), source.read::<2>(), source.read::<3>());
+        }
+    """, "[9] [4, 4] [4, 4, 4]\n"),
+    ("generic associated bindings accept type and lifetime arguments", """
+        trait Tagged { type Value<T>; type Word<'a>; }
+        struct Source;
+        impl Tagged for Source {
+            type Value<T> = [T; 1];
+            type Word<'a> = u8;
+        }
+        fn validate(_: impl Tagged<Value<u16> = [u16; 1], Word<'static> = u8>) {}
+        fn main() { validate(Source); }
+    """, ""),
     ("associated type constraints infer generic results and select blanket implementations", """
         trait Read { type Item; fn read(&self) -> Self::Item; }
         struct Packet<T: Copy>(T);
@@ -1948,6 +1977,19 @@ VALID = [
 ]
 
 INVALID = [
+    ("generic associated equality applies only to the named specialization", """
+        trait Read {
+            type Item<const N: usize>;
+            fn read<const N: usize>(&self) -> Self::Item<N>;
+        }
+        fn get(source: impl Read<Item<2> = u8>) -> u8 { source.read::<3>() }
+        fn main() {}
+    """, "expected u8, found .*::Item<3>"),
+    ("associated const arguments use the declared type", """
+        trait Read { type Item<const N: usize>; }
+        fn check(_: impl Read<Item<true> = u8>) {}
+        fn main() {}
+    """, "expected a usize constant"),
     ("argument position impl trait enforces associated equality", """
         trait Read { type Item; }
         struct Source;
