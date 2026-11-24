@@ -307,7 +307,7 @@ class MacroExpander:
                 expanded = self.invoke(item, rules, items[argument].items, (definition, self.steps))
                 index = argument + 1
                 result.extend(self.expand(expanded, macros, depth + 1))
-                if (expanded and tree_text(expanded[0]) in {"#", "fn", "struct", "enum", "trait", "impl"}
+                if (expanded and tree_text(expanded[0]) in {"#", "pub", "fn", "struct", "enum", "trait", "impl", "type", "const"}
                         and index < len(items) and tree_text(items[index]) == ";"):
                     index += 1
                 continue
@@ -544,7 +544,7 @@ class ModuleUnit:
     symbols: dict = field(default_factory=dict)
     imports: list = field(default_factory=list)
     aliases: dict = field(default_factory=dict)
-    constants: list = field(default_factory=list)
+    declarations: list = field(default_factory=list)
     trait_imports: dict = field(default_factory=dict)
     glob_aliases: dict = field(default_factory=dict)
     hidden_traits: set = field(default_factory=set)
@@ -558,6 +558,8 @@ class Modules:
         self.exported = {}
         self.macro_paths = {}
         self.constants = {}
+        self.type_aliases = {}
+        self.alias_names = set()
         root.items = self.scan(root, trees)
 
     def register(self, unit, token, kind, boundary):
@@ -586,7 +588,7 @@ class Modules:
             if angles == 0:
                 if word == ";":
                     return position + 1
-                if kind not in {"const", "use"} and isinstance(item, TokenGroup) and word == "{":
+                if kind not in {"const", "type", "use"} and isinstance(item, TokenGroup) and word == "{":
                     return position + 1
         return len(items)
 
@@ -657,7 +659,7 @@ class Modules:
                 unit.imports.extend(self.import_tree(items[index + 1:end - 1], (), boundary))
                 index = end
                 continue
-            if word in {"fn", "struct", "enum", "trait", "const", "impl", "macro_rules"}:
+            if word in {"fn", "struct", "enum", "trait", "const", "type", "impl", "macro_rules"}:
                 end = self.item_end(items, index, word)
                 if word not in {"impl", "macro_rules"} and index + 1 < len(items):
                     name = items[index + 1]
@@ -669,8 +671,8 @@ class Modules:
                         original = unit.symbols.get(name.text)
                         if not expanded or not original or original.token is not name:
                             self.register(unit, name, kind, boundary)
-                if word == "const":
-                    unit.constants.append(items[index:end])
+                if word == "const" or (word == "type" and expanded):
+                    unit.declarations.append(items[index:end])
                 else:
                     if export and word == "macro_rules":
                         name, body = items[index + 2:index + 4]
@@ -978,10 +980,12 @@ class Modules:
             unit.items = self.scan(unit, expanded, expanded=True)
             pending.extend(path for path in self.units if path not in visited)
         self.link_imports()
-        self.read_constants()
+        self.alias_names = {symbol.name for unit in self.units.values()
+                            for symbol in unit.symbols.values() if symbol.kind == "type"}
+        self.read_declarations()
 
-    def read_constants(self):
-        pending = [(unit, segment) for unit in self.units.values() for segment in unit.constants]
+    def read_declarations(self):
+        pending = [(unit, segment) for unit in self.units.values() for segment in unit.declarations]
         while pending:
             remaining = []
             for unit, segment in pending:
@@ -989,8 +993,12 @@ class Modules:
                 parser = Parser("", tokens=(*flatten_trees(segment), replace(last, text="")),
                                 modules=self, unit=unit)
                 try:
-                    parser.expect("const")
-                    parser.constant_item()
+                    if parser.accept("const"):
+                        parser.constant_item()
+                    else:
+                        parser.expect("type")
+                        alias = parser.type_alias()
+                        self.type_aliases[alias.name.text] = alias
                 except RustError as error:
                     remaining.append((unit, segment, error))
             if len(remaining) == len(pending):
@@ -1142,6 +1150,23 @@ def const_kind(value):
     return value.const_type if isinstance(value, (TypeParameter, TypeVariable)) else value.kind
 
 
+def check_constant_kind(value, kind, token):
+    if isinstance(value, (TypeParameter, TypeVariable)) and value.const_type == kind:
+        return
+    if isinstance(value, ConstExpression) and value.kind == kind:
+        return
+    if not isinstance(value, ConstValue) or (value.kind and value.kind != kind):
+        raise token.error(f"expected a {kind} constant")
+    if kind == "bool" and value.boolean:
+        return
+    if kind == "char" and isinstance(value.value, Character):
+        return
+    if kind in INTEGER_TYPES and type(value.value) is int:
+        checked(value.value, token, kind)
+        return
+    raise token.error(f"expected a {kind} constant")
+
+
 def fold_const(expression):
     if not all(isinstance(value, ConstValue) for value in expression.operands):
         return expression
@@ -1230,6 +1255,32 @@ class AssociatedDeclaration:
 class AssociatedDefinition:
     parameters: tuple
     body: object
+
+
+@dataclass(frozen=True)
+class TypeAlias:
+    name: Token
+    lifetimes: tuple
+    parameters: tuple
+    target: object
+
+    def specialize(self, arguments, token):
+        supplied_lifetimes = tuple(arg for arg in arguments if isinstance(arg, LifetimeArgument))
+        if arguments[:len(supplied_lifetimes)] != supplied_lifetimes:
+            raise token.error("lifetime arguments must precede type and const arguments")
+        if supplied_lifetimes and len(supplied_lifetimes) != len(self.lifetimes):
+            raise token.error(f"{self.name.text} expects {len(self.lifetimes)} lifetime arguments")
+        types = arguments[len(supplied_lifetimes):]
+        if len(types) != len(self.parameters):
+            raise token.error(f"{self.name.text} expects {len(self.parameters)} type or const arguments")
+        for parameter, arg in zip(self.parameters, types):
+            if parameter.const_type:
+                check_constant_kind(arg, parameter.const_type, token)
+            elif isinstance(arg, (ConstValue, ConstExpression)) or getattr(arg, "const_type", None):
+                raise token.error("expected a type argument, found a constant")
+        if not supplied_lifetimes:
+            supplied_lifetimes = (LifetimeArgument("'_"),) * len(self.lifetimes)
+        return substitute(self.target, dict(zip((*self.lifetimes, *self.parameters), (*supplied_lifetimes, *types))))
 
 
 @dataclass(frozen=True)
@@ -1342,6 +1393,7 @@ def substitute(annotation, arguments):
 class Program:
     functions: dict = field(default_factory=dict)
     types: dict = field(default_factory=dict)
+    type_aliases: dict = field(default_factory=dict)
     constructors: dict = field(default_factory=dict)
     patterns: dict = field(default_factory=dict)
     expr_types: dict = field(default_factory=dict)
@@ -1698,9 +1750,21 @@ class Parser:
             while self.accept("::"):
                 parts.append(self.advance().text if self.current.text == "super" else self.identifier().text)
             name = self.qualified_token(token, parts, type_name=True).text
-            if self.accept("<"):
-                return AppliedType(name, self.type_arguments())
-            return name
+            is_alias = self.modules and name in self.modules.alias_names
+            arguments = self.type_arguments(lifetimes=is_alias) if self.accept("<") else None
+            if is_alias:
+                alias = self.modules.type_aliases.get(name)
+                if alias is None:
+                    raise token.error(f"cyclic or unresolved type alias {name!r}")
+                target = alias.specialize(arguments or (), token)
+                if isinstance(target, ReferenceType):
+                    if static_string:
+                        raise token.error("references in fields are unsupported")
+                    if (target.lifetime and target.lifetime != "'static"
+                            and (signature is None or target.lifetime not in signature)):
+                        raise token.error(f"undeclared or unsupported lifetime {target.lifetime}")
+                return target
+            return AppliedType(name, arguments) if arguments is not None else name
         raise token.error(f"unsupported type {token.text!r}")
 
     def associated_projection(self, owner, trait=None):
@@ -1812,6 +1876,20 @@ class Parser:
             checked(value.value, name, annotation)
         self.expect(";")
         self.constants[name.text] = ConstValue(value.value, annotation)
+
+    def type_alias(self):
+        name = self.declare_token(self.identifier())
+        if name.text in PRIMITIVES:
+            raise name.error(f"duplicate type {name.text!r}")
+        lifetimes, parameters = self.generic_parameters()
+        self.type_parameters = parameters
+        self.where_clause(lifetimes)
+        self.expect("=")
+        target = self.type_name(signature=lifetimes, output=True)
+        if isinstance(target, ReferenceType) and target.lifetime is None:
+            raise name.error("a reference type alias requires an explicit lifetime")
+        self.expect(";")
+        return TypeAlias(name, tuple(map(LifetimeArgument, lifetimes)), tuple(parameters.values()), target)
 
     def peek(self, offset=0):
         while len(self.lookahead) <= offset:
@@ -1968,10 +2046,11 @@ class Parser:
                 if name.text in types:
                     raise name.error(f"duplicate generic parameter {name.text}")
                 self.expect(":")
-                kind = self.advance()
-                if kind.text not in CONST_TYPES:
-                    raise kind.error("unsupported const parameter type")
-                types[name.text] = TypeParameter(name.text, const_type=kind.text)
+                token = self.current
+                kind = self.type_name()
+                if kind not in CONST_TYPES:
+                    raise token.error("unsupported const parameter type")
+                types[name.text] = TypeParameter(name.text, const_type=kind)
             elif IDENT.fullmatch(token.text) and token.text not in RESERVED:
                 if token.text in types:
                     raise token.error(f"duplicate type parameter {token.text}")
@@ -3366,6 +3445,16 @@ class Checker:
         self.indirect_calls = []
 
     def check(self):
+        for alias in self.program.type_aliases.values():
+            target, token = alias.target, alias.name
+            self.check_bounds(alias.parameters, token)
+            if isinstance(target, (SliceType, DynType)):
+                self.check_type(ReferenceType(target, False), token)
+            else:
+                self.check_type(target, token)
+            for parameter in alias.parameters:
+                if not parameter.const_type and substitute(target, {parameter: object()}) == target:
+                    raise token.error(f"unused type parameter {parameter}")
         finished = set()
         for name, (token, _) in self.program.types.items():
             self.check_bounds(self.program.type_parameters[name], token)
@@ -3623,23 +3712,7 @@ class Checker:
             raise token.error("expected a type argument, found a constant")
 
     def check_const(self, value, kind, token):
-        value = self.resolve(value)
-        if isinstance(value, (TypeParameter, TypeVariable)) and value.const_type == kind:
-            return
-        if isinstance(value, ConstExpression) and value.kind == kind:
-            return
-        if not isinstance(value, ConstValue) or (value.kind and value.kind != kind):
-            raise token.error(f"expected a {kind} constant")
-        if kind == "bool":
-            if not value.boolean:
-                raise token.error("expected a bool constant")
-        elif kind == "char":
-            if not isinstance(value.value, Character):
-                raise token.error("expected a char constant")
-        elif type(value.value) is not int:
-            raise token.error(f"expected a {kind} constant")
-        else:
-            checked(value.value, token, kind)
+        check_constant_kind(self.resolve(value), kind, token)
 
     def specialize(self, parameters, explicit, token):
         if explicit is not None and (not parameters or len(explicit) != len(parameters)):
@@ -6583,7 +6656,7 @@ def compile_program(source, *, proc_extern=(), source_path=None):
     trees, end = token_trees(lex(source))
     modules = Modules(trees, source_path)
     modules.expand()
-    program = Program()
+    program = Program(type_aliases=modules.type_aliases)
     program.add_prelude()
     for unit in modules.units.values():
         Parser("", tokens=(*flatten_trees(unit.items), end), modules=modules, unit=unit).parse(program)

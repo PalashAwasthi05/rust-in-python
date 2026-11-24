@@ -1288,6 +1288,45 @@ VALID = [
         }
         fn main() { println!("{:?}", packet::<6>()); }
     """, "[0, 0, 0]\n"),
+    ("forward and imported type aliases preserve generics and lifetimes", """
+        type Output<T> = shapes::Pair<T>;
+        type Borrowed<'a, T> = &'a T;
+        type Static<T> = Borrowed<'static, T>;
+        type Callback<T> = fn(T) -> T;
+        type Bytes = [u8];
+        mod shapes {
+            pub type Pair<T> = (T, [u8; SIZE]);
+            pub const SIZE: Width = 3;
+            pub type Width = usize;
+        }
+        macro_rules! describe { () => { type Numeric = i64; }; }
+        describe!();
+        use shapes::Width as Count;
+        fn transform(value: u8) -> u8 { value + 1 }
+        fn pass<'a>(value: Borrowed<'a, u8>) -> Borrowed<'a, u8> { value }
+        fn promoted() -> Static<u8> { &8 }
+        fn pass_elided(value: Borrowed<u8>) -> Borrowed<u8> { value }
+        fn total<const N: Count>() -> Count { N }
+        fn length(data: &Bytes) -> usize { data.len() }
+        fn main() {
+            let result: Output<_> = (true, [1, 2, 3]);
+            let call: Callback<u8> = transform;
+            let integer: Numeric = 10;
+            println!("{result:?} {} {} {} {}", call(*pass(&3)), promoted(), pass_elided(&7), length(&result.1));
+            println!("{} {integer}", total::<3>());
+        }
+    """, "(true, [1, 2, 3]) 4 8 7 3\n3 10\n"),
+    ("aliases work inside aggregate fields and trait impl targets", """
+        type Array<const N: usize> = [u8; N];
+        type Payload<T> = (T,);
+        trait Score { fn score(&self) -> u8; }
+        impl Score for Array<3> { fn score(&self) -> u8 { self[1] } }
+        struct Packet<T> { value: Payload<T> }
+        fn main() {
+            let packet: Packet<Array<3>> = Packet { value: ([8, 9, 10],) };
+            println!("{}", packet.value.0.score());
+        }
+    """, "9\n"),
 ]
 
 INVALID = [
@@ -1876,6 +1915,23 @@ INVALID = [
     ("shift counts must be integers", """
         fn main() { let _ = 2u8 << false; }
     """, "expected an integer, found bool"),
+    ("cyclic type aliases are rejected", """
+        type One = Two;
+        type Two = One;
+        fn main() {}
+    """, "cyclic or unresolved type alias"),
+    ("reference aliases require a lifetime in their definition", """
+        type Ref = &i32;
+        fn main() {}
+    """, "reference type alias requires an explicit lifetime"),
+    ("alias const arguments are checked before expansion", """
+        type Bytes<const N: usize> = [u8; 2];
+        fn main() { let _: Bytes<true> = [1, 2]; }
+    """, "expected a usize constant"),
+    ("alias type parameters must be used", """
+        type Missing<T> = bool;
+        fn main() {}
+    """, "unused type parameter T"),
 ]
 
 
