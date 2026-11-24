@@ -1,0 +1,26 @@
+0
+["ann", "bob", "cy"] -> ["ANN", "BOB", "CY"]
+[3, 3, 2]
+[0, 1, 4, 9, 16, 25]
+["cell0", "cell1", "cell2", "cell3"]
+[[0, 1, 2], [10, 11, 12]]
+[Slot { name: "", items: [] }, Slot { name: "middle", items: [5] }, Slot { name: "last", items: [1, 2] }]
+Slot {
+    name: "last",
+    items: [
+        1,
+        2,
+    ],
+}
+[[], [], []] 3
+Some("x") [None, None, None, Some("y")]
+["y"]
+2
+[[], []]
+one/two/three/
+["alpha!", "beta!"]
+[1, 2, 3]
+["a", "b", "c"]
+["c", "b", "a"]
+"b" ["c", "", "a"]
+c ["new", "", "a"]

@@ -1,0 +1,21 @@
+0
+6
+70
+0
+9.25
+z
+[4, 3, 2, 1]
+["b", "a"]
+12
+#....
+..#..
+....#
+area 15 count 3
+true
+Grid { cells: [[0, 0], [0, 0]] }
+pushed 10
+pushed 20
+pushed 30
+full, rejected 40
+full, rejected 50
+[10, 20, 30]

@@ -1,0 +1,26 @@
+0
+[1, 2, 3, 6, 7, 8, 9]
+[9, 8, 7, 6, 3, 2, 1]
+[3, 6, 9, 1, 7, 2, 8]
+[1, 2, 3, 6, 7, 8, 9] sorted=true
+Ok(4) Err(3)
+Some(3)
+Some(8)
+Some(9)
+[-1.0, 0.0, 2.5, 3.2]
+[3.2, 2.5, 0.0, -1.0]
+["apple", "banana", "fig", "kiwi", "pear"]
+["fig", "pear", "kiwi", "apple", "banana"]
+["pear", "kiwi", "fig", "apple", "banana"]
+[Card { rank: 2, suit: 's' }, Card { rank: 10, suit: 'c' }, Card { rank: 10, suit: 'h' }, Card { rank: 14, suit: 'd' }]
+2s 10h 14d 10c 
+Some(Card { rank: 14, suit: 'd' })
+true
+[[1, 2, 3], [7, 8, 9], [4, 5, 6]]
+[[7, 8, 9], [4, 5, 6], [1, 2, 3]]
+[[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+['b', 'c', 'a', 'd']
+abcd
+[1, 3, 3, 5, 5] [1, 3, 5]
+Some(1)
+select: 7
