@@ -85,6 +85,9 @@ pub mod intrinsics {
     pub fn set_range<S, B, R>(set: &S, range: B) -> R;
     pub fn lazy_elements<C, R>(items: C) -> R;
     pub fn duration_debug(nanos: u128, f: &mut crate::fmt::Formatter) -> crate::fmt::Result;
+    pub fn debug_entry(value: &dyn crate::fmt::Debug, f: &crate::fmt::Formatter) -> String;
+    pub fn arguments_text<A>(value: A) -> String;
+    pub fn kind_fmt<T>(value: &T, f: &mut crate::fmt::Formatter, kind: char) -> crate::fmt::Result;
     pub fn hash_value<T>(value: &T) -> u64;
     pub fn track_drops();
     pub fn box_unsized<T, U: ?Sized>(value: T) -> Box<U>;
@@ -1063,6 +1066,7 @@ pub mod fmt {
         align: u8,
         sign_plus: bool,
         sign_aware_zero_pad: bool,
+        debug_hex: u8,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1102,8 +1106,8 @@ pub mod fmt {
             self.buf.push_str(data);
             Ok(())
         }
-        pub fn write_fmt(&mut self, text: String) -> Result {
-            self.buf.push_str(&text);
+        pub fn write_fmt<A>(&mut self, text: A) -> Result {
+            self.buf.push_str(&crate::intrinsics::arguments_text(text));
             Ok(())
         }
         pub fn write_char(&mut self, c: char) -> Result {
@@ -1143,13 +1147,13 @@ pub mod fmt {
     }
     impl<'a> DebugMap<'a> {
         pub fn entry(&mut self, key: &dyn Debug, value: &dyn Debug) -> &mut DebugMap<'a> {
-            let key = format!("{:?}", key);
+            let key = crate::intrinsics::debug_entry(key, self.inner.fmt);
             self.inner.item(Some(&key), value);
             self
         }
         pub fn entries<K: Debug, V: Debug, I: IntoIterator<Item = (K, V)>>(&mut self, entries: I) -> &mut DebugMap<'a> {
             for (key, value) in entries {
-                let key = format!("{:?}", key);
+                let key = crate::intrinsics::debug_entry(&key, self.inner.fmt);
                 self.inner.item(Some(&key), &value);
             }
             self
@@ -1161,7 +1165,8 @@ pub mod fmt {
         fn item(&mut self, name: Option<&str>, value: &dyn Debug) {
             let alternate = self.fmt.alternate;
             let named = self.closer == '}';
-            let text = if alternate { format!("{:#?}", value).replace("\n", "\n    ") } else { format!("{:?}", value) };
+            let text = crate::intrinsics::debug_entry(value, self.fmt);
+            let text = if alternate { text.replace("\n", "\n    ") } else { text };
             if alternate {
                 if self.fields == 0 {
                     self.fmt.buf.push_str(if named { " {\n" } else if self.closer == ')' { "(\n" } else { "\n" });
@@ -1215,8 +1220,8 @@ pub mod fmt {
             text.push(c);
             self.write_str(&text)
         }
-        fn write_fmt(&mut self, text: String) -> Result {
-            self.write_str(&text)
+        fn write_fmt<A>(&mut self, text: A) -> Result {
+            self.write_str(&crate::intrinsics::arguments_text(text))
         }
     }
 
@@ -1226,6 +1231,43 @@ pub mod fmt {
             Ok(())
         }
     }
+
+    // What format_args! builds: the formatted text, written verbatim by both Display and Debug.
+    #[derive(Clone)]
+    pub struct Arguments<'a> { text: String, life: crate::marker::PhantomData<&'a str> }
+    impl<'a> Arguments<'a> {
+        pub fn from_text(text: String) -> Arguments<'a> { Arguments { text, life: crate::marker::PhantomData } }
+    }
+    impl<'a> Display for Arguments<'a> {
+        fn fmt(&self, f: &mut Formatter) -> Result { f.write_str(&self.text) }
+    }
+    impl<'a> Debug for Arguments<'a> {
+        fn fmt(&self, f: &mut Formatter) -> Result { f.write_str(&self.text) }
+    }
+
+    pub trait LowerHex { fn fmt(&self, f: &mut Formatter) -> Result; }
+    pub trait UpperHex { fn fmt(&self, f: &mut Formatter) -> Result; }
+    pub trait Octal { fn fmt(&self, f: &mut Formatter) -> Result; }
+    pub trait Binary { fn fmt(&self, f: &mut Formatter) -> Result; }
+    pub trait LowerExp { fn fmt(&self, f: &mut Formatter) -> Result; }
+    pub trait UpperExp { fn fmt(&self, f: &mut Formatter) -> Result; }
+
+    macro_rules! integer_format_impls {
+        ($($t:ident)*) => { $(
+            impl LowerHex for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'x') } }
+            impl UpperHex for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'X') } }
+            impl Octal for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'o') } }
+            impl Binary for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'b') } }
+        )* };
+    }
+    integer_format_impls! { i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize }
+    macro_rules! exponent_format_impls {
+        ($($t:ident)*) => { $(
+            impl LowerExp for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'e') } }
+            impl UpperExp for $t { fn fmt(&self, f: &mut Formatter) -> Result { crate::intrinsics::kind_fmt(self, f, 'E') } }
+        )* };
+    }
+    exponent_format_impls! { i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 }
 }
 
 pub mod clone {
@@ -1336,16 +1378,16 @@ pub mod ops {
     }
 
     impl<Idx: fmt::Debug> fmt::Debug for Range<Idx> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..{:?}", self.start, self.end) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.start, f)?; f.write_str("..")?; fmt::Debug::fmt(&self.end, f) }
     }
     impl<Idx: fmt::Debug> fmt::Debug for RangeInclusive<Idx> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..={:?}", self.start, self.end) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.start, f)?; f.write_str("..=")?; fmt::Debug::fmt(&self.end, f) }
     }
     impl<Idx: fmt::Debug> fmt::Debug for RangeFrom<Idx> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}..", self.start) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.start, f)?; f.write_str("..") }
     }
     impl<Idx: fmt::Debug> fmt::Debug for RangeTo<Idx> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "..{:?}", self.end) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("..")?; fmt::Debug::fmt(&self.end, f) }
     }
     impl fmt::Debug for RangeFull {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "..") }
@@ -1502,6 +1544,7 @@ pub mod str {
         pub fn parse<F: FromStr>(&self) -> Result<F, F::Err> { F::from_str(self) }
         pub fn escape_default(&self) -> String;
         pub fn escape_debug(&self) -> String;
+        pub fn escape_unicode(&self) -> String;
     }
 }
 
@@ -1576,6 +1619,9 @@ pub mod char {
         pub fn len_utf8(self) -> usize;
         pub fn from_u32(i: u32) -> Option<char>;
         pub fn from_digit(num: u32, radix: u32) -> Option<char>;
+        pub fn escape_default(self) -> String;
+        pub fn escape_debug(self) -> String;
+        pub fn escape_unicode(self) -> String;
     }
 }
 
@@ -1943,7 +1989,7 @@ pub mod collections {
         fn into_iter(self) -> Lazy<&T> { crate::intrinsics::lazy_elements(&self.items) }
     }
     impl<T: fmt::Debug> fmt::Debug for VecDeque<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.items) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.items, f) }
     }
     impl<T> From<Vec<T>> for VecDeque<T> {
         fn from(items: Vec<T>) -> VecDeque<T> { VecDeque { items: items } }
@@ -2016,7 +2062,7 @@ pub mod collections {
         fn into_iter(self) -> Lazy<T> { crate::intrinsics::lazy_elements(self.items) }
     }
     impl<T: fmt::Debug> fmt::Debug for BinaryHeap<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{:?}", self.items) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&self.items, f) }
     }
 }
 
@@ -2291,7 +2337,7 @@ pub mod cell {
         }
     }
     impl<T: fmt::Debug> fmt::Debug for RefCell<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "RefCell {{ value: {:?} }}", self.value) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.debug_struct("RefCell").field("value", &self.value).finish() }
     }
 
     impl<T> Cell<T> {
@@ -2312,7 +2358,7 @@ pub mod cell {
         }
     }
     impl<T: fmt::Debug + Copy> fmt::Debug for Cell<T> {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "Cell {{ value: {:?} }}", self.value) }
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.debug_struct("Cell").field("value", &self.value).finish() }
     }
 
     #[derive(Debug)]
@@ -2430,7 +2476,7 @@ pub mod io {
 
     pub trait Write {
         fn write_str_out(&mut self, text: &str);
-        fn write_fmt(&mut self, text: String) -> Result<()> { self.write_str_out(&text); Ok(()) }
+        fn write_fmt<A>(&mut self, text: A) -> Result<()> { self.write_str_out(&crate::intrinsics::arguments_text(text)); Ok(()) }
         fn write_all(&mut self, data: &[u8]) -> Result<()> {
             self.write_str_out(&String::from_utf8_lossy(data));
             Ok(())

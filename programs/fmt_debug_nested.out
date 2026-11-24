@@ -1,0 +1,33 @@
+0
+Unit
+Pair(1, "one")
+Empty
+Point { x: 1.0, y: -2.5 }
+Circle { center: Point { x: 0.0, y: 0.0 }, radius: 1.5 }
+Square(2.0)
+Nothing
+Wrapper(Wrapper([Some(1), None]))
+[[1, 2], [], [3]]
+(1, "two", 3.0, '4', true, ())
+(5,)
+((1, 2), [3, 4], ([5],))
+Some(None)
+Err("bad")
+Ok(())
+{"only": [1, 2]}
+{1: "a", 2: "b", 3: "c"}
+{'e', 'h', 'l', 'o'}
+{42}
+[1, 2, 3]
+[] {}
+[1, 2]
+[[0, 0, 0], [0, 0, 0]]
+[1.5, 2.0]
+"hi" hi
+Point { x: 3.0, y: 4.0 }
+5
+RefCell { value: [1] }
+Cell { value: 2 }
+'a'..'e'
+1..=5
+["a", "b", "c"]
