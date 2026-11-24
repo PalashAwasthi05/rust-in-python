@@ -1,0 +1,29 @@
+0
+[1, 2, 3, 4, 5] [5, 4, 3, 2, 1]
+len 10
+Some(0) Some(9) Some(8) len now 7
+size_hint (7, Some(7))
+[(0, 4), (1, 3), (2, -1)]
+last three reversed: [19, 18, 17]
+squares reversed: [16, 9, 4, 1]
+largest even: Some(8)
+rposition: Some(8)
+[(0, 3), (1, 2), (2, 1), (3, 0)]
+countdown [5, 4, 3, 2, 1]
+countdown hint (0, None)
+empty len 0 is zero true
+lazy rev take(2):
+  back yields 99
+  back yields 98
+got [99, 98]
+rev of map:
+  back yields 2
+first from back Some(20)
+  front yields 0
+next_back on rev Some(0)
+  back yields 7
+  back yields 6
+  back yields 5
+rfold 765
+  back yields 8
+rfind Some(8)

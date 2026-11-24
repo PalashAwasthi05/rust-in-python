@@ -1,0 +1,14 @@
+0
+[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+sum of primes below 100: 1060
+twin primes: [(3, 5), (5, 7), (11, 13), (17, 19), (29, 31), (41, 43)]
+200th prime: 1223
+[2, 3, 5] then [7, 11, 13]; cached 6
+doubled: [6, 12, 18, 24, 30, 36, 42]
+original state still: Counter { count: 0, step: 3, limit: 20 }
+total: 18
+10! = 3628800
+3 6 9 12 | after: None
+true true Some(20)
+folded: [2,4,6,8]
+closest distance to 17: Some(2)

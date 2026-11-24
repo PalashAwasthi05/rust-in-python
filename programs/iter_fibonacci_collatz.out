@@ -1,0 +1,17 @@
+0
+first 12: [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
+even fib sum below 4M: 4613732
+first fib >= 1000: 1597
+index of first fib > 10000: 21
+collatz(6): 6 -> 3 -> 10 -> 5 -> 16 -> 8 -> 4 -> 2 -> 1
+longest chain under 30: 27 with 112 steps
+peak of collatz(27): 9232
+consecutive pairs: [(0, 1), (1, 1), (1, 2), (2, 3), (3, 5)]
+ratios: ["1.617978", "1.618056", "1.618026"]
+nth(3) = Some(2), then Some(3)
+odd values in collatz(7): 6
+last of collatz(9): Some((19, 1))
+fib[0] = 0
+fib[5] = 5
+fib[10] = 55
+fib[15] = 610

@@ -1,0 +1,17 @@
+0
+[Num(3.0), Op('+'), Ident("foo_1"), Op('*'), LParen, Num(2.5), Op('-'), Ident("x"), RParen]
+1 + 2 * 3 = 7
+(1 + 2) * 3 = 9
+2 ^ 3 ^ 2 = 512
+-4 + 10 / 4 = -1.5
+two * pi = 6.28318
+8 / (3 - 3) -> error: division by zero
+1 + bogus -> error: unknown name bogus
+(1 + 2 -> error: expected ), got None
+1 2 -> error: trailing Num(2.0)
+[('a', 3), ('b', 1), ('c', 2), ('d', 4)]
+[[1, 2, 3], [10, 11], [20]]
+peeked 1
+peek Some(1)
+peek again Some(1)
+rest [1, 2, 3]

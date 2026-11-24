@@ -1,0 +1,19 @@
+0
+it    3
+of    3
+the   3
+was   3
+times 2
+#1 dan 0.900
+#2 amy 0.714
+#3 zoe 0.714
+#4 bob 0.500
+#5 cal 0.000
+["wisdom", "times", "worst", "best", "age", "the"]
+[(3, 'c'), (3, 'a'), (2, 'b'), (1, 'z'), (1, 'y')]
+[0, -3, 4, 7, -8, 10]
+most wins: dan
+fewest wins: cal
+[(9, ["dan"]), (7, ["bob"]), (5, ["amy", "zoe"]), (0, ["cal"])]
+ranked sorted: true
+Less

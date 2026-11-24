@@ -5,7 +5,7 @@ pub mod prelude {
     pub use crate::iter::Iterator;
     pub use crate::iter::IntoIterator;
     pub use crate::iter::Extend;
-    pub use crate::iter::FromIterator;
+    pub use crate::iter::{DoubleEndedIterator, ExactSizeIterator, FromIterator};
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
@@ -106,6 +106,13 @@ pub mod intrinsics {
     pub fn lazy_range<C, B, R>(items: C, range: B) -> R;
     pub fn parse_float<T>(text: &str) -> Result<T, crate::num::ParseFloatError>;
     pub fn lazy_next<T>(iter: &mut crate::iter::Lazy<T>) -> Option<T>;
+    pub fn extend_builtin<C: ?Sized, I>(collection: &mut C, iter: I);
+    pub fn iter_size_hint<I: ?Sized>(iter: &I) -> (usize, Option<usize>);
+    pub fn double_ended<I: ?Sized>(iter: &I) -> bool;
+    pub fn next_back<I: crate::iter::Iterator + ?Sized>(iter: &mut I) -> Option<I::Item>;
+    pub fn range_count<R>(range: &R) -> usize;
+    pub fn range_next_back<A>(range: &mut crate::ops::Range<A>) -> Option<A>;
+    pub fn range_inclusive_next_back<A>(range: &mut crate::ops::RangeInclusive<A>) -> Option<A>;
 }
 
 pub mod iter {
@@ -113,6 +120,7 @@ pub mod iter {
         type Item;
         fn next(&mut self) -> Option<Self::Item>;
 
+        fn size_hint(&self) -> (usize, Option<usize>) { crate::intrinsics::iter_size_hint(self) }
         fn count(self) -> usize where Self: Sized {
             let mut iter = self;
             let mut total = 0;
@@ -300,8 +308,8 @@ pub mod iter {
             }
             None
         }
-        fn rev(self) -> Rev<Self::Item> where Self: Sized {
-            Rev { items: crate::intrinsics::iter_collect(self) }
+        fn rev(self) -> Rev<Self> where Self: Sized {
+            Rev { iter: self, buffer: None }
         }
         fn partition<B, F>(self, f: F) -> (B, B) where Self: Sized, B: Default + Extend<Self::Item>, F: FnMut(&Self::Item) -> bool {
             crate::intrinsics::iter_partition(self, f)
@@ -329,42 +337,23 @@ pub mod iter {
         fn sum_by<B>(self) -> B where Self: Sized { crate::intrinsics::iter_collect_into(self) }
         fn cycle(self) -> Lazy<Self::Item> where Self: Sized { crate::intrinsics::iter_cycle(self) }
         fn array_chunks_vec(self, size: usize) -> Lazy<Vec<Self::Item>> where Self: Sized { crate::intrinsics::iter_chunks(self, size) }
-        fn size_hint(&self) -> (usize, Option<usize>) { (0, None) }
     }
 
-    // The built-in collections' impls forward to their inherent extend methods.
+    // Built-in collections extend through their own inherent methods; these impls let inference
+    // find a collection's element type, and user types implement extend themselves.
     pub trait Extend<A> {
-        fn extend<I: IntoIterator<Item = A>>(&mut self, iter: I);
+        fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T) { crate::intrinsics::extend_builtin(self, iter) }
     }
-    impl<T> Extend<T> for Vec<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { Vec::extend(self, iter) } }
-    impl<'a, T: Copy> Extend<&'a T> for Vec<T> { fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) { Vec::extend(self, iter) } }
-    impl Extend<char> for String { fn extend<I: IntoIterator<Item = char>>(&mut self, iter: I) { String::extend(self, iter) } }
-    impl<'a> Extend<&'a str> for String { fn extend<I: IntoIterator<Item = &'a str>>(&mut self, iter: I) { String::extend(self, iter) } }
-    impl Extend<String> for String { fn extend<I: IntoIterator<Item = String>>(&mut self, iter: I) { String::extend(self, iter) } }
-    impl<T> Extend<T> for crate::collections::VecDeque<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::VecDeque::extend(self, iter) } }
-    impl<T> Extend<T> for crate::collections::HashSet<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::HashSet::extend(self, iter) } }
-    impl<T> Extend<T> for crate::collections::BTreeSet<T> { fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) { crate::collections::BTreeSet::extend(self, iter) } }
-    impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> { fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) { crate::collections::HashMap::extend(self, iter) } }
-    impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> { fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) { crate::collections::BTreeMap::extend(self, iter) } }
-
-    // Collecting into built-in collections is built in; user types implement FromIterator.
-    pub trait FromIterator<A>: Sized {
-        fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
-    }
-
-    // A boxed iterator (such as `Box<dyn Iterator<Item = T>>`) is an iterator, so adapters take it by value.
-    impl<I: Iterator + ?Sized> Iterator for Box<I> {
-        type Item = I::Item;
-        fn next(&mut self) -> Option<I::Item> { (**self).next() }
-    }
-
-    // Numeric sums are built in; these traits let user types opt into `iter.sum()` and `iter.product()`.
-    pub trait Sum<A = Self>: Sized {
-        fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
-    }
-    pub trait Product<A = Self>: Sized {
-        fn product<I: Iterator<Item = A>>(iter: I) -> Self;
-    }
+    impl<T> Extend<T> for Vec<T> {}
+    impl<'a, T: Copy> Extend<&'a T> for Vec<T> {}
+    impl Extend<char> for String {}
+    impl<'a> Extend<&'a str> for String {}
+    impl Extend<String> for String {}
+    impl<T> Extend<T> for crate::collections::VecDeque<T> {}
+    impl<T> Extend<T> for crate::collections::HashSet<T> {}
+    impl<T> Extend<T> for crate::collections::BTreeSet<T> {}
+    impl<K, V> Extend<(K, V)> for crate::collections::HashMap<K, V> {}
+    impl<K, V> Extend<(K, V)> for crate::collections::BTreeMap<K, V> {}
 
     pub trait IntoIterator {
         type Item;
@@ -375,6 +364,16 @@ pub mod iter {
     pub struct StepBy<I> { iter: I, step: usize, first: bool }
     impl<I: Iterator> Iterator for StepBy<I> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let (low, high) = self.iter.size_hint();
+            let step = self.step + 1;
+            if self.first {
+                let f = |n: usize| if n == 0 { 0 } else { 1 + (n - 1) / step };
+                (f(low), high.map(f))
+            } else {
+                (low / step, high.map(|n| n / step))
+            }
+        }
         fn next(&mut self) -> Option<I::Item> {
             if self.first {
                 self.first = false;
@@ -387,6 +386,20 @@ pub mod iter {
     pub struct Chain<A, B> { first: Option<A>, second: B }
     impl<A: Iterator, B: Iterator<Item = A::Item>> Iterator for Chain<A, B> {
         type Item = A::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let (low, high) = self.second.size_hint();
+            match &self.first {
+                Some(first) => {
+                    let (first_low, first_high) = first.size_hint();
+                    let total = match (first_high, high) {
+                        (Some(a), Some(b)) => a.checked_add(b),
+                        _ => None,
+                    };
+                    (first_low.saturating_add(low), total)
+                }
+                None => (low, high),
+            }
+        }
         fn next(&mut self) -> Option<A::Item> {
             if let Some(first) = &mut self.first {
                 match first.next() {
@@ -402,6 +415,17 @@ pub mod iter {
     pub struct Zip<A, B> { a: A, b: B }
     impl<A: Iterator, B: Iterator> Iterator for Zip<A, B> {
         type Item = (A::Item, B::Item);
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let (a_low, a_high) = self.a.size_hint();
+            let (b_low, b_high) = self.b.size_hint();
+            let high = match (a_high, b_high) {
+                (Some(x), Some(y)) => Some(if x < y { x } else { y }),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            };
+            (if a_low < b_low { a_low } else { b_low }, high)
+        }
         fn next(&mut self) -> Option<(A::Item, B::Item)> {
             let left = self.a.next()?;
             let right = self.b.next()?;
@@ -412,6 +436,7 @@ pub mod iter {
     pub struct Map<I, F> { iter: I, f: F }
     impl<B, I: Iterator, F: FnMut(I::Item) -> B> Iterator for Map<I, F> {
         type Item = B;
+        fn size_hint(&self) -> (usize, Option<usize>) { self.iter.size_hint() }
         fn next(&mut self) -> Option<B> {
             match self.iter.next() {
                 Some(item) => Some((self.f)(item)),
@@ -423,6 +448,7 @@ pub mod iter {
     pub struct Filter<I, P> { iter: I, predicate: P }
     impl<I: Iterator, P: FnMut(&I::Item) -> bool> Iterator for Filter<I, P> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, self.iter.size_hint().1) }
         fn next(&mut self) -> Option<I::Item> {
             while let Some(item) = self.iter.next() {
                 if (self.predicate)(&item) { return Some(item); }
@@ -434,6 +460,7 @@ pub mod iter {
     pub struct FilterMap<I, F> { iter: I, f: F }
     impl<B, I: Iterator, F: FnMut(I::Item) -> Option<B>> Iterator for FilterMap<I, F> {
         type Item = B;
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, self.iter.size_hint().1) }
         fn next(&mut self) -> Option<B> {
             while let Some(item) = self.iter.next() {
                 if let Some(mapped) = (self.f)(item) { return Some(mapped); }
@@ -445,6 +472,7 @@ pub mod iter {
     pub struct Enumerate<I> { iter: I, count: usize }
     impl<I: Iterator> Iterator for Enumerate<I> {
         type Item = (usize, I::Item);
+        fn size_hint(&self) -> (usize, Option<usize>) { self.iter.size_hint() }
         fn next(&mut self) -> Option<(usize, I::Item)> {
             let item = self.iter.next()?;
             let index = self.count;
@@ -456,6 +484,15 @@ pub mod iter {
     pub struct Peekable<I: Iterator> { iter: I, peeked: Option<Option<I::Item>> }
     impl<I: Iterator> Iterator for Peekable<I> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let extra = match &self.peeked {
+                Some(None) => return (0, Some(0)),
+                Some(Some(_)) => 1,
+                None => 0,
+            };
+            let (low, high) = self.iter.size_hint();
+            (low.saturating_add(extra), match high { Some(n) => n.checked_add(extra), None => None })
+        }
         fn next(&mut self) -> Option<I::Item> {
             match self.peeked.take() {
                 Some(item) => item,
@@ -499,6 +536,7 @@ pub mod iter {
     pub struct SkipWhile<I, P> { iter: I, done: bool, predicate: P }
     impl<I: Iterator, P: FnMut(&I::Item) -> bool> Iterator for SkipWhile<I, P> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, self.iter.size_hint().1) }
         fn next(&mut self) -> Option<I::Item> {
             while let Some(item) = self.iter.next() {
                 if self.done || !(self.predicate)(&item) {
@@ -513,6 +551,9 @@ pub mod iter {
     pub struct TakeWhile<I, P> { iter: I, done: bool, predicate: P }
     impl<I: Iterator, P: FnMut(&I::Item) -> bool> Iterator for TakeWhile<I, P> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            if self.done { (0, Some(0)) } else { (0, self.iter.size_hint().1) }
+        }
         fn next(&mut self) -> Option<I::Item> {
             if self.done { return None; }
             let item = self.iter.next()?;
@@ -525,6 +566,9 @@ pub mod iter {
     pub struct MapWhile<I, P> { iter: I, done: bool, predicate: P }
     impl<B, I: Iterator, P: FnMut(I::Item) -> Option<B>> Iterator for MapWhile<I, P> {
         type Item = B;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            if self.done { (0, Some(0)) } else { (0, self.iter.size_hint().1) }
+        }
         fn next(&mut self) -> Option<B> {
             if self.done { return None; }
             let item = self.iter.next()?;
@@ -537,6 +581,10 @@ pub mod iter {
     pub struct Skip<I> { iter: I, n: usize }
     impl<I: Iterator> Iterator for Skip<I> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let (low, high) = self.iter.size_hint();
+            (low.saturating_sub(self.n), high.map(|x| x.saturating_sub(self.n)))
+        }
         fn next(&mut self) -> Option<I::Item> {
             while self.n > 0 {
                 self.n -= 1;
@@ -549,6 +597,16 @@ pub mod iter {
     pub struct Take<I> { iter: I, n: usize }
     impl<I: Iterator> Iterator for Take<I> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            if self.n == 0 { return (0, Some(0)); }
+            let (low, high) = self.iter.size_hint();
+            let low = if low < self.n { low } else { self.n };
+            let high = match high {
+                Some(x) if x < self.n => Some(x),
+                _ => Some(self.n),
+            };
+            (low, high)
+        }
         fn next(&mut self) -> Option<I::Item> {
             if self.n == 0 { return None; }
             self.n -= 1;
@@ -559,6 +617,7 @@ pub mod iter {
     pub struct Scan<I, St, F> { iter: I, f: F, state: St }
     impl<B, I: Iterator, St, F: FnMut(&mut St, I::Item) -> Option<B>> Iterator for Scan<I, St, F> {
         type Item = B;
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, self.iter.size_hint().1) }
         fn next(&mut self) -> Option<B> {
             let item = self.iter.next()?;
             (self.f)(&mut self.state, item)
@@ -582,6 +641,7 @@ pub mod iter {
     pub struct Lazy<T> { items: Vec<T> }
     impl<I: Iterator + ?Sized> Iterator for &mut I {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) { (**self).size_hint() }
         fn next(&mut self) -> Option<I::Item> { (**self).next() }
     }
     impl<T> Iterator for Lazy<T> {
@@ -592,6 +652,12 @@ pub mod iter {
     pub struct Fuse<I> { iter: Option<I> }
     impl<I: Iterator> Iterator for Fuse<I> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            match &self.iter {
+                Some(iter) => iter.size_hint(),
+                None => (0, Some(0)),
+            }
+        }
         fn next(&mut self) -> Option<I::Item> {
             let item = match &mut self.iter {
                 Some(iter) => iter.next(),
@@ -605,6 +671,7 @@ pub mod iter {
     pub struct Inspect<I, F> { iter: I, f: F }
     impl<I: Iterator, F: FnMut(&I::Item)> Iterator for Inspect<I, F> {
         type Item = I::Item;
+        fn size_hint(&self) -> (usize, Option<usize>) { self.iter.size_hint() }
         fn next(&mut self) -> Option<I::Item> {
             let item = self.iter.next()?;
             (self.f)(&item);
@@ -612,15 +679,32 @@ pub mod iter {
         }
     }
 
-    pub struct Rev<T> { items: Vec<T> }
-    impl<T> Iterator for Rev<T> {
-        type Item = T;
-        fn next(&mut self) -> Option<T> { self.items.pop() }
+    // Rev walks a DoubleEndedIterator from the back; other iterators are buffered on first use.
+    pub struct Rev<I: Iterator> { iter: I, buffer: Option<Vec<I::Item>> }
+    impl<I: Iterator> Iterator for Rev<I> {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<I::Item> {
+            if self.buffer.is_none() {
+                if crate::intrinsics::double_ended(&self.iter) { return crate::intrinsics::next_back(&mut self.iter); }
+                self.buffer = Some(crate::intrinsics::iter_collect(&mut self.iter));
+            }
+            match &mut self.buffer {
+                Some(items) => items.pop(),
+                None => None,
+            }
+        }
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            match &self.buffer {
+                Some(items) => (items.len(), Some(items.len())),
+                None => self.iter.size_hint(),
+            }
+        }
     }
 
     pub struct Empty<T> { items: Vec<T> }
     impl<T> Iterator for Empty<T> {
         type Item = T;
+        fn size_hint(&self) -> (usize, Option<usize>) { (0, Some(0)) }
         fn next(&mut self) -> Option<T> { None }
     }
     pub fn empty<T>() -> Empty<T> { Empty { items: Vec::new() } }
@@ -628,6 +712,10 @@ pub mod iter {
     pub struct Once<T> { item: Option<T> }
     impl<T> Iterator for Once<T> {
         type Item = T;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let n = if self.item.is_some() { 1 } else { 0 };
+            (n, Some(n))
+        }
         fn next(&mut self) -> Option<T> { self.item.take() }
     }
     pub fn once<T>(value: T) -> Once<T> { Once { item: Some(value) } }
@@ -635,6 +723,7 @@ pub mod iter {
     pub struct Repeat<T> { item: T }
     impl<T: Clone> Iterator for Repeat<T> {
         type Item = T;
+        fn size_hint(&self) -> (usize, Option<usize>) { (usize::MAX, None) }
         fn next(&mut self) -> Option<T> { Some(self.item.clone()) }
     }
     pub fn repeat<T: Clone>(value: T) -> Repeat<T> { Repeat { item: value } }
@@ -649,6 +738,9 @@ pub mod iter {
     pub struct Successors<T, F> { next: Option<T>, f: F }
     impl<T, F: FnMut(&T) -> Option<T>> Iterator for Successors<T, F> {
         type Item = T;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            if self.next.is_some() { (1, None) } else { (0, Some(0)) }
+        }
         fn next(&mut self) -> Option<T> {
             let item = self.next.take()?;
             self.next = (self.f)(&item);
@@ -659,6 +751,198 @@ pub mod iter {
         Successors { next: first, f: succ }
     }
 
+    pub struct RepeatWith<F> { f: F }
+    impl<T, F: FnMut() -> T> Iterator for RepeatWith<F> {
+        type Item = T;
+        fn size_hint(&self) -> (usize, Option<usize>) { (usize::MAX, None) }
+        fn next(&mut self) -> Option<T> { Some((self.f)()) }
+    }
+    pub fn repeat_with<T, F: FnMut() -> T>(f: F) -> RepeatWith<F> { RepeatWith { f: f } }
+
+    pub trait DoubleEndedIterator: Iterator {
+        fn next_back(&mut self) -> Option<Self::Item>;
+        fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+            let mut remaining = n;
+            while let Some(item) = self.next_back() {
+                if remaining == 0 { return Some(item); }
+                remaining -= 1;
+            }
+            None
+        }
+        fn rfold<B, F>(self, init: B, f: F) -> B where Self: Sized, F: FnMut(B, Self::Item) -> B {
+            let mut iter = self;
+            let mut f = f;
+            let mut accumulator = init;
+            while let Some(item) = iter.next_back() { accumulator = f(accumulator, item); }
+            accumulator
+        }
+        fn rfind<P>(&mut self, predicate: P) -> Option<Self::Item> where Self: Sized, P: FnMut(&Self::Item) -> bool {
+            let mut predicate = predicate;
+            while let Some(item) = self.next_back() {
+                if predicate(&item) { return Some(item); }
+            }
+            None
+        }
+    }
+
+    pub trait ExactSizeIterator: Iterator {
+        fn len(&self) -> usize {
+            let (lower, _) = self.size_hint();
+            lower
+        }
+    }
+
+    pub trait FromIterator<A>: Sized {
+        fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
+    }
+
+    pub trait Sum<A = Self>: Sized {
+        fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
+
+    pub trait Product<A = Self>: Sized {
+        fn product<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
+
+    impl<I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for &mut I {
+        fn next_back(&mut self) -> Option<I::Item> { (**self).next_back() }
+    }
+    impl<I: ExactSizeIterator + ?Sized> ExactSizeIterator for &mut I {}
+    impl<T> DoubleEndedIterator for Lazy<T> {
+        fn next_back(&mut self) -> Option<T> { crate::intrinsics::next_back(self) }
+    }
+    impl<I: DoubleEndedIterator> DoubleEndedIterator for Rev<I> {
+        fn next_back(&mut self) -> Option<I::Item> { self.iter.next() }
+    }
+    impl<I: ExactSizeIterator + DoubleEndedIterator> ExactSizeIterator for Rev<I> {}
+    impl<B, I: DoubleEndedIterator, F: FnMut(I::Item) -> B> DoubleEndedIterator for Map<I, F> {
+        fn next_back(&mut self) -> Option<B> {
+            match self.iter.next_back() {
+                Some(item) => Some((self.f)(item)),
+                None => None,
+            }
+        }
+    }
+    impl<B, I: ExactSizeIterator, F: FnMut(I::Item) -> B> ExactSizeIterator for Map<I, F> {}
+    impl<I: DoubleEndedIterator, P: FnMut(&I::Item) -> bool> DoubleEndedIterator for Filter<I, P> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            while let Some(item) = self.iter.next_back() {
+                if (self.predicate)(&item) { return Some(item); }
+            }
+            None
+        }
+    }
+    impl<B, I: DoubleEndedIterator, F: FnMut(I::Item) -> Option<B>> DoubleEndedIterator for FilterMap<I, F> {
+        fn next_back(&mut self) -> Option<B> {
+            while let Some(item) = self.iter.next_back() {
+                if let Some(mapped) = (self.f)(item) { return Some(mapped); }
+            }
+            None
+        }
+    }
+    impl<I: DoubleEndedIterator, F: FnMut(&I::Item)> DoubleEndedIterator for Inspect<I, F> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            let item = self.iter.next_back()?;
+            (self.f)(&item);
+            Some(item)
+        }
+    }
+    impl<I: ExactSizeIterator, F: FnMut(&I::Item)> ExactSizeIterator for Inspect<I, F> {}
+    impl<A: DoubleEndedIterator, B: DoubleEndedIterator<Item = A::Item>> DoubleEndedIterator for Chain<A, B> {
+        fn next_back(&mut self) -> Option<A::Item> {
+            if let Some(item) = self.second.next_back() { return Some(item); }
+            match &mut self.first {
+                Some(first) => first.next_back(),
+                None => None,
+            }
+        }
+    }
+    impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for Enumerate<I> {
+        fn next_back(&mut self) -> Option<(usize, I::Item)> {
+            let len = self.iter.len();
+            let item = self.iter.next_back()?;
+            Some((self.count + len - 1, item))
+        }
+    }
+    impl<I: ExactSizeIterator> ExactSizeIterator for Enumerate<I> {}
+    impl<A: DoubleEndedIterator + ExactSizeIterator, B: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for Zip<A, B> {
+        fn next_back(&mut self) -> Option<(A::Item, B::Item)> {
+            let a_len = self.a.len();
+            let b_len = self.b.len();
+            let mut extra = if a_len > b_len { a_len - b_len } else { 0 };
+            while extra > 0 { self.a.next_back(); extra -= 1; }
+            let mut extra = if b_len > a_len { b_len - a_len } else { 0 };
+            while extra > 0 { self.b.next_back(); extra -= 1; }
+            let left = self.a.next_back()?;
+            let right = self.b.next_back()?;
+            Some((left, right))
+        }
+    }
+    impl<A: ExactSizeIterator, B: ExactSizeIterator> ExactSizeIterator for Zip<A, B> {}
+    impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for Skip<I> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            if self.len() > 0 { self.iter.next_back() } else { None }
+        }
+    }
+    impl<I: ExactSizeIterator> ExactSizeIterator for Skip<I> {}
+    impl<I: DoubleEndedIterator + ExactSizeIterator> DoubleEndedIterator for Take<I> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            if self.n == 0 { return None; }
+            let len = self.iter.len();
+            let item = if len > self.n { self.iter.nth_back(len - self.n) } else { self.iter.next_back() };
+            self.n -= 1;
+            item
+        }
+    }
+    impl<I: ExactSizeIterator> ExactSizeIterator for Take<I> {}
+    impl<I: DoubleEndedIterator> DoubleEndedIterator for Fuse<I> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            let item = match &mut self.iter {
+                Some(iter) => iter.next_back(),
+                None => return None,
+            };
+            if item.is_none() { self.iter = None; }
+            item
+        }
+    }
+    impl<I: ExactSizeIterator> ExactSizeIterator for Fuse<I> {}
+    impl<I: DoubleEndedIterator> DoubleEndedIterator for Peekable<I> {
+        fn next_back(&mut self) -> Option<I::Item> {
+            match &mut self.peeked {
+                Some(None) => None,
+                Some(peeked) => match self.iter.next_back() {
+                    Some(item) => Some(item),
+                    None => peeked.take(),
+                },
+                None => self.iter.next_back(),
+            }
+        }
+    }
+    impl<I: ExactSizeIterator> ExactSizeIterator for Peekable<I> {}
+    impl<T> DoubleEndedIterator for Once<T> {
+        fn next_back(&mut self) -> Option<T> { self.item.take() }
+    }
+    impl<T> ExactSizeIterator for Once<T> {}
+    impl<T> DoubleEndedIterator for Empty<T> {
+        fn next_back(&mut self) -> Option<T> { None }
+    }
+    impl<T> ExactSizeIterator for Empty<T> {}
+    impl<A: Copy> DoubleEndedIterator for crate::ops::Range<A> {
+        fn next_back(&mut self) -> Option<A> { crate::intrinsics::range_next_back(self) }
+    }
+    impl<A: Copy> ExactSizeIterator for crate::ops::Range<A> {}
+    impl<A: Copy> DoubleEndedIterator for crate::ops::RangeInclusive<A> {
+        fn next_back(&mut self) -> Option<A> { crate::intrinsics::range_inclusive_next_back(self) }
+    }
+    impl<A: Copy> ExactSizeIterator for crate::ops::RangeInclusive<A> {}
+    impl<I: Iterator + ?Sized> Iterator for Box<I> {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<I::Item> { (**self).next() }
+        fn size_hint(&self) -> (usize, Option<usize>) { (**self).size_hint() }
+    }
+    impl<I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for Box<I> {
+        fn next_back(&mut self) -> Option<I::Item> { (**self).next_back() }
+    }
 }
 
 pub mod cmp {
@@ -1383,15 +1667,24 @@ pub mod ops {
 
     impl<A: Copy> Iterator for Range<A> {
         type Item = A;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let n = crate::intrinsics::range_count(self);
+            (n, Some(n))
+        }
         fn next(&mut self) -> Option<A> { crate::intrinsics::range_next(self) }
         fn nth(&mut self, n: usize) -> Option<A> { crate::intrinsics::range_nth(self, n) }
     }
     impl<A: Copy> Iterator for RangeInclusive<A> {
         type Item = A;
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let n = crate::intrinsics::range_count(self);
+            (n, Some(n))
+        }
         fn next(&mut self) -> Option<A> { crate::intrinsics::range_inclusive_next(self) }
     }
     impl<A: Copy> Iterator for RangeFrom<A> {
         type Item = A;
+        fn size_hint(&self) -> (usize, Option<usize>) { (usize::MAX, None) }
         fn next(&mut self) -> Option<A> { crate::intrinsics::range_from_next(self) }
     }
 
