@@ -36,7 +36,9 @@ RUST_EDITIONS = ("2015", "2018", "2021", "2024")
 
 
 class RustError(Exception):
-    pass
+    def __init__(self, message, *, located=False):
+        super().__init__(message)
+        self.located = located
 
 
 class RustPanic(Exception):
@@ -74,7 +76,9 @@ class Token:
         return replace(self, text=key, context=())
 
     def error(self, message):
-        return RustError(f"{self.line}:{self.column}: {message}")
+        site = self.expansion_site or self
+        prefix = f"{site.source_file}:" if site.source_file is not None else ""
+        return RustError(f"{prefix}{site.line}:{site.column}: {message}", located=bool(prefix))
 
     def followed_by(self, token):
         return (self.origin is not None and self.origin is token.origin
@@ -194,7 +198,8 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         if match is None:
             start = offset + int(source[offset] == "'")
             if start == len(source) or not is_identifier(source[start]):
-                raise Token(source[offset], line, column).error(f"unexpected character {source[offset]!r}")
+                bad = Token(source[offset], line, column, source_file=source_file)
+                raise bad.error(f"unexpected character {source[offset]!r}")
             end = start + 1
         else:
             end = match.end()
@@ -212,7 +217,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         if identifier:
             word = unicodedata.normalize("NFC", word)
             if raw and identifier_text(word[name_start - offset:]) in {"_", "crate", "self", "Self", "super"}:
-                raise Token(word, line, column).error(f"{word!r} is reserved")
+                raise Token(word, line, column, source_file=source_file).error(f"{word!r} is reserved")
         if word == "/*":
             depth = 1
             for edge in COMMENT_EDGE.finditer(source, end):
@@ -221,7 +226,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
                     end = edge.end()
                     break
             if depth:
-                raise Token(word, line, column).error("unclosed block comment")
+                raise Token(word, line, column, source_file=source_file).error("unclosed block comment")
         consumed = source[offset:end]
         lines = consumed.count("\n")
         next_column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
@@ -234,7 +239,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         line += lines
         column = next_column
         offset = end
-    yield Token("", line, column)
+    yield Token("", line, column, source_file=source_file)
 
 
 DELIMITERS = {"(": ")", "[": "]", "{": "}"}
@@ -951,14 +956,17 @@ class ModuleUnit:
     glob_aliases: dict = field(default_factory=dict)
     hidden_traits: set = field(default_factory=set)
     macro_use: bool = False
+    crate_root: tuple = ()
 
 
 class Modules:
-    def __init__(self, trees, source_path, edition):
+    def __init__(self, trees, source_path, edition, dependencies=None):
         self.source_path = os.fspath(source_path) if source_path is not None else None
         self.directory = Path(source_path).absolute().parent if source_path is not None else None
         root = ModuleUnit((), self.directory)
         self.units = {(): root}
+        self.crate_files = {(): self.source_path}
+        self.external_roots = {}
         self.edition = edition
         self.exported = {}
         self.macro_paths = {}
@@ -968,6 +976,15 @@ class Modules:
         self.active_const_functions = set()
         self.type_aliases = {}
         self.alias_names = set()
+        for name, file in (dependencies or {}).items():
+            key = (f"@external:{name}",)
+            dependency = ModuleUnit(key, file.resolve().parent, crate_root=key)
+            self.units[key] = dependency
+            self.external_roots[name] = key
+            self.crate_files[key] = os.fspath(file)
+            contents, _ = token_trees(lex(file.read_text(encoding="utf-8"), edition=edition,
+                                          source_file=os.fspath(file)))
+            dependency.items = self.scan(dependency, contents)
         root.items = self.scan(root, trees)
 
     def register(self, unit, token, kind, boundary):
@@ -1084,7 +1101,7 @@ class Modules:
                 directory = unit.directory / symbol.path[-1] if unit.directory is not None else None
                 if custom_path is not None and unit.directory is not None:
                     directory = (unit.directory / custom_path).resolve().parent
-                child = ModuleUnit(symbol.path, directory, macro_use=macro_use)
+                child = ModuleUnit(symbol.path, directory, macro_use=macro_use, crate_root=unit.crate_root)
                 self.units[symbol.path] = child
                 if isinstance(body, TokenGroup) and tree_text(body) == "{":
                     contents = body.items
@@ -1123,7 +1140,7 @@ class Modules:
                 else:
                     if export and word == "macro_rules":
                         name, body = items[index + 2:index + 4]
-                        key = identifier_text(name.text)
+                        key = (*unit.crate_root, identifier_text(name.text))
                         if key in self.exported and not expanded:
                             raise name.error(f"duplicate exported macro {name.text!r}")
                         self.exported[key] = body, local_inner
@@ -1156,24 +1173,28 @@ class Modules:
             raise token.error(f"module {token.text!r} needs {filenames[0]} or {filenames[1]}")
         try:
             filename = found[0]
-            source_file = os.path.join(os.path.dirname(self.source_path), os.path.relpath(filename, self.directory))
+            crate_file = self.crate_files[unit.crate_root]
+            root = self.units[unit.crate_root]
+            source_file = os.path.join(os.path.dirname(crate_file), os.path.relpath(filename, root.directory))
             return token_trees(lex(filename.read_text(encoding="utf-8"), edition=self.edition,
                                    source_file=source_file))[0]
         except RustError as error:
+            if error.located:
+                raise
             raise RustError(f"{found[0]}: {error}") from error
 
     @staticmethod
     def visibility(unit, group):
         words = tuple(token.text for token in flatten_trees(group.items))
         if words == ("crate",):
-            return ()
+            return unit.crate_root
         if words == ("self",):
             return unit.path
-        if words == ("super",) and unit.path:
+        if words == ("super",) and unit.path != unit.crate_root:
             return unit.path[:-1]
         if words[:2] == ("in", "crate"):
-            boundary = words[3::2]
-            if words[2::2] == ("::",) * len(boundary) and unit.path[:len(boundary)] == boundary:
+            boundary = (*unit.crate_root, *words[3::2])
+            if words[2::2] == ("::",) * len(words[3::2]) and unit.path[:len(boundary)] == boundary:
                 return boundary
         raise group.opening.error("visibility must name an ancestor module")
 
@@ -1221,11 +1242,11 @@ class Modules:
             head = path.pop(0)
             absolute = True
             if head == "crate":
-                root = self.units[()]
+                root = self.units[unit.crate_root]
             if head == "super":
                 current = unit.path
                 while True:
-                    if not current:
+                    if current == unit.crate_root:
                         raise token.error("super goes past the crate root")
                     current = current[:-1]
                     if not path or path[0] != "super":
@@ -1239,7 +1260,10 @@ class Modules:
         if not symbol:
             if absolute:
                 raise token.error("unresolved path")
-            return self.prelude((first, *path), token)
+            if first in self.external_roots:
+                symbol = ModuleSymbol(self.external_roots[first], "module", (), token)
+            else:
+                return self.prelude((first, *path), token)
         while path and symbol.kind == "module":
             nested = self.units[symbol.path]
             symbol = self.lookup(nested, path.pop(0), origin, token)
@@ -1351,7 +1375,7 @@ class Modules:
     def macro_path(unit, path):
         head, *tail = path
         if head == "crate":
-            return tuple(tail)
+            return (*unit.crate_root, *tail)
         if head == "self":
             return (*unit.path, *tail)
         if head == "super":
@@ -1370,7 +1394,7 @@ class Modules:
         return bool(entry and unit.path[:len(entry[1])] == entry[1])
 
     def link_macros(self, exports):
-        self.macro_paths = {(name,): (macro, ()) for name, macro in exports.items()}
+        self.macro_paths = {path: (macro, path[:-1]) for path, macro in exports.items()}
         while True:
             size = len(self.macro_paths)
             for unit in self.units.values():
@@ -1388,8 +1412,9 @@ class Modules:
         for path, (macro, visible) in self.macro_paths.items():
             if unit.path[:len(visible)] != visible:
                 continue
-            qualified[("crate", *path)] = macro
-            for ancestor in range(len(unit.path), -1, -1):
+            root_size = len(unit.crate_root)
+            qualified[("crate", *path[root_size:])] = macro
+            for ancestor in range(len(unit.path), root_size - 1, -1):
                 if path[:ancestor] == unit.path[:ancestor] and len(path) > ancestor:
                     prefix = ("super",) * (len(unit.path) - ancestor) or ("self",)
                     qualified[(*prefix, *path[ancestor:])] = macro
@@ -1444,13 +1469,17 @@ class Modules:
                            for item in unit.imports if self.is_macro_import(unit, item)})
             previous = expander.qualified
             previous_path = expander.module_path
+            previous_crate = expander.crate_name
             expander.qualified = self.macro_qualifiers(unit)
-            expander.module_path = unit.path
+            expander.module_path = unit.path[len(unit.crate_root):]
+            if unit.crate_root:
+                expander.crate_name = unit.crate_root[0].removeprefix("@external:")
             try:
                 expanded = expander.expand(unit.items, macros, item_scope=True, definitions=definitions)
             finally:
                 expander.qualified = previous
                 expander.module_path = previous_path
+                expander.crate_name = previous_crate
             unit.items = self.scan(unit, expanded, expanded=True)
             return definitions
 
@@ -1526,6 +1555,7 @@ class Function:
     visible_from: tuple = ()
     captures: tuple = ()
     consumes_captures: bool = False
+    reference_slots: set = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -1563,7 +1593,11 @@ def is_str_reference(annotation):
 
 
 def is_static_str(annotation):
-    return is_str_reference(annotation) and not annotation.mutable and annotation.lifetime == "'static"
+    return is_str_reference(annotation) and is_static_reference(annotation)
+
+
+def is_static_reference(annotation):
+    return isinstance(annotation, ReferenceType) and not annotation.mutable and annotation.lifetime == "'static"
 
 
 @dataclass(frozen=True)
@@ -2033,6 +2067,7 @@ class Program:
     statics: dict = field(default_factory=dict)
     opaque_witnesses: dict = field(default_factory=dict)
     formats: dict = field(default_factory=dict)
+    edition: str = "2021"
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2379,7 +2414,7 @@ class Parser:
             return ()
         return Modules.visibility(self.unit, TokenGroup(opening, tuple(parts), closing))
 
-    def type_name(self, *, static_string=False, signature=None):
+    def type_name(self, *, static_fields=False, signature=None):
         token = self.advance()
         if token.text == "_":
             return None
@@ -2395,7 +2430,7 @@ class Parser:
             self.expect(")")
             result = self.type_name(signature=signature) if self.accept("->") else "()"
             self.argument_parameters = outer
-            if static_string and isinstance(result, ReferenceType) and not is_static_str(result):
+            if static_fields and isinstance(result, ReferenceType) and not is_static_str(result):
                 raise token.error("reference-returning function pointer fields are unsupported")
             return FunctionType(tuple(arguments), result)
         if token.text == "impl":
@@ -2436,7 +2471,7 @@ class Parser:
         if token.text in CONST_VALUE_TYPES or token.text == "str":
             return token.text
         if token.text == "[":
-            element = self.type_name(static_string=static_string, signature=signature)
+            element = self.type_name(static_fields=static_fields, signature=signature)
             if self.accept("]"):
                 return SliceType(element)
             self.expect(";")
@@ -2448,13 +2483,8 @@ class Parser:
             if lifetime and lifetime.text == "'_":
                 lifetime = None
             mutable = bool(self.accept("mut"))
-            if static_string and not mutable and self.current.text == "str":
-                if not lifetime or lifetime.text != "'static":
-                    raise token.error("this position requires &'static str")
-                self.advance()
-                return STATIC_STR
-            if static_string:
-                raise token.error("references in fields are unsupported")
+            if static_fields and (mutable or not lifetime or lifetime.text != "'static"):
+                raise token.error("reference fields require an immutable 'static reference")
             if lifetime and lifetime.text == "'static" and mutable:
                 raise lifetime.error("mutable 'static references are unsupported")
             if lifetime and lifetime.text != "'static" and (signature is None or lifetime.text not in signature):
@@ -2463,13 +2493,13 @@ class Parser:
         if token.text == "(":
             if self.accept(")"):
                 return "()"
-            first = self.type_name(static_string=static_string, signature=signature)
+            first = self.type_name(static_fields=static_fields, signature=signature)
             if not self.accept(","):
                 self.expect(")")
                 return first
             kinds = [first]
             while self.current.text != ")":
-                kinds.append(self.type_name(static_string=static_string, signature=signature))
+                kinds.append(self.type_name(static_fields=static_fields, signature=signature))
                 if not self.accept(","):
                     break
             self.expect(")")
@@ -2496,8 +2526,8 @@ class Parser:
                     raise token.error(f"cyclic or unresolved type alias {name!r}")
                 target = alias.specialize(arguments or (), token)
                 if isinstance(target, ReferenceType):
-                    if static_string and not is_static_str(target):
-                        raise token.error("references in fields are unsupported")
+                    if static_fields and not is_static_reference(target):
+                        raise token.error("reference fields require an immutable 'static reference")
                     if (target.lifetime and target.lifetime != "'static"
                             and (signature is None or target.lifetime not in signature)):
                         raise token.error(f"undeclared or unsupported lifetime {target.lifetime}")
@@ -3082,7 +3112,7 @@ class Parser:
                     raise name.error(f"duplicate field {name.text!r}")
                 names.add(name.text)
                 self.expect(":")
-                fields.append((name.text, self.type_name(static_string=True)))
+                fields.append((name.text, self.type_name(static_fields=True)))
                 visibility.append((name.text, visible))
                 if not self.accept(","):
                     break
@@ -3092,7 +3122,7 @@ class Parser:
             while self.current.text != ")":
                 visible = self.field_visibility(variant)
                 name = str(len(fields))
-                fields.append((name, self.type_name(static_string=True)))
+                fields.append((name, self.type_name(static_fields=True)))
                 visibility.append((name, visible))
                 if not self.accept(","):
                     break
@@ -4093,7 +4123,7 @@ def place_root(expr):
 
 def reference_source(expr, annotation):
     expr = ungroup(expr)
-    if is_static_str(annotation) or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
+    if is_static_reference(annotation) or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
         return True
     return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "if_chain", "match", "dyn_reference",
                          "slice_reference", "string_reference", "byte_string", "vector_method",
@@ -4159,6 +4189,12 @@ class SliceAddress:
 
     def read(self):
         return ArrayValue(self.address.read().items[self.start:self.stop])
+
+    def write(self, value):
+        items = self.address.read().items
+        if len(value.items) != self.length:
+            raise AssertionError("slice mutation changed the length of a borrowed view")
+        self.address.write(ArrayValue((*items[:self.start], *value.items, *items[self.stop:])))
 
 
 @dataclass(frozen=True)
@@ -5132,7 +5168,7 @@ class Checker:
                                       for capture in function.captures)
         for annotation, token in self.generic_arguments:
             annotation = self.resolve(annotation)
-            if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
+            if isinstance(annotation, ReferenceType) and not is_static_reference(annotation):
                 raise token.error("references as generic type arguments are unsupported")
             if isinstance(annotation, FunctionType) and annotation.closure:
                 raise token.error("capturing closures as generic type arguments are unsupported")
@@ -5279,12 +5315,12 @@ class Checker:
         if isinstance(annotation, TupleType):
             for kind in annotation.elements:
                 if (isinstance(kind, ReferenceType) or (isinstance(kind, FunctionType) and kind.closure)
-                        or borrowing_iterator(kind)) and not is_static_str(kind):
+                        or borrowing_iterator(kind)) and not is_static_reference(kind):
                     raise token.error("references, capturing closures, and borrowed iterators in tuples are unsupported")
                 self.check_type(kind, token)
             return
         if isinstance(annotation, ArrayType):
-            if isinstance(annotation.element, ReferenceType) and not is_static_str(annotation.element):
+            if isinstance(annotation.element, ReferenceType) and not is_static_reference(annotation.element):
                 raise token.error("reference elements in arrays are unsupported")
             if borrowing_iterator(annotation.element):
                 raise token.error("borrowed iterator elements in arrays are unsupported")
@@ -6112,7 +6148,8 @@ class Checker:
             self.require_place(value, write=mutable, allow_temporary=True)
             if mutable:
                 CaptureContext.mark_mutable(scope, value)
-            result = ReferenceType(annotation, mutable)
+            static = not mutable and (value.kind == "static_item" or is_static_reference(expected))
+            result = ReferenceType(annotation, mutable, "'static" if static else None)
             self.check_type(result, token)
             return result
         if kind == "deref":
@@ -6195,13 +6232,13 @@ class Checker:
                 self.ascriptions.append(expr)
             annotation = self.resolve(annotation or actual)
             if isinstance(annotation, ReferenceType):
-                if value is None or (otherwise and source.kind in {"bind", "wild"}):
+                if otherwise and source.kind in {"bind", "wild"}:
                     raise token.error("reference let requires a simple initialized binding")
             pattern, bindings = self.prepare_pattern(source, annotation)
             if value is None:
                 for kind, _ in bindings.values():
-                    if isinstance(kind, ReferenceType):
-                        raise token.error("reference let requires a simple initialized binding")
+                    if isinstance(kind, ReferenceType) and (source.kind != "bind" or len(source.args) != 1):
+                        raise token.error("deferred reference initialization requires a simple binding")
                     if isinstance(kind, TypeVariable):
                         self.deferred_binding_types.add(kind)
             self.program.patterns[id(source)] = (pattern, bindings)
@@ -6308,8 +6345,8 @@ class Checker:
             annotation = self.resolve(annotation)
             self.require_place(left, write=True)
             CaptureContext.mark_mutable(scope, left)
-            if isinstance(annotation, ReferenceType) and not is_static_str(annotation):
-                raise token.error("reassigning reference bindings is unsupported")
+            if isinstance(annotation, ReferenceType) and token.text != "=":
+                raise token.error("compound assignment requires a non-reference destination")
             if borrowing_iterator(annotation):
                 raise token.error("reassigning a borrowed iterator is unsupported")
             if isinstance(annotation, SliceType):
@@ -6322,7 +6359,7 @@ class Checker:
             ) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
-                self.require(actual, annotation, token)
+                self.require_argument(actual, annotation, token)
             else:
                 self.binary_type(replace(token, text=operator), annotation, actual)
             return NEVER if NEVER in {annotation, actual} else "()"
@@ -6750,6 +6787,18 @@ class Checker:
             return "usize" if name == "len" else "bool"
         if is_vector(base) and name in {"push", "pop", "clear", "truncate", "as_slice", "as_mut_slice"}:
             return self.vector_method(expr, scope, expected, actual, base)
+        if (isinstance(base, (ArrayType, SliceType)) or is_vector(base)) and name in {
+            "contains", "starts_with", "ends_with", "swap", "reverse",
+        }:
+            element = base.arguments[0] if is_vector(base) else base.element
+            mutable = name in {"swap", "reverse"}
+            if mutable:
+                arguments = ("usize", "usize") if name == "swap" else ()
+            else:
+                self.obligation(element, "PartialEq", expr.token)
+                arguments = (ReferenceType(element if name == "contains" else SliceType(element), False),)
+            return self.builtin_receiver_call(expr, scope, expected, actual, base, arguments,
+                                              "()" if mutable else "bool", kind="vector_method", mutable=mutable)
         if base == STRING and name in {"push", "push_str", "pop", "clear", "truncate", "as_str", "as_mut_str"}:
             arguments = {"push": ("char",), "push_str": (STR_REFERENCE,), "truncate": ("usize",)}.get(name, ())
             result = AppliedType(OPTION, ("char",)) if name == "pop" else "()"
@@ -7240,7 +7289,7 @@ class Effect:
     roots: frozenset = frozenset()
 
     def reference_uses(self):
-        if self.kind in {"declare", "uninitialized", "end_temporaries"}:
+        if self.kind in {"declare", "uninitialized", "end_temporaries", "overwrite_reference"}:
             return set()
         if self.place.holder:
             return {self.place.holder}
@@ -7275,6 +7324,8 @@ class MoveState:
         if effect is None:
             return self
         kind, place = effect.kind, effect.place
+        if kind == "overwrite_reference":
+            kind = "write"
         if kind == "write" and place.holder:
             return self
         if kind == "move":
@@ -7290,6 +7341,8 @@ class MoveState:
         if effect is None:
             return
         kind, place, token = effect.kind, effect.place, effect.token
+        if kind == "overwrite_reference":
+            kind = "write"
         if kind == "return_reference":
             for owner in place.local.loan.regions():
                 if owner.local not in effect.roots and not owner.local.static:
@@ -7353,6 +7406,7 @@ class Ownership:
             self.return_roots = set()
             self.function = function
             self.owned_captures = set()
+            self.reference_captures = set()
             for capture in function.captures:
                 loan = None
                 annotation = capture.annotation
@@ -7365,6 +7419,10 @@ class Ownership:
                 local = Local(capture.name, capture.mutable, loan, shared_capture=not capture.by_move)
                 if capture.by_move:
                     self.owned_captures.add(local)
+                elif isinstance(annotation, ReferenceType):
+                    self.reference_captures.add(local)
+                    if self.program.edition < "2021":
+                        function.reference_slots.add(capture.name.key)
                 scope.bindings[capture.name.key] = local
                 cursor = self.emit(cursor, "declare", Place(local), capture.name)
             for index, (token, mutable, annotation) in enumerate(function.params):
@@ -7424,7 +7482,7 @@ class Ownership:
             before = set().union(*(live[successor] for successor in node.edges))
             effect = node.effect
             if effect:
-                if effect.kind in {"declare", "uninitialized"}:
+                if effect.kind in {"declare", "uninitialized", "overwrite_reference"}:
                     before.discard(effect.place.local)
                 before.update(effect.reference_uses())
             if before != live[node]:
@@ -7441,6 +7499,8 @@ class Ownership:
     @staticmethod
     def validate_loans(effect, live):
         kind, place, token = effect.kind, effect.place, effect.token
+        if kind == "overwrite_reference":
+            kind = "write"
         if kind == "end_temporaries":
             if place.local.loan in live:
                 raise token.error("temporary value dropped while borrowed")
@@ -7505,7 +7565,9 @@ class Ownership:
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
-                return cursor, Place(scope.find(expr.token))
+                local = scope.find(expr.token)
+                self.note_reference_slot(local)
+                return cursor, Place(local)
         if expr.kind == "field":
             base, name = expr.args
             cursor, place = self.lower_address(base, scope, cursor)
@@ -7531,6 +7593,10 @@ class Ownership:
 
     def annotation(self, expr):
         return self.program.expr_types[id(expr)]
+
+    def note_reference_slot(self, local):
+        if local in self.reference_captures:
+            self.function.reference_slots.add(local.token.key)
 
     def access(self, cursor, place, annotation, token, *, consume):
         if consume and not self.program.is_copy(annotation):
@@ -7616,9 +7682,10 @@ class Ownership:
                         extend_to.owned.add(local)
             return self.start_loan(cursor, place, mutable, expr.token, expiring=expiring,
                                    two_phase=two_phase and expr.auto_borrow)
-        if expr.kind != "name" and is_static_str(annotation):
+        if expr.kind != "name" and is_static_reference(annotation):
             return self.static_loan(self.lower(expr, scope, cursor), expr.token)
         holder = scope.find(expr.token)
+        self.note_reference_slot(holder)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
                                    two_phase=two_phase)
@@ -7757,6 +7824,7 @@ class Ownership:
                     cursor, loan = self.lower_reference(reference, scope, cursor)
                 else:
                     holder = scope.find(reference.token)
+                    self.note_reference_slot(holder)
                     cursor, loan = self.start_loan(cursor, self.referent(holder), False, reference.token)
             else:
                 cursor, place = self.lower_address(value, scope, cursor)
@@ -7775,6 +7843,7 @@ class Ownership:
             for name in arguments:
                 if isinstance(name, str):
                     local = scope.find(replace(template.token, text=name))
+                    self.note_reference_slot(local)
                     place = self.referent(local) if local.loan else Place(local)
                     cursor, loan = self.start_loan(cursor, place, False, token)
                     cursor, holder = self.keep_loan(cursor, loan, token)
@@ -7964,6 +8033,8 @@ class Ownership:
         if kind == "assign":
             left, right = args
             target_type = self.annotation(left)
+            if isinstance(target_type, ReferenceType) and target_type.lifetime != "'static":
+                return self.reassign_reference(left, right, scope, cursor, token)
             argument = None
             if target_type == STRING and token.text == "+=" and self.annotation(right) != NEVER:
                 cursor, loan = self.lower_reference(right, scope, cursor)
@@ -8017,8 +8088,35 @@ class Ownership:
             return self.lower_print(expr, scope, cursor)
         raise AssertionError(kind)
 
+    def reassign_reference(self, left, right, scope, cursor, token):
+        binding = ungroup(left)
+        if binding.kind != "name" or binding.token.key not in scope.bindings:
+            raise token.error("reference reassignment requires a local declared in the same block")
+        local = scope.bindings[binding.token.key]
+        annotation = self.annotation(left)
+        actual = self.annotation(right)
+        if actual == NEVER:
+            return self.lower(right, scope, cursor)
+        coercion = annotation if shared_coercion(actual, annotation) else None
+        cursor, loan = self.lower_reference(right, scope, cursor, reborrow=coercion)
+        if loan and local.loan and loan is not local.loan and any(
+                other is not local and other.loan and local.loan in other.loan.ancestors()
+                for other in scope.bindings.values()):
+            loan = replace(loan, parents=(*loan.parents, local.loan))
+        cursor = self.emit(cursor, "overwrite_reference", Place(local), token)
+        # Give later uses the new loan while earlier uses and aliases keep
+        # the original loan. The write still checks the original local slot.
+        replacement = replace(local, loan=loan)
+        scope.bindings[binding.token.key] = replacement
+        scope.owned.add(replacement)
+        holder = Place(replacement)
+        cursor = self.emit(cursor, "declare", holder, token)
+        if loan and loan.expiring:
+            cursor = self.emit(cursor, "end_temporaries", holder, token)
+        return cursor
+
     def lower_stored_value(self, expr, expected, scope, cursor):
-        if is_static_str(expected) and self.annotation(expr) != NEVER:
+        if is_static_reference(expected) and self.annotation(expr) != NEVER:
             cursor, loan = self.lower_reference(expr, scope, cursor)
             cursor, holder = self.keep_loan(cursor, loan, expr.token)
             return self.emit(cursor, "static_reference", holder, expr.token)
@@ -8042,6 +8140,10 @@ class Ownership:
                 if local.loan:
                     leases.append(local.loan)
             elif isinstance(capture.annotation, ReferenceType):
+                if capture.name.key in function.reference_slots:
+                    self.note_reference_slot(local)
+                    cursor, slot = self.start_loan(cursor, place, False, capture.name)
+                    leases.append(slot)
                 cursor, lease = self.start_loan(cursor, self.referent(local), capture.mutable, capture.name)
                 leases.append(lease)
             else:
@@ -8267,8 +8369,11 @@ class Ownership:
                 branches, loans = zip(*paths)
                 cursor = branches[0] if len(branches) == 1 else self.join(*branches)
                 binding_loan = self.merge_loans(loans, annotation.mutable)
-            if binding_loan is None and is_static_str(annotation):
+            if binding_loan is None and is_static_reference(annotation):
                 cursor, binding_loan = self.static_loan(cursor, source.token)
+            if binding_loan is None and not initialized and isinstance(annotation, ReferenceType):
+                owner = Local(source.token, annotation.mutable)
+                binding_loan = Loan(Place(owner), annotation.mutable)
             local = Local(source.token.binding(name), mutable, binding_loan)
             scope.bindings[name] = local
             scope.owned.add(local)
@@ -8860,9 +8965,13 @@ class Interpreter:
         if kind in {"function_pointer", "closure_value"}:
             name, arguments = args
             environment = {}
-            for capture in self.program.functions[name].captures:
+            function = self.program.functions[name]
+            for capture in function.captures:
                 binding = scope.find(capture.name)
-                environment[capture.name.key] = Binding(binding.value, capture.mutable) if capture.by_move else binding
+                snapshot = isinstance(capture.annotation, ReferenceType) and capture.name.key not in function.reference_slots
+                environment[capture.name.key] = (
+                    Binding(binding.value, capture.mutable) if capture.by_move or snapshot else binding
+                )
             return FunctionValue(name, {parameter: self.program.normalize(substitute(value, self.type_arguments))
                                         for parameter, value in arguments.items()}, environment)
         if kind == "indirect_call":
@@ -8900,7 +9009,25 @@ class Interpreter:
                 return address
             arguments = tuple(self.eval(arg, scope) for arg in args[1:])
             items = address.read().items
-            if token.text == "push":
+            if token.text == "contains":
+                return any(self.compare(item, arguments[0].read()) == 0 for item in items)
+            if token.text in {"starts_with", "ends_with"}:
+                pattern = arguments[0].read().items
+                start = 0 if token.text == "starts_with" else len(items) - len(pattern)
+                return len(pattern) <= len(items) and all(
+                    self.compare(a, b) == 0 for a, b in zip(items[start:], pattern)
+                )
+            if token.text == "reverse":
+                address.write(ArrayValue(items[::-1]))
+            elif token.text == "swap":
+                left, right = arguments
+                for index in arguments:
+                    if index >= len(items):
+                        raise RustPanic(f"index out of bounds: the len is {len(items)} but the index is {index}")
+                reordered = list(items)
+                reordered[left], reordered[right] = reordered[right], reordered[left]
+                address.write(ArrayValue(tuple(reordered)))
+            elif token.text == "push":
                 address.write(ArrayValue((*items, arguments[0])))
             elif token.text == "clear":
                 address.write(ArrayValue(()))
@@ -9442,32 +9569,36 @@ def strip_host_items(items, marker, shims, repeat_shim, libraries, *, top=True):
     return tuple(result)
 
 
-def macro_libraries(values):
+def external_files(values, kind):
     libraries = {}
     for item in values:
         name, separator, file = item.partition("=")
         if not separator or not name.isascii() or not name.isidentifier() or not file:
-            raise RustError("expected a compiled Rust macro crate as NAME=PATH")
+            raise RustError(f"expected a {kind} as NAME=PATH")
         path = Path(file).resolve()
         if not path.is_file():
-            raise RustError(f"compiled Rust macro crate does not exist: {path}")
+            raise RustError(f"{kind} does not exist: {path}")
         if name in libraries:
-            raise RustError(f"duplicate macro crate {name!r}")
+            raise RustError(f"duplicate {kind} {name!r}")
         libraries[name] = path
     return libraries
 
 
-def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
+def compile_program(source, *, proc_extern=(), extern_source=(), source_path=None, edition="2021"):
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
-        trees, end = rustc_source(source, macro_libraries(proc_extern), source_path, edition=edition)
+        if extern_source:
+            raise RustError("source dependencies and compiled macro crates require separate expansion modes")
+        libraries = external_files(proc_extern, "compiled Rust macro crate")
+        trees, end = rustc_source(source, libraries, source_path, edition=edition)
     else:
         source_file = os.fspath(source_path) if source_path is not None else None
         trees, end = token_trees(lex(source, edition=edition, source_file=source_file))
-    modules = Modules(trees, source_path, edition)
+    dependencies = external_files(extern_source, "Rust dependency source")
+    modules = Modules(trees, source_path, edition, dependencies)
     modules.expand()
-    program = Program(type_aliases=modules.type_aliases, statics=modules.statics)
+    program = Program(type_aliases=modules.type_aliases, statics=modules.statics, edition=edition)
     program.add_prelude()
     scalars = modules.constants | modules.statics
     for unit in modules.units.values():
@@ -9485,8 +9616,9 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     return program
 
 
-def run(source, stdout=None, *, proc_extern=(), source_path=None, edition="2021"):
-    program = compile_program(source, proc_extern=proc_extern, source_path=source_path, edition=edition)
+def run(source, stdout=None, *, proc_extern=(), extern_source=(), source_path=None, edition="2021"):
+    program = compile_program(source, proc_extern=proc_extern, extern_source=extern_source,
+                              source_path=source_path, edition=edition)
     interpreter = Interpreter(program, sys.stdout if stdout is None else stdout)
     try:
         value = interpreter.call("main", ())
@@ -9504,6 +9636,8 @@ def main():
     parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for syntax")
     parser.add_argument("--proc-extern", "--macro-extern", action="append", default=[], metavar="NAME=PATH",
                         help="load a compiled declarative or procedural macro crate through rustc")
+    parser.add_argument("--extern-source", action="append", default=[], metavar="NAME=PATH",
+                        help="load a dependency crate from its Rust source")
     args = parser.parse_args()
     if args.demo == bool(args.source):
         parser.error("provide either a source file or --demo")
@@ -9517,11 +9651,13 @@ def main():
             source = Path(args.source).read_text(encoding="utf-8")
         source_path = None if args.demo or args.source == "-" else args.source
         operation = compile_program if args.check else run
-        result = operation(source, proc_extern=args.proc_extern, source_path=source_path, edition=args.edition)
+        result = operation(source, proc_extern=args.proc_extern, extern_source=args.extern_source,
+                           source_path=source_path, edition=args.edition)
         if not args.check and result is not None:
             return result
     except (RustError, OSError, UnicodeError) as error:
-        print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
+        prefix = "" if isinstance(error, RustError) and error.located else f"{label}: "
+        print(prefix + str(error).replace(MODULE_SEPARATOR, "::"), file=sys.stderr)
         return 1
     except RustPanic as error:
         print(f"{label}: {error}", file=sys.stderr)

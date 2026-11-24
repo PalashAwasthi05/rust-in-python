@@ -45,6 +45,8 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Disjoint field reborrows through references selected by control flow
+- Same-block reference reassignment and deferred initialization of reference bindings
+- Immutable `'static` references in records, tuples, arrays, and supported generic values
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments, associated-type constraints, and argument-position `impl Trait`
 - Opaque owned return types in free functions and inherent methods with `-> impl Trait` and associated-type bindings
@@ -74,6 +76,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
 - Owned `String` values with concatenation and UTF-8-aware lengths and mutation
 - String searches with character and shared string patterns and UTF-8 byte offsets
+- Slice searches, prefix and suffix checks, reversal, and swapping on arrays, vectors, and borrowed views
 - Borrowed strings with lifetime checking, UTF-8 substring views, and `chars` and `bytes` iterators
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `f32` and `f64` arithmetic, comparisons, casts, and selected float methods
@@ -229,6 +232,14 @@ fn main() {
 }
 ```
 
+## Load a source dependency
+
+```sh
+python3 rust_in_python.py --extern-source utility=../utility/src/lib.rs program.rs
+```
+
+Source dependencies have separate crate roots, module trees, and visibility rules. Import supported types and values with paths such as `utility::Report` and `utility::make`. Source dependency loading and compiled macro expansion currently run in separate modes.
+
 ## Load compiled macros
 
 The optional host uses the installed Rust compiler to expand declarative macros from compiled `.rlib` crates and procedural macros from dynamic libraries. Pass the name and path of each crate.
@@ -254,12 +265,12 @@ Both commands accept `--edition`, which defaults to 2021. Edition 2024 enables l
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
-Function signatures can tie reference returns, including string slices, to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, nested references, and general reference capture in patterns remain incomplete.
+Function signatures can tie reference returns, including string slices, to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reassignment across blocks, non-static reference fields, general nested references, and reference capture in patterns remain incomplete.
 
 Generic bodies are checked against their declared trait bounds. Const parameters support integer widths, `bool`, and `char`. Dependent const expressions cover checked arithmetic and comparisons with structural matching, plus Rust's unit-array bound syntax. Scalar constant evaluation supports immutable bindings, conditionals, and short-circuit boolean expressions. Recursion and mutation in constant evaluation remain open.
 
 Trait objects support shared and mutable references and `Box` ownership. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. The optional host supports cross-crate macro expansion and generated local bindings. General external value and type resolution and full hygiene in exported expansions remain open.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. Python diagnostics for source files point to the original file and use the invocation location for generated macro tokens. The optional host supports compiled cross-crate macro expansion and generated local bindings. Compiled external type and value linking, original diagnostics for hosted expansions, and full hygiene in exported expansions remain open.
 
 General reference types as type arguments, complete closure capture analysis and callable trait bounds, standard library coverage, Cargo integration, and native code generation remain incomplete. `Result` propagation currently requires the same error type at the call and return sites.

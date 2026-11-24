@@ -15,6 +15,56 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("reference reassignment preserves earlier reborrows and then permits deferred initialization", """
+        fn main() {
+            let mut x = 1;
+            let mut y = 2;
+            let mut r = &mut x;
+            let earlier = &mut *r;
+            r = &mut y;
+            *earlier += 8;
+            *r += 3;
+            println!("{r}");
+            let later;
+            later = &x;
+            let shared: &i32;
+            shared = &mut y;
+            println!("{later} {shared}");
+        }
+    """, "5\n9 5\n"),
+    ("a closure capturing a dereference keeps the original place after reassignment", """
+        fn main() {
+            let mut x = 1;
+            let mut y = 2;
+            let mut r = &mut x;
+            let original = || *r;
+            r = &mut y;
+            println!("{} {}", original(), *r);
+        }
+    """, "1 2\n"),
+    ("immutable static references can be stored and read from aggregates", """
+        static GLOBAL: i32 = 6;
+        struct Wrapper { value: &'static i32 }
+        fn build() -> Wrapper { Wrapper { value: &GLOBAL } }
+        fn main() {
+            let value = build();
+            let tuple: (&'static i32,) = (&GLOBAL,);
+            let array: [&'static i32; 2] = [&GLOBAL, &7];
+            let opt = Some(&GLOBAL);
+            println!("{} {} {} {}", *value.value, *tuple.0, *array[1], *opt.unwrap());
+        }
+    """, "6 6 7 6\n"),
+    ("arrays vectors and slice views support search and in-place reordering", """
+        fn main() {
+            let mut a = [0, 1, 2, 3];
+            a[1..3].reverse();
+            a.swap(0, 3);
+            let mut b = vec![5, 6, 7];
+            b.reverse();
+            println!("{a:?} {b:?} {} {} {} {}", a.contains(&2), a.starts_with(&[3, 2]),
+                     a.ends_with(&[0]), a.ends_with(&[5]));
+        }
+    """, "[3, 2, 1, 0] [7, 6, 5] true true true false\n"),
     ("sibling fields stay disjoint through a borrow selected by a branch", """
         struct Pair { x: i32, y: i32 }
         fn exercise(pick: bool) -> i32 {
@@ -2209,6 +2259,30 @@ VALID = [
 ]
 
 INVALID = [
+    ("assigning a reference does not extend a temporary's lifetime", """
+        fn main() {
+            let r: &String;
+            r = &String::from("temporary");
+            println!("{r}");
+        }
+    """, "temporary value dropped while borrowed"),
+    ("assignment conflicts with an active closure borrowing the reference binding", """
+        fn main() {
+            let x = 1;
+            let mut r = &x;
+            let print = || println!("{r}");
+            r = &7;
+            print();
+        }
+    """, "immutably borrowed"),
+    ("a static reference field cannot store a borrow of a local", """
+        struct Wrapper { value: &'static i32 }
+        fn main() {
+            let local = 8;
+            let item = Wrapper { value: &local };
+            println!("{}", item.value);
+        }
+    """, "does not live for 'static"),
     ("selected references still reject overlapping mutable field borrows", """
         struct Pair { x: i32, y: i32 }
         fn exercise(pick: bool) -> i32 {
@@ -3319,6 +3393,63 @@ INVALID = [
 
 
 class InterpreterTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_source_dependency_resolution_and_diagnostic_locations(self):
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            dependency = folder / "dependency"
+            dependency.mkdir()
+            crate = dependency / "lib.rs"
+            crate.write_text("""
+                mod builder;
+                pub use builder::make;
+                pub const LIMIT: u32 = 5;
+                pub type Count = u32;
+                pub struct Report(pub Count);
+                pub(crate) fn internal() -> Count { 7 }
+            """, encoding="utf-8")
+            (dependency / "builder.rs").write_text(
+                "use crate::{Count, Report, LIMIT};\n"
+                "pub fn make(x: Count) -> Report { Report(x + crate::internal() + LIMIT) }\n",
+                encoding="utf-8",
+            )
+            main = folder / "program.rs"
+            main.write_text("""
+                use utility::{Count, Report, make};
+                fn main() {
+                    let n: Count = 3;
+                    let result: Report = make(n);
+                    println!("{} {}", result.0, utility::LIMIT);
+                }
+            """, encoding="utf-8")
+            rlib = folder / "libutility.rlib"
+            binary = folder / "native"
+            subprocess.run(["rustc", "--edition=2021", "--crate-name", "utility", "--crate-type", "rlib",
+                            crate, "-o", rlib], capture_output=True, timeout=30, check=True)
+            native = ["rustc", "--edition=2021", "--extern", f"utility={rlib}", main, "-o", binary]
+            subprocess.run(native, capture_output=True, timeout=30, check=True)
+            expected = subprocess.run([binary], capture_output=True, text=True, timeout=10, check=True)
+            runner = Path(__file__).with_name("rust_in_python.py")
+            python = [sys.executable, runner, "--extern-source", f"utility={crate}", main]
+            actual = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            self.assertEqual(actual.stdout, expected.stdout)
+
+            main.write_text("fn main() { utility::internal(); }", encoding="utf-8")
+            failed = subprocess.run(native, capture_output=True, text=True, timeout=30, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            rejected = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("'internal' is private", rejected.stderr)
+
+            main.write_text("mod broken;\nfn main() { broken::show(); }\n", encoding="utf-8")
+            broken = folder / "broken.rs"
+            broken.write_text("macro_rules! bad { () => { true + 2 }; }\n"
+                              "pub fn show() {\n    bad!();\n}\n", encoding="utf-8")
+            rejected = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertTrue(rejected.stderr.startswith(f"{broken}:3:5:"), rejected.stderr)
+
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_source_location_and_file_inclusion(self):
         with TemporaryDirectory() as directory:
