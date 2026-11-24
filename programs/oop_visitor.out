@@ -1,0 +1,11 @@
+0
+let x = (2 * 3) in (x + max(-x, (x / 4)))
+= Ok(7.5)
+nodes=12 vars=["x"] max_depth=5
+(1 / 0) => Err("division by zero")
+y => Err("unbound variable `y`")
+nope(1) => Err("unknown function nope/1")
+sum(1, 2.5, 3) => Ok(6.5)
+sqrt(16) => Ok(4.0)
+folded: (3 * (z - -4))
+Bin(Num(3.0), Mul, Bin(Var("z"), Sub, Num(-4.0)))

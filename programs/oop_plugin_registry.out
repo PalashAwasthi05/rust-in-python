@@ -1,0 +1,15 @@
+0
+replaced plugin square
+plugins: ["circle", "square", "triangle", "unit"]
+  square: square side 5 area=25.000
+  circle: circle radius 1 area=3.142
+triangle: triangle 3x4 area=6.000
+ hexagon: error: no plugin named "hexagon"
+    unit: square side 1 area=1.000
+total area of one of each: 35.14
+echo hello world   => Ok("> hello world")
+sum 1 2 39         => Ok("42")
+sum 4 x            => Err("bad number \"x\": invalid digit found in string")
+count a b c d      => Ok("4")
+frobnicate now     => Err("unknown command frobnicate")
+commands: ["count", "echo", "sum"]

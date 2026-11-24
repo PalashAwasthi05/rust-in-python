@@ -1,0 +1,29 @@
+0
+Config { name: "", port: 0, verbose: false, level: Info, tags: [], retry: Retry { attempts: 0, backoff_ms: 0 }, ratio: 0.0, parent: None }
+server 8080 Info false
+Config {
+    name: "server",
+    port: 8080,
+    verbose: true,
+    level: Debug,
+    tags: [
+        "x",
+    ],
+    retry: Retry {
+        attempts: 0,
+        backoff_ms: 0,
+    },
+    ratio: 0.0,
+    parent: None,
+}
+retry=Retry { attempts: 3, backoff_ms: 0 } parent=server
+e.tags=["x"] same retry? false
+Window { title: "editor", width: 800, height: 600, resizable: true }
+Window { title: "untitled", width: 1024, height: 768, resizable: true }
+Point3(0, 0, 0) Empty
+Circle(1.5)
+0 "" [] None (false, '\0', 0.0) Info
+Error Warn
+[0, 0, 0]
+Retry { attempts: 0, backoff_ms: 0 }
+0

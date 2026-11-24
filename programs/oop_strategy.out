@@ -1,0 +1,17 @@
+0
+none: 100.00
+10% off: 90.00
+$20 off over $50: 80.00
+$20 off over $50: 25.00
+best for 100: 25% off -> 75
+[-7, -2, 0, 1, 3, 9]
+[9, 3, 1, 0, -2, -7]
+[0, 1, -2, 3, -7, 9]
+[9, 3, 1, 0, -2, -7]
+[0, 1, -2, 3, -7, 9]
+non-empty "": rejected | min-len "": rejected
+non-empty "abc": ok | min-len "abc": rejected
+non-empty "abcdef": ok | min-len "abcdef": ok
+add(6, 7) = 13
+mul(6, 7) = 42
+max(6, 7) = 7

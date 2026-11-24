@@ -1,0 +1,28 @@
+0
+Post https://example.com/api timeout=500
+  Content-Type: application/json
+  Accept: */*
+  body = Some("{\"x\": 1}")
+Request {
+    url: "https://example.com/api",
+    method: Post,
+    headers: [
+        (
+            "Content-Type",
+            "application/json",
+        ),
+        (
+            "Accept",
+            "*/*",
+        ),
+    ],
+    body: Some(
+        "{\"x\": 1}",
+    ),
+    timeout_ms: 500,
+}
+error: GET /x cannot have a body
+RUST_LOG=debug cargo build --release --quiet
+(cd /tmp && RUST_LOG=debug cargo build --release --quiet --offline)
+Command { program: "cargo", args: ["build", "--release", "--quiet", "--offline"], env: [("RUST_LOG", "debug")], cwd: Some("/tmp") }
+3 headers, method Get

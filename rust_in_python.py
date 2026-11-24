@@ -2570,6 +2570,11 @@ class SliceType:
         return f"[{self.element}]"
 
 
+def type_head(annotation):
+    """The type constructor of a type: `Vec` for `Vec<T>`, the type itself otherwise."""
+    return annotation.name if isinstance(annotation, AppliedType) else annotation
+
+
 @dataclass(frozen=True)
 class AssociatedType:
     owner: object
@@ -2928,6 +2933,7 @@ def substitute(annotation, arguments, *, defer_const=False):
 @dataclass
 class Program:
     functions: dict = field(default_factory=dict)
+    type_defaults: dict = field(default_factory=dict)
     types: dict = field(default_factory=dict)
     type_aliases: dict = field(default_factory=dict)
     constructors: dict = field(default_factory=dict)
@@ -3318,7 +3324,10 @@ class Program:
                 and self.implementation(annotation, trait, seen) is not None):
             return True
         if isinstance(annotation, DynType):
-            return trait in self.trait_closure({annotation.trait})
+            # Besides its supertraits, a trait object has the traits implemented for it, like `impl PartialEq for dyn Shape`.
+            return trait in self.trait_closure({annotation.trait}) or any(
+                impl.trait == trait and isinstance(impl.target, DynType) and impl.target.trait == annotation.trait
+                for impl in self.impls)
         if annotation == "str" and (trait in TRAIT_MODULES or trait not in self.traits):
             return trait in {"Debug", "Display", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash"}
         if annotation in FLOAT_TYPES and trait == "Hash":
@@ -3376,6 +3385,9 @@ class Program:
         if isinstance(annotation, IteratorType):
             if trait == ITERATOR:
                 return True
+            if trait in self.traits and trait not in TRAIT_MODULES and trait != "Clone":
+                # User traits with blanket impls, like `impl<I: Iterator> Ext for I`, cover built-in iterators.
+                return self.implementation(annotation, trait, seen) is not None
             source = annotation.source[1] if annotation.source[0] in {"map", "rev"} else annotation.item
             return (trait == "Clone" and self.implements(source, "Clone", assumed)
                     and (annotation.source[0] != "map" or self.implements(annotation.source[3], "Clone", assumed)))
@@ -3761,6 +3773,11 @@ class Parser:
                             and (signature is None or target.lifetime not in signature)):
                         raise token.error(f"undeclared or unsupported lifetime {target.lifetime}")
                 return target
+            program = getattr(self, "current_program", None)
+            defaults = program.type_defaults.get(name) if program is not None else None
+            if defaults and len(arguments or ()) < len(defaults) and None not in defaults[len(arguments or ()):]:
+                # `Conn` with `struct Conn<State = Disconnected>` means `Conn<Disconnected>`.
+                arguments = (*(arguments or ()), *defaults[len(arguments or ()):])
             return AppliedType(name, arguments) if arguments is not None else name
         raise token.error(f"unsupported type {token.text!r}")
 
@@ -4496,7 +4513,11 @@ class Parser:
         name = self.declare_token(self.identifier())
         if name.text in program.types or name.text in PRIMITIVES:
             raise name.error(f"duplicate type {name.text!r}")
+        self.parameter_defaults = {}
         lifetimes, self.type_parameters = self.generic_parameters()
+        defaults = tuple(self.parameter_defaults.get(parameter) for parameter in self.type_parameters)
+        if any(default is not None for default in defaults):
+            program.type_defaults[name.text] = defaults
         program.type_lifetimes[name.text] = tuple(lifetimes)
         outer_lifetimes = self.lifetime_scope
         self.lifetime_scope = {**outer_lifetimes, **lifetimes}
@@ -6549,6 +6570,7 @@ class Checker:
         self.pending_selections = []
         self.error_conversions = []
         self.mutable_places = set()
+        self.deref_sources = {}
         self.pretyped = {}
         self.std_string_search = False
 
@@ -6706,7 +6728,7 @@ class Checker:
             for associated in trait.associated.values():
                 self.check_bounds(associated.parameters, trait.name)
                 for bound in associated.bounds:
-                    if bound not in TRAIT_MODULES and bound not in self.program.traits:
+                    if bound not in TRAIT_MODULES and bound not in self.program.traits and bound != "?Sized":
                         raise trait.name.error(f"unknown trait {bound!r}")
             for method in trait.methods.values():
                 self.check_bounds(method.type_parameters, method.name)
@@ -6720,7 +6742,7 @@ class Checker:
                 self.check_type(method.result, method.name, allow_never=True)
         for index, impl in enumerate(self.program.impls):
             self.check_bounds(impl.parameters, impl.token)
-            if isinstance(impl.target, SliceType) or impl.target == "str":
+            if isinstance(impl.target, (SliceType, DynType)) or impl.target == "str":
                 self.check_type(ReferenceType(impl.target, False), impl.token)
             else:
                 self.check_type(impl.target, impl.token)
@@ -6740,7 +6762,7 @@ class Checker:
                     target_parameters.update(type_leaves(signature))
             if any(parameter not in target_parameters for parameter in impl.parameters):
                 raise impl.token.error("unconstrained impl parameter")
-            if impl.trait is None and impl.token.module[:1] != STD_ROOT and (
+            if impl.trait is None and impl.token.module[:1] != STD_ROOT and not isinstance(impl.target, DynType) and (
                     isinstance(impl.target, TupleType) or self.program.layout(impl.target) is None):
                 raise impl.token.error("inherent impl requires a declared struct or enum")
             for previous in self.program.impls[:index]:
@@ -6768,7 +6790,14 @@ class Checker:
                                for wanted, actual in zip(declaration.parameters, definition.parameters))):
                     raise impl.token.error(f"associated type {name!r} has incompatible generic parameters")
                 kind = definition.body
-                self.check_type(kind, impl.token)
+                if "?Sized" in declaration.bounds and (kind == "str" or isinstance(kind, (SliceType, DynType))):
+                    # `type Target: ?Sized` may name an unsized type such as `str`, `[T]` or `dyn Trait`.
+                    if isinstance(kind, DynType):
+                        self.check_dyn(kind, impl.token)
+                    elif isinstance(kind, SliceType):
+                        self.check_type(kind.element, impl.token)
+                else:
+                    self.check_type(kind, impl.token)
                 resolved = self.resolve(kind)
                 if (isinstance(resolved, AssociatedType) and resolved.item == name
                         and resolved.owner == impl.target):
@@ -7988,7 +8017,7 @@ class Checker:
             if unsized is not None:
                 self.check_dyn_conversion(*unsized, expr.token)
                 result = expected
-        result = self.coerce_reference(expr, result, expected)
+        result = self.coerce_reference(expr, result, expected, scope)
         self.program.expr_types[id(expr)] = result
         return result
 
@@ -8013,7 +8042,7 @@ class Checker:
                     return None
         return found
 
-    def coerce_reference(self, expr, actual, expected):
+    def coerce_reference(self, expr, actual, expected, scope=None):
         if (not isinstance(expected, ReferenceType) or not isinstance(actual, ReferenceType)
                 or actual.inner == expected.inner
                 or (expected.mutable and not actual.mutable)):
@@ -8029,7 +8058,7 @@ class Checker:
             self.program.expr_types[id(original)] = actual
             expr.kind, expr.args, expr.label = "deref", (original, False), None
             self.program.expr_types[id(expr)] = inner
-            return self.coerce_reference(expr, inner, expected)
+            return self.coerce_reference(expr, inner, expected, scope)
         if isinstance(inner, AppliedType) and inner.name == BOX and self.resolve(target) != inner and not (
                 isinstance(self.resolve(target), (TypeVariable, DynType))):
             # &Box<T> and &Rc<T> coerce to &T.
@@ -8044,7 +8073,7 @@ class Checker:
             expr.kind, expr.args, expr.label = "borrow", (pointee, actual.mutable), None
             coerced = ReferenceType(inner.arguments[0], actual.mutable)
             self.program.expr_types[id(expr)] = coerced
-            return self.coerce_reference(expr, coerced, expected)
+            return self.coerce_reference(expr, coerced, expected, scope)
         if target == "str" and actual.inner == STRING and not expected.mutable:
             conversion = "string_reference"
         elif isinstance(target, SliceType) and (isinstance(actual.inner, ArrayType) or is_vector(actual.inner)):
@@ -8054,6 +8083,23 @@ class Checker:
         elif isinstance(target, DynType):
             self.check_dyn_conversion(actual.inner, target, expr.token)
             conversion = "dyn_reference"
+        elif (scope is not None and not isinstance(self.resolve(target), TypeVariable)
+              and self.derefs(inner) and type_head(self.resolve(target)) != type_head(inner)):
+            # Deref coercion through a user Deref impl: &W becomes &*Deref::deref(&W).
+            original = replace(expr)
+            for table in (self.program.call_types, self.program.call_functions, self.program.dispatches):
+                if id(expr) in table:
+                    table[id(original)] = table.pop(id(expr))
+            self.program.expr_types[id(original)] = actual
+            self.pretyped[id(original)] = actual
+            pointee, target_type = self.deref_call(original, actual, scope, expr.token)
+            if expected.mutable and not self.upgrade_deref(pointee.args[0]):
+                raise expr.token.error("cannot borrow through Deref as mutable")
+            self.program.expr_types[id(pointee)] = target_type
+            expr.kind, expr.args, expr.label = "borrow", (pointee, expected.mutable), None
+            coerced = ReferenceType(target_type, expected.mutable)
+            self.program.expr_types[id(expr)] = coerced
+            return self.coerce_reference(expr, coerced, expected, scope)
         else:
             return actual
         original = replace(expr)
@@ -8775,7 +8821,8 @@ class Checker:
                 while isinstance(peeled_left, ReferenceType) and isinstance(peeled_right, ReferenceType):
                     peeled_left, peeled_right = self.resolve(peeled_left.inner), self.resolve(peeled_right.inner)
                 trait = "PartialEq" if token.text in {"==", "!="} else "PartialOrd"
-                if (peeled_left != peeled_right and not isinstance(peeled_left, TypeVariable)
+                if ((peeled_left != peeled_right or isinstance(peeled_left, DynType))
+                        and not isinstance(peeled_left, TypeVariable)
                         and not isinstance(peeled_right, TypeVariable)
                         and (self.program.implementation(peeled_left, trait, arguments_wanted=(peeled_right,))
                              or self.bounded_compare(peeled_left, peeled_right, trait))):
@@ -9441,6 +9488,13 @@ class Checker:
             base, ArrayType) else "str" if base == STRING else None
         if unsized is not None:
             method = self.inherent_method(unsized, name)
+            if method is None:
+                # Trait methods implemented for the slice or str, like `impl Stats for [i64]`, after auto-deref.
+                traits = [trait for trait in self.program.traits.values()
+                          if name in trait.methods and self.has_receiver(trait.methods[name])
+                          and self.implements(unsized, trait.name.text)
+                          and self.trait_available(unsized, trait.name.text, expr.token)]
+                method = traits[0].methods[name] if len(traits) == 1 else None
             if method is not None and self.has_receiver(method):
                 wanted = method.params[0][2]
                 mutable = isinstance(wanted, ReferenceType) and wanted.mutable
@@ -9982,6 +10036,14 @@ class Checker:
             if impl.trait is None and name in impl.methods and target == owner:
                 method = impl.methods[name]
                 return None if method.associated_const else len(method.params)
+        # A trait's associated function named through an implementing type, like `UserId::from`.
+        arities = {None if method.associated_const else len(method.params)
+                   for impl in self.program.impls if impl.trait is not None
+                   and (impl.target.name if isinstance(impl.target, AppliedType) else impl.target) == owner
+                   for trait in [self.program.traits.get(impl.trait)] if trait and name in trait.methods
+                   for method in [trait.methods[name]]}
+        if len(arities) == 1:
+            return arities.pop()
         if owner in self.parameters:
             for bound in self.program.trait_closure(self.parameters[owner].bounds):
                 trait = self.program.traits.get(bound)
@@ -10057,11 +10119,14 @@ class Checker:
         if not layout or len(layout[1]) != 1:
             return False
         resolved = self.resolve(annotation)
-        owner = resolved.name if isinstance(resolved, AppliedType) else resolved
-        # User code sees the fields of its own types (and tuples), never those of std's types.
-        return any(field == name.text for field, _ in layout[1][0].fields) and (
-            name.module[:1] == STD_ROOT
-            or not (isinstance(owner, str) and owner.startswith("std" + MODULE_SEPARATOR)))
+        declared = self.program.types.get(resolved.name if isinstance(resolved, AppliedType) else resolved)
+        ctor = layout[1][0]
+        scope = dict(ctor.visibility).get(name.text, ())
+        # A field is found only where it is visible: std internals stay hidden from user code, so
+        # auto-deref continues to the target, while a user type's own fields are found first.
+        return any(field == name.text for field, _ in ctor.fields) and (
+            name.module[:1] == STD_ROOT or declared is None
+            or declared[0].module[:1] != STD_ROOT and name.module[:len(scope)] == scope)
 
     def derefs(self, annotation):
         annotation = self.resolve(annotation)
@@ -12430,6 +12495,32 @@ class Interpreter:
         elif annotation != "()":
             raise RustPanic(f"cannot hash a value of type {annotation}")
 
+    def dyn_format(self, value, annotation, spec):
+        """Format a trait object through a Display or Debug impl written for `dyn Trait` itself, if any."""
+        while isinstance(annotation, ReferenceType) or isinstance(annotation, AppliedType) and annotation.name in {BOX, RC}:
+            annotation = annotation.inner if isinstance(annotation, ReferenceType) else annotation.arguments[0]
+        if not isinstance(annotation, DynType) or spec.kind not in {"", "?"}:
+            return None
+        trait = "Debug" if spec.kind == "?" else "Display"
+        impl = next((impl for impl in self.program.impls if impl.trait == trait and isinstance(impl.target, DynType)
+                     and impl.target.trait == annotation.trait), None)
+        if impl is None:
+            return None
+        while not isinstance(value, DynAddress):
+            if isinstance(value, BoxValue):
+                value = DynAddress(value.address, self.program.concrete_type(value.concrete))
+            elif isinstance(value, RcValue):
+                value = DynAddress(Address(value.cell), value.concrete)
+            elif isinstance(value, Address):
+                value = value.read()
+            else:
+                return None
+        formatter = Address(Binding(self.formatter_value(spec.alternate, spec), True))
+        result = self.call(impl.methods["fmt"].name.text, (value, formatter), {})
+        if result.constructor.path.endswith("::Err"):
+            raise RustPanic("a formatting trait implementation returned an error when the underlying stream did not")
+        return formatter.read().fields[0]
+
     def builtin_fmt(self, value, formatter, debug, result):
         """`x.fmt(f)` for a built-in x, honouring the formatter's width, fill, and precision as Rust does."""
         stored = formatter.read()
@@ -12664,6 +12755,14 @@ class Interpreter:
         if isinstance(argument, str):
             return scope.find(replace(token, text=argument)).value
         return substitute(argument, self.type_arguments).value
+
+    def dyn_operand(self, expr, value, scope):
+        """The trait-object reference for an operand of type `dyn Trait` or a reference to one."""
+        if not isinstance(self.program.expr_types.get(id(expr)), ReferenceType):
+            value = self.address(expr, scope)
+        while not isinstance(value, DynAddress) and isinstance(value, Address):
+            value = value.read()
+        return value
 
     def lazy_static(self, name):
         if name not in self.statics:
@@ -13290,6 +13389,10 @@ class Interpreter:
                                                 else kind for kind in self.program.cross_compares[id(expr)])
                 impl, arguments = self.program.implementation(left_type, trait, arguments_wanted=(right_type,))
                 pair = (shared(map_of(value)), shared(map_of(other)))
+                if isinstance(left_type, DynType):
+                    # `impl PartialEq for dyn Trait` receives trait objects, which dispatch on their concrete type.
+                    pair = tuple(self.dyn_operand(operand, evaluated, scope)
+                                 for operand, evaluated in ((left, value), (right, other)))
                 if trait == "PartialEq":
                     same = self.call(impl.methods["eq"].name.text, pair, arguments)
                     return same if token.text == "==" else not same
@@ -13391,7 +13494,8 @@ class Interpreter:
                                for dimension, count in (("width", spec.width), ("precision", spec.precision))
                                if isinstance(count, FormatCount)}
                 annotation = self.program.normalize(substitute(field.annotation, self.type_arguments))
-                rendered.append(format_value(item, annotation, replace(spec, **adjustments)))
+                text = self.dyn_format(item, annotation, replace(spec, **adjustments))
+                rendered.append(format_value(item, annotation, replace(spec, **adjustments)) if text is None else text)
             rendered = "".join(rendered)
             if self.track_drops:
                 # Format arguments are borrowed; temporaries among them, like a RefCell guard, drop here.
@@ -15945,6 +16049,27 @@ def rust_from_utf8(interpreter, result, data):
 @intrinsic
 def rust_box_unsized(interpreter, result, value):
     return BoxValue(Address(Binding(value, True)), result.arguments[0])
+
+
+def any_downcast(interpreter, result, this):
+    """`<dyn Any>::downcast_ref` and `downcast_mut`: the trait object's data if its concrete type is T."""
+    while not isinstance(this, DynAddress) and isinstance(this, Address):
+        this = this.read()
+    wanted = interpreter.program.concrete_type(interpreter.intrinsic_types[0])
+    if isinstance(this, DynAddress) and interpreter.program.concrete_type(this.concrete) == wanted:
+        return interpreter.variant(result, "Some", this.address)
+    return interpreter.variant(result, "None")
+
+
+INTRINSICS["Any.downcast_ref"] = INTRINSICS["Any.downcast_mut"] = any_downcast
+
+
+@intrinsic
+def Box__downcast(interpreter, result, this):
+    wanted = interpreter.program.concrete_type(interpreter.intrinsic_types[0])
+    if interpreter.program.concrete_type(this.concrete) == wanted:
+        return interpreter.variant(result, "Ok", BoxValue(this.address, wanted))
+    return interpreter.variant(result, "Err", this)
 
 
 @intrinsic
