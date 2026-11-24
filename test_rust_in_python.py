@@ -246,6 +246,116 @@ VALID = [
             println!("{}", p.second);
         }
     """, "2\n"),
+    ("shared borrow ends at last use", """
+        fn main() {
+            let mut value = 1;
+            let first = &value;
+            let second = first;
+            println!("{first} {second}");
+            value = 2;
+            println!("{value}");
+        }
+    """, "1 1\n2\n"),
+    ("disjoint fields borrowed across calls", """
+        struct Pair { left: i32, right: i32 }
+        fn add(x: &mut i32, y: &i32) { *x += *y; }
+        fn main() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let left = &mut pair.left;
+            let right = &pair.right;
+            add(left, right);
+            add(left, right);
+            println!("{} {}", pair.left, pair.right);
+        }
+    """, "5 2\n"),
+    ("split mutable reborrow", """
+        struct Pair { left: i32, right: i32 }
+        fn main() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let whole = &mut pair;
+            let left = &mut whole.left;
+            let right = &mut whole.right;
+            *left += 3;
+            *right += 4;
+            println!("{} {}", whole.left, whole.right);
+        }
+    """, "4 6\n"),
+    ("mutable argument reservation allows a later read", """
+        fn add(x: &mut i32, delta: i32) { *x += delta; }
+        fn main() {
+            let mut value = 3;
+            let handle = &mut value;
+            add(handle, *handle);
+            add(handle, *handle);
+            println!("{value}");
+        }
+    """, "12\n"),
+    ("shared coercion from mutable reference", """
+        fn sum(x: &i32, y: &i32) -> i32 { *x + *y }
+        fn main() {
+            let mut value = 3;
+            let handle = &mut value;
+            let shared: &i32 = handle;
+            println!("{}", sum(shared, handle));
+            *handle += 1;
+            println!("{value}");
+        }
+    """, "6\n4\n"),
+    ("temporary values can be borrowed", """
+        fn sum(a: &i32, b: &i32) -> i32 { *a + *b }
+        fn main() {
+            let x = 3;
+            let temp = &mut { x + 2 };
+            *temp += 1;
+            println!("{}", sum(temp, &2));
+        }
+    """, "8\n"),
+    ("branch-sensitive borrow uses", """
+        fn use_value(flag: bool) {
+            let mut value = 1;
+            let shared = &value;
+            if flag { value = 2; println!("{value}"); } else { println!("{shared}"); }
+        }
+        fn main() { use_value(true); use_value(false); }
+    """, "2\n1\n"),
+    ("moved aggregate replaced after its borrow ends", """
+        #[derive(Clone, Debug)]
+        struct Item(i32);
+        fn replace(place: &mut Item, value: Item) { *place = value; }
+        fn main() {
+            let mut item = Item(2);
+            let cloned = (&item);
+            let copied = cloned.clone();
+            replace(&mut item, Item(5));
+            println!("{copied:?} {item:?}");
+        }
+    """, "Item(2) Item(5)\n"),
+    ("borrow recreated on loop iteration", """
+        fn main() {
+            let mut value = 0;
+            for n in 1..4 {
+                let handle = &mut value;
+                *handle += n;
+                println!("{value}");
+            }
+        }
+    """, "1\n3\n6\n"),
+    ("temporary references can be dereferenced immediately", """
+        struct Point { x: i32 }
+        fn main() {
+            let mut point = Point { x: 1 };
+            (&mut point).x += 1;
+            *(&mut point.x) += 1;
+            let shared = &*(&point);
+            println!("{}", shared.x);
+        }
+    """, "3\n"),
+    ("diverging reference initializer", """
+        fn main() {
+            let missing: &i32 = return;
+            println!("{missing}");
+        }
+    """, ""),
 ]
 
 INVALID = [
@@ -370,6 +480,75 @@ INVALID = [
             let again = data;
         }
     """, "use of moved value"),
+    ("shared alias retains loan", """
+        fn main() {
+            let mut value = 1;
+            let shared = &value;
+            let alias = shared;
+            value = 2;
+            println!("{alias}");
+        }
+    """, "immutably borrowed"),
+    ("no read through owner of active mutable loan", """
+        fn main() {
+            let mut value = 1;
+            let handle = &mut value;
+            let copy = value;
+            *handle += copy;
+        }
+    """, "mutably borrowed"),
+    ("parent loan stays live through reborrow", """
+        struct Pair { left: i32, right: i32 }
+        fn main() {
+            let mut pair = Pair { left: 1, right: 2 };
+            let handle = &mut pair;
+            let child = &mut handle.left;
+            pair.right = 4;
+            *child = 3;
+        }
+    """, "mutably borrowed"),
+    ("second mutable borrow overlaps", """
+        fn main() {
+            let mut value = 1;
+            let first = &mut value;
+            let second = &mut value;
+            *first += *second;
+        }
+    """, "mutably borrowed"),
+    ("cannot borrow immutable binding as mutable", """
+        fn main() { let value = 1; let _ = &mut value; }
+    """, "cannot borrow immutable place"),
+    ("cannot borrow uninitialized value", """
+        fn main() { let value: i32; let _ = &value; }
+    """, "uninitialized value"),
+    ("cannot write through shared reference", """
+        fn main() { let value = 1; let shared = &value; *shared = 2; }
+    """, "cannot write through a shared reference"),
+    ("cannot move noncopy dereference", """
+        struct Item(i32);
+        fn main() { let item = Item(1); let shared = &item; let moved = *shared; }
+    """, "cannot move out of borrowed place"),
+    ("mutable reference moves when assigned", """
+        fn main() { let mut value = 1; let first = &mut value; let alias = first; *first = 2; *alias = 3; }
+    """, "use of moved reference"),
+    ("two mutable reservations cannot activate together", """
+        fn add(left: &mut i32, right: &mut i32) { *left += *right; }
+        fn main() { let mut value = 1; let handle = &mut value; add(handle, handle); }
+    """, "cannot borrow"),
+    ("explicit mutable argument does not reserve", """
+        fn add(left: &mut i32, right: i32) { *left += right; }
+        fn main() { let mut value = 1; add(&mut value, value); }
+    """, "mutably borrowed"),
+    ("loop back edge keeps a shared borrow alive", """
+        fn main() {
+            let mut value = 1;
+            let shared = &value;
+            for n in 0..2 { println!("{shared}"); value = n; }
+        }
+    """, "immutably borrowed"),
+    ("format arguments retain loans together", """
+        fn main() { let mut value = 1; println!("{:?} {:?}", &mut value, &value); }
+    """, "mutably borrowed"),
 ]
 
 

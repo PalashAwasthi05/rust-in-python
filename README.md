@@ -2,7 +2,7 @@
 
 I heard Rust had a steep learning curve, so I put Python underneath it.
 
-This is a Rust interpreter written entirely in Python. It tokenizes, parses, type-checks, and runs a subset of Rust using only the Python standard library. The borrow checker saw the repo name and sent the move checker ahead.
+This is a Rust interpreter written entirely in Python. It tokenizes, parses, type-checks, and runs a subset of Rust using only the Python standard library. Python is now checking my borrowing habits. This seemed funnier before it started saying no.
 
 ## Run it
 
@@ -37,6 +37,8 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Exhaustive `match` with nested patterns, alternatives, integer ranges, and guards
 - Move and initialization checks across branches and loop iterations
 - Partial moves, assignment after a move, and selected `Clone`, `Copy`, and `Debug` derives
+- Shared and mutable references to locals, fields, and temporaries
+- Borrow checks through last use, including aliases, reborrows, and function arguments
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -79,6 +81,25 @@ fn main() {
 }
 ```
 
+## Borrow something
+
+```rust
+fn add(value: &mut i32, delta: i32) {
+    *value += delta;
+}
+
+fn main() {
+    let mut balance = 3;
+    let borrowed = &mut balance;
+    add(borrowed, *borrowed);
+    println!("{balance}");
+}
+```
+
+The implicit mutable reborrow activates when `add` is called, so the second argument can read the old balance. The program prints `6`. No interest was charged.
+
 ## Scope
 
-This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location. The remaining work includes general reference expressions, borrow checking, lifetime inference, generics, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation.
+This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
+
+Reference values can be bound to locals and passed as function arguments. The reference implementation still needs reassignment, pattern binding modes, reference fields and returns, and named lifetime inference. Generics, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are also incomplete.

@@ -7,8 +7,9 @@ Supported types: i32, bool, &str (string literals), (), structs, and enums.
 Supported syntax: functions, let bindings, mut, blocks, if/else,
 while, loop, for over integer ranges, return, break, continue, scalar operators,
 exhaustive match, and println!. Integers use checked i32 arithmetic.
-This subset checks moves and initialization. General borrowing, lifetime
-checking, and the Rust standard library are outside its scope.
+This subset checks moves, initialization, and local shared and mutable loans.
+References in aggregates, reference returns, and the standard library are
+outside its scope.
 """
 
 from __future__ import annotations
@@ -121,6 +122,16 @@ class Constructor:
         raise token.error(f"{self.path} has no field {token.text!r}")
 
 
+@dataclass(frozen=True)
+class ReferenceType:
+    inner: object
+    mutable: bool
+
+    def __str__(self):
+        prefix = "&mut " if self.mutable else "&"
+        return f"{prefix}{self.inner}"
+
+
 @dataclass
 class Program:
     functions: dict = field(default_factory=dict)
@@ -131,6 +142,8 @@ class Program:
     derives: dict = field(default_factory=dict)
 
     def is_copy(self, annotation):
+        if isinstance(annotation, ReferenceType):
+            return not annotation.mutable
         return annotation in PRIMITIVES or "Copy" in self.derives.get(annotation, {})
 
 
@@ -169,10 +182,14 @@ class Parser:
             return token.text
         if token.text == "&":
             lifetime = self.accept("'static")
-            self.expect("str")
-            if static_string and not lifetime:
-                raise token.error("this position requires &'static str")
-            return "&str"
+            mutable = bool(self.accept("mut"))
+            if not mutable and self.accept("str"):
+                if static_string and not lifetime:
+                    raise token.error("this position requires &'static str")
+                return "&str"
+            if static_string or lifetime:
+                raise token.error("references in fields and return types are unsupported")
+            return ReferenceType(self.type_name(), mutable)
         if token.text == "(":
             self.expect(")")
             return "()"
@@ -408,6 +425,10 @@ class Parser:
             return Expr(word, token, (value,), label)
         if word in {"-", "!"}:
             return Expr("unary", token, (self.expression(7, allow_record=allow_record),))
+        if word in {"&", "*"}:
+            mutable = bool(self.accept("mut")) if word == "&" else False
+            operand = self.expression(7, allow_record=allow_record)
+            return Expr("borrow" if word == "&" else "deref", token, (operand, mutable))
         if word == "(":
             if self.accept(")"):
                 return Expr("literal", token, ("()", None))
@@ -628,16 +649,47 @@ def require(actual, expected, token):
         raise token.error(f"expected {expected}, found {actual}")
 
 
-def assignment_target(expr, scope):
-    fields = []
-    while expr.kind in {"group", "field"}:
-        if expr.kind == "field":
-            fields.append(expr.args[1])
+def ungroup(expr):
+    while expr.kind == "group":
         expr = expr.args[0]
-    if expr.kind != "name":
-        raise expr.token.error("invalid assignment target")
-    binding = scope.find(expr.token)
-    return binding, tuple(reversed(fields))
+    return expr
+
+
+def place_root(expr):
+    root = ungroup(expr)
+    while root.kind == "field":
+        root = ungroup(root.args[0])
+    return root
+
+
+def reference_source(expr):
+    return ungroup(expr).kind in {"name", "borrow"}
+
+
+def shared_coercion(actual, expected):
+    return (isinstance(actual, ReferenceType) and actual.mutable
+            and isinstance(expected, ReferenceType) and not expected.mutable
+            and actual.inner == expected.inner)
+
+
+@dataclass(frozen=True)
+class Address:
+    binding: Binding
+    fields: tuple = ()
+
+    def child(self, field):
+        return Address(self.binding, (*self.fields, field))
+
+    def read(self):
+        value = self.binding.value
+        for name in self.fields:
+            value = value.fields[value.constructor.index(name)]
+        return value
+
+    def write(self, value):
+        if self.fields:
+            value = self.binding.value.replace(self.fields, value)
+        self.binding.value = value
 
 
 @dataclass(frozen=True)
@@ -889,6 +941,11 @@ class Checker:
         return annotation in PRIMITIVES or trait in self.program.derives.get(annotation, {})
 
     def check_type(self, annotation, token, *, allow_never=False):
+        if isinstance(annotation, ReferenceType):
+            if isinstance(annotation.inner, ReferenceType):
+                raise token.error("nested reference types are unsupported")
+            self.check_type(annotation.inner, token)
+            return
         if annotation in PRIMITIVES or annotation in self.program.types:
             return
         if annotation != NEVER or not allow_never:
@@ -1009,6 +1066,8 @@ class Checker:
     def match_type(self, expr, scope):
         scrutinee, arms = expr.args
         annotation = self.type_of(scrutinee, scope)
+        if isinstance(annotation, ReferenceType):
+            raise scrutinee.token.error("match on a reference requires explicit dereferencing")
         coverage = []
         result = NEVER
         for source, guard, body in arms:
@@ -1056,6 +1115,8 @@ class Checker:
                     require(test, "bool", condition.token)
                 else:
                     source = args[1]
+                    if isinstance(test, ReferenceType):
+                        raise condition.token.error("matching a reference requires explicit dereferencing")
                     pattern, bindings = self.prepare_pattern(source, test)
                     self.program.patterns[id(source)] = (pattern, bindings)
                     scope = Scope(scope, {name: Binding(kind, mutable)
@@ -1081,8 +1142,27 @@ class Checker:
             result = unify_exits([*target.exit_types, (tail, expr.token)])
         else:
             result = self.check_expr(expr, scope)
+        if isinstance(result, ReferenceType) and not reference_source(expr):
+            raise expr.token.error("reference values must come from a borrow or a local binding")
         self.program.expr_types[id(expr)] = result
         return result
+
+    def require_place(self, expr, *, write=False, allow_temporary=False):
+        place = place_root(expr)
+        if place.kind == "deref":
+            pointer = self.program.expr_types[id(place.args[0])]
+            if pointer == NEVER:
+                return
+            if write and not pointer.mutable:
+                raise expr.token.error("cannot write through a shared reference")
+            return
+        if place.kind != "name":
+            if allow_temporary:
+                return
+            raise expr.token.error("expected a local place")
+        ctor = self.program.constructors.get(place.token.text)
+        if ctor and ctor.style == "unit" and not allow_temporary:
+            raise expr.token.error("expected a local place")
 
     def check_expr(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
@@ -1100,9 +1180,35 @@ class Checker:
             return scope.find(token).value
         if kind == "field":
             value, name = args
-            return self.field_type(self.type_of(value, scope), name)
+            annotation = self.type_of(value, scope)
+            if isinstance(annotation, ReferenceType):
+                value = Expr("deref", value.token, (value, False))
+                expr.args = (value, name)
+                annotation = self.type_of(value, scope)
+            return self.field_type(annotation, name)
+        if kind == "borrow":
+            value, mutable = args
+            annotation = self.type_of(value, scope)
+            if annotation == NEVER:
+                return NEVER
+            self.require_place(value, write=mutable, allow_temporary=True)
+            result = ReferenceType(annotation, mutable)
+            self.check_type(result, token)
+            return result
+        if kind == "deref":
+            value = args[0]
+            annotation = self.type_of(value, scope)
+            if annotation == NEVER:
+                return NEVER
+            if not isinstance(annotation, ReferenceType):
+                raise token.error(f"cannot dereference {annotation}")
+            return annotation.inner
         if kind == "clone":
             annotation = self.type_of(args[0], scope)
+            if isinstance(annotation, ReferenceType) and self.implements(annotation.inner, "Clone"):
+                operand = Expr("deref", args[0].token, (args[0], False))
+                expr.args = (operand,)
+                annotation = self.type_of(operand, scope)
             if annotation != NEVER and not self.implements(annotation, "Clone"):
                 raise token.error(f"{annotation} does not implement Clone")
             return annotation
@@ -1129,8 +1235,12 @@ class Checker:
             actual = self.type_of(value, scope) if value else annotation
             if annotation:
                 self.check_type(annotation, token)
-                require(actual, annotation, token)
+                if not shared_coercion(actual, annotation):
+                    require(actual, annotation, token)
             annotation = annotation or actual
+            if isinstance(annotation, ReferenceType):
+                if value is None or source.kind not in {"bind", "wild"} or otherwise:
+                    raise token.error("reference let requires a simple initialized binding")
             pattern, bindings = self.prepare_pattern(source, annotation)
             if value is None and not bindings:
                 raise token.error("uninitialized let requires a local binding")
@@ -1186,15 +1296,15 @@ class Checker:
             return actual
         if kind == "assign":
             left, right = args
-            binding, fields = assignment_target(left, scope)
-            annotation = binding.value
-            for name in fields:
-                annotation = self.field_type(annotation, name)
+            annotation = self.type_of(left, scope)
+            self.require_place(left, write=True)
+            if isinstance(annotation, ReferenceType):
+                raise token.error("reassigning reference bindings is unsupported")
             if token.text != "=":
                 require(annotation, "i32", token)
             actual = self.type_of(right, scope)
             require(actual, annotation, token)
-            return NEVER if actual == NEVER else "()"
+            return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
             return self.binary_type(token, *(self.type_of(arg, scope) for arg in args))
         if kind == "call":
@@ -1213,7 +1323,8 @@ class Checker:
                 raise token.error(f"{token.text} takes {len(function.params)} arguments")
             types = [self.type_of(arg, scope) for arg in args]
             for actual, (_, _, expected) in zip(types, function.params):
-                require(actual, expected, token)
+                if not shared_coercion(actual, expected):
+                    require(actual, expected, token)
             return NEVER if NEVER in types else function.result
         if kind == "print":
             if not args:
@@ -1232,6 +1343,8 @@ class Checker:
                     actual = scope.find(Token(name, token.line, token.column)).value
                 else:
                     actual = next(positional)
+                if isinstance(actual, ReferenceType):
+                    actual = actual.inner
                 if mode == "display" and actual == "()":
                     raise token.error("() requires debug formatting")
                 if actual in self.program.types and (mode != "debug" or not self.implements(actual, "Debug")):
@@ -1261,15 +1374,17 @@ class Checker:
 class Local:
     token: Token
     mutable: bool
+    loan: Loan | None = None
 
 
 @dataclass(frozen=True)
 class Place:
     local: Local
     fields: tuple = ()
+    holder: Local | None = field(default=None, compare=False)
 
     def child(self, field):
-        return Place(self.local, (*self.fields, field))
+        return Place(self.local, (*self.fields, field), self.holder)
 
     def contains(self, other):
         return self.local is other.local and other.fields[:len(self.fields)] == self.fields
@@ -1282,11 +1397,35 @@ class Place:
         return ".".join((self.local.token.text, *self.fields))
 
 
+@dataclass(frozen=True, eq=False)
+class Loan:
+    place: Place
+    mutable: bool
+    parent: Loan | None = None
+    two_phase: bool = False
+
+    def ancestors(self):
+        loan = self
+        while loan:
+            yield loan
+            loan = loan.parent
+
+
 @dataclass(frozen=True)
 class Effect:
     kind: str
     place: Place
     token: Token
+    loan: Loan | None = None
+
+    def reference_uses(self):
+        if self.kind in {"declare", "uninitialized"}:
+            return set()
+        if self.place.holder:
+            return {self.place.holder}
+        if self.place.local.loan:
+            return {self.place.local}
+        return set()
 
 
 @dataclass(eq=False)
@@ -1320,11 +1459,15 @@ class MoveState:
         if effect is None:
             return
         kind, place, token = effect.kind, effect.place, effect.token
+        if place.holder and any(item == Place(place.holder) for item, _ in self.missing):
+            raise token.error(f"use of moved reference {place.holder.token.text!r}")
+        if kind == "deref_move":
+            raise token.error(f"cannot move out of borrowed place {place.name!r}")
         if kind == "guard_move":
             raise token.error(f"cannot move out of {place.name!r} in a pattern guard")
         if kind == "guard_write":
             raise token.error(f"cannot assign to {place.name!r} in a pattern guard")
-        if kind in {"read", "move"}:
+        if kind in {"read", "move", "borrow"}:
             unavailable = [(item, reason) for item, reason in self.missing if place.overlaps(item)]
             if unavailable:
                 item, reason = min(unavailable, key=lambda entry: (len(entry[0].fields), entry[0].name, entry[1]))
@@ -1354,10 +1497,15 @@ class Ownership:
             scope = Scope()
             entry = FlowNode()
             cursor = entry
-            for token, mutable, _ in function.params:
+            for token, mutable, annotation in function.params:
                 if token.text == "_":
                     continue
-                local = Local(token, mutable)
+                loan = None
+                if isinstance(annotation, ReferenceType):
+                    referent = Local(Token(f"*{token.text}", token.line, token.column), annotation.mutable)
+                    loan = Loan(Place(referent), annotation.mutable)
+                    cursor = self.emit(cursor, "declare", loan.place, token)
+                local = Local(token, mutable, loan)
                 scope.bindings[token.text] = local
                 cursor = self.emit(cursor, "declare", Place(local), token)
             self.lower(function.body, scope, cursor)
@@ -1382,14 +1530,76 @@ class Ownership:
                         queued.add(successor)
         for node, state in incoming.items():
             state.validate(node.effect)
+        Ownership.check_loans(incoming)
+
+    @staticmethod
+    def check_loans(nodes):
+        if not any(node.effect and (node.effect.kind == "borrow" or node.effect.reference_uses())
+                   for node in nodes):
+            return
+        predecessors = {node: [] for node in nodes}
+        for node in nodes:
+            for successor in node.edges:
+                predecessors[successor].append(node)
+        live = {node: set() for node in nodes}
+        # Reference bindings carry loans back to their last reachable uses.
+        pending = deque(reversed(nodes))
+        queued = set(nodes)
+        while pending:
+            node = pending.popleft()
+            queued.remove(node)
+            before = set().union(*(live[successor] for successor in node.edges))
+            effect = node.effect
+            if effect:
+                if effect.kind in {"declare", "uninitialized"}:
+                    before.discard(effect.place.local)
+                before.update(effect.reference_uses())
+            if before != live[node]:
+                live[node] = before
+                for previous in predecessors[node]:
+                    if previous not in queued:
+                        pending.append(previous)
+                        queued.add(previous)
+        for node, holders in live.items():
+            if node.effect:
+                active = {loan for local in holders for loan in local.loan.ancestors()}
+                Ownership.validate_loans(node.effect, active)
+
+    @staticmethod
+    def validate_loans(effect, live):
+        kind, place, token = effect.kind, effect.place, effect.token
+        if kind not in {"read", "write", "move", "borrow", "activate"}:
+            return
+        if kind == "borrow" and effect.loan.mutable and not place.local.mutable:
+            raise token.error(f"cannot borrow immutable place {place.name!r} as mutable")
+        if kind == "activate":
+            parent = place.local.loan
+            place = parent.place
+        else:
+            parent = place.holder.loan if place.holder else None
+        permitted = set(parent.ancestors()) if parent else set()
+        reference = place.local.loan
+        if kind == "move" and reference:
+            if any(loan is not reference and reference in loan.ancestors() for loan in live):
+                raise token.error(f"cannot move reference {place.name!r} while it is reborrowed")
+        exclusive = kind in {"move", "write", "activate"} or (
+            kind == "borrow" and effect.loan.mutable and not effect.loan.two_phase
+        )
+        for loan in live - permitted:
+            active_mutable = loan.mutable and not loan.two_phase
+            if place.overlaps(loan.place) and (exclusive or active_mutable):
+                action = {"read": "read", "write": "assign to", "move": "move",
+                          "borrow": "borrow", "activate": "borrow"}[kind]
+                mode = "mutably" if active_mutable else "immutably"
+                raise token.error(f"cannot {action} {place.name!r} while {loan.place.name!r} is {mode} borrowed")
 
     @staticmethod
     def connect(source, target):
         if source is not None:
             source.edges.append(target)
 
-    def emit(self, cursor, kind, place, token):
-        node = FlowNode(Effect(kind, place, token))
+    def emit(self, cursor, kind, place, token, *, loan=None):
+        node = FlowNode(Effect(kind, place, token, loan))
         self.connect(cursor, node)
         return node
 
@@ -1399,19 +1609,27 @@ class Ownership:
             self.connect(cursor, node)
         return node
 
-    def place(self, expr, scope):
+    def lower_address(self, expr, scope, cursor):
         if expr.kind == "group":
-            return self.place(expr.args[0], scope)
+            return self.lower_address(expr.args[0], scope, cursor)
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
-                return Place(scope.find(expr.token))
+                return cursor, Place(scope.find(expr.token))
         if expr.kind == "field":
             base, name = expr.args
-            place = self.place(base, scope)
+            cursor, place = self.lower_address(base, scope, cursor)
             if place is not None:
-                return place.child(name.text)
-        return None
+                return cursor, place.child(name.text)
+        if expr.kind == "deref":
+            value = ungroup(expr.args[0])
+            if value.kind == "name":
+                return cursor, self.referent(scope.find(value.token))
+            if value.kind == "borrow":
+                cursor, loan = self.lower_reference(value, scope, cursor)
+                cursor, holder = self.keep_loan(cursor, loan, value.token)
+                return cursor, self.referent(holder.local)
+        return cursor, None
 
     def annotation(self, expr):
         return self.program.expr_types[id(expr)]
@@ -1423,19 +1641,114 @@ class Ownership:
             action = "read"
         return self.emit(cursor, action, place, token)
 
+    @staticmethod
+    def referent(holder):
+        owner = holder.loan.place
+        return Place(owner.local, owner.fields, holder)
+
+    def start_loan(self, cursor, place, mutable, token, *, two_phase=False):
+        parent = place.holder.loan if place.holder else None
+        loan = Loan(Place(place.local, place.fields), mutable, parent, two_phase)
+        protected = self.guard_borrows + self.guard_tests
+        if mutable and (place.local in self.guarded or any(place.overlaps(item) for item in protected)):
+            return self.emit(cursor, "guard_write", place, token), loan
+        return self.emit(cursor, "borrow", place, token, loan=loan), loan
+
+    def lower_reference(self, expr, scope, cursor, *, reborrow=None, two_phase=False):
+        expr = ungroup(expr)
+        if expr.kind == "borrow":
+            target, mutable = expr.args
+            cursor, place = self.lower_address(target, scope, cursor)
+            if place is None:
+                cursor = self.lower(target, scope, cursor)
+                local = Local(Token("<temporary value>", expr.token.line, expr.token.column), True)
+                place = Place(local)
+                cursor = self.emit(cursor, "declare", place, expr.token)
+            return self.start_loan(cursor, place, mutable, expr.token)
+        holder = scope.find(expr.token)
+        if reborrow:
+            return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
+                                   two_phase=two_phase)
+        return self.lower(expr, scope, cursor), holder.loan
+
+    def keep_loan(self, cursor, loan, token):
+        holder = Local(Token("<temporary reference>", token.line, token.column), False, loan)
+        place = Place(holder)
+        return self.emit(cursor, "declare", place, token), place
+
+    def lower_call(self, token, args, scope, cursor):
+        function = self.program.functions.get(token.text)
+        expected = [annotation for _, _, annotation in function.params] if function else [None] * len(args)
+        temporaries = []
+        for expr, annotation in zip(args, expected):
+            if isinstance(annotation, ReferenceType) and self.annotation(expr) != NEVER:
+                cursor, loan = self.lower_reference(
+                    expr, scope, cursor, reborrow=annotation, two_phase=annotation.mutable
+                )
+                cursor, holder = self.keep_loan(cursor, loan, expr.token)
+                temporaries.append((holder, expr.token))
+            else:
+                cursor = self.lower(expr, scope, cursor)
+        # Activate implicit mutable reborrows after all arguments have been
+        # evaluated. Keep each argument live through the activation checks.
+        for holder, at in temporaries:
+            if holder.local.loan.two_phase:
+                cursor = self.emit(cursor, "activate", holder, at)
+        for holder, at in temporaries:
+            cursor = self.emit(cursor, "read", holder, at)
+        return cursor
+
+    def lower_print(self, token, args, scope, cursor):
+        if not args:
+            return cursor
+        template, *values = args
+        temporaries = []
+        for value in values:
+            if isinstance(self.annotation(value), ReferenceType):
+                reference = ungroup(value)
+                if reference.kind == "borrow":
+                    cursor, loan = self.lower_reference(reference, scope, cursor)
+                else:
+                    holder = scope.find(reference.token)
+                    cursor, loan = self.start_loan(cursor, self.referent(holder), False, reference.token)
+            else:
+                cursor, place = self.lower_address(value, scope, cursor)
+                if place is None:
+                    cursor = self.lower(value, scope, cursor, consume=False)
+                    continue
+                cursor, loan = self.start_loan(cursor, place, False, value.token)
+            cursor, holder = self.keep_loan(cursor, loan, value.token)
+            temporaries.append(holder)
+        for mode, name in format_parts(template.args[1], template.token):
+            if mode == "text" or not name:
+                continue
+            local = scope.find(Token(name, token.line, token.column))
+            place = self.referent(local) if local.loan else Place(local)
+            cursor, loan = self.start_loan(cursor, place, False, token)
+            cursor, holder = self.keep_loan(cursor, loan, token)
+            temporaries.append(holder)
+        for holder in temporaries:
+            cursor = self.emit(cursor, "read", holder, token)
+        return cursor
+
     def move_action(self, place):
+        if place.holder:
+            return "deref_move"
         if place.local in self.guarded or any(place.overlaps(item) for item in self.guard_borrows):
             return "guard_move"
         return "move"
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
-        place = self.place(expr, scope)
+        cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
         if kind in {"literal", "name"}:
             return cursor
-        if kind in {"group", "field", "unary"}:
+        if kind == "borrow":
+            cursor, _ = self.lower_reference(expr, scope, cursor)
+            return cursor
+        if kind in {"group", "field", "unary", "deref"}:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
@@ -1458,11 +1771,22 @@ class Ownership:
                 return target.finish
             return cursor
         if kind == "let":
-            source, _, value, otherwise = args
+            source, annotation, value, otherwise = args
             pattern, types = self.program.patterns[id(source)]
             if value is None:
                 return self.declare(source, types, scope, cursor, initialized=False)
-            origin = self.place(value, scope)
+            if isinstance(self.annotation(value), ReferenceType):
+                if not types and ungroup(value).kind == "name":
+                    return cursor
+                coercion = annotation if shared_coercion(self.annotation(value), annotation) else None
+                cursor, loan = self.lower_reference(value, scope, cursor, reborrow=coercion)
+                return self.declare(source, types, scope, cursor, loan=loan)
+            if self.annotation(value) == NEVER and isinstance(annotation, ReferenceType):
+                cursor = self.lower(value, scope, cursor)
+                # Keep an address for type-checked expressions in the dead tail.
+                loan = Loan(Place(Local(source.token, annotation.mutable)), annotation.mutable)
+                return self.declare(source, types, scope, cursor, loan=loan)
+            cursor, origin = self.lower_address(value, scope, cursor)
             if origin is None:
                 cursor = self.lower(value, scope, cursor)
             reads, moves, tests = self.pattern_accesses(pattern, origin, self.annotation(value))
@@ -1495,8 +1819,10 @@ class Ownership:
             return None
         if kind == "assign":
             left, right = args
-            target_place = self.place(left, scope)
             cursor = self.lower(right, scope, cursor)
+            cursor, target_place = self.lower_address(left, scope, cursor)
+            if target_place is None:
+                return self.lower(left, scope, cursor)
             if token.text != "=":
                 cursor = self.emit(cursor, "read", target_place, token)
             protected = self.guard_borrows + self.guard_tests
@@ -1515,20 +1841,10 @@ class Ownership:
                 cursor = self.lower(value, scope, cursor)
             return cursor
         if kind == "call":
-            for arg in args:
-                cursor = self.lower(arg, scope, cursor)
+            cursor = self.lower_call(token, args, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
         if kind == "print":
-            if not args:
-                return cursor
-            template, *values = args
-            for value in values:
-                cursor = self.lower(value, scope, cursor, consume=False)
-            for mode, name in format_parts(template.args[1], template.token):
-                if mode != "text" and name:
-                    local = scope.find(Token(name, token.line, token.column))
-                    cursor = self.emit(cursor, "read", Place(local), token)
-            return cursor
+            return self.lower_print(token, args, scope, cursor)
         raise AssertionError(kind)
 
     def lower_loop(self, expr, scope, cursor):
@@ -1551,10 +1867,10 @@ class Ownership:
                 self.connect(body_entry, finish)
             elif kind == "while_let":
                 condition, source, _ = args
-                origin = self.place(condition, scope)
                 target.in_condition = True
+                body_entry, origin = self.lower_address(condition, scope, restart)
                 if origin is None:
-                    body_entry = self.lower(condition, scope, restart)
+                    body_entry = self.lower(condition, scope, body_entry)
                 target.in_condition = False
                 pattern, types = self.program.patterns[id(source)]
                 annotation = self.annotation(condition)
@@ -1577,7 +1893,7 @@ class Ownership:
 
     def lower_match(self, expr, scope, cursor):
         scrutinee, arms = expr.args
-        origin = self.place(scrutinee, scope)
+        cursor, origin = self.lower_address(scrutinee, scope, cursor)
         if origin is None:
             cursor = self.lower(scrutinee, scope, cursor)
         finishes = []
@@ -1608,10 +1924,10 @@ class Ownership:
             finishes.append(self.lower(body, inner, ready))
         return self.join(*finishes)
 
-    def declare(self, source, types, scope, cursor, *, initialized=True):
+    def declare(self, source, types, scope, cursor, *, initialized=True, loan=None):
         action = "declare" if initialized else "uninitialized"
         for name, (_, mutable) in types.items():
-            local = Local(Token(name, source.token.line, source.token.column), mutable)
+            local = Local(Token(name, source.token.line, source.token.column), mutable, loan)
             scope.bindings[name] = local
             cursor = self.emit(cursor, action, Place(local), source.token)
         return cursor
@@ -1690,6 +2006,8 @@ def binary(word, left, right, token):
 
 
 def display(value, debug):
+    if isinstance(value, Address):
+        return display(value.read(), debug)
     if isinstance(value, Value):
         ctor = value.constructor
         name = ctor.path.rsplit("::", 1)[-1]
@@ -1767,12 +2085,29 @@ class Interpreter:
         except Return as signal:
             return signal.args[0]
 
+    def address(self, expr, scope):
+        expr = ungroup(expr)
+        if expr.kind == "name":
+            ctor = self.program.constructors.get(expr.token.text)
+            if not ctor or ctor.style != "unit":
+                return Address(scope.find(expr.token))
+        if expr.kind == "deref":
+            return self.eval(expr.args[0], scope)
+        if expr.kind == "field":
+            base, name = expr.args
+            return self.address(base, scope).child(name)
+        return Address(Binding(self.eval(expr, scope), True))
+
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "literal":
             return args[1]
         if kind == "group":
             return self.eval(args[0], scope)
+        if kind == "borrow":
+            return self.address(args[0], scope)
+        if kind == "deref":
+            return self.eval(args[0], scope).read()
         if kind == "clone":
             # Aggregate values are immutable records, so a clone can share storage.
             return self.eval(args[0], scope)
@@ -1886,13 +2221,10 @@ class Interpreter:
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
-            binding, fields = assignment_target(left, scope)
+            address = self.address(left, scope)
             if token.text != "=":
-                old = binding.value
-                for name in fields:
-                    old = old.fields[old.constructor.index(name)]
-                value = binary(token.text[0], old, value, token)
-            binding.value = binding.value.replace(fields, value) if fields else value
+                value = binary(token.text[0], address.read(), value, token)
+            address.write(value)
             return None
         if kind == "binary":
             left, right = args
