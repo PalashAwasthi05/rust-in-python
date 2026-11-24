@@ -1368,6 +1368,8 @@ class Modules:
             if (tree_text(items[index]) == "unsafe" and index + 1 < len(items)
                     and tree_text(items[index + 1]) in {"fn", "impl", "trait"}):
                 index += 1
+                if isinstance(items[index], Token) and items[index].text == "fn":
+                    UNSAFE_FUNCTIONS.add(token_position(items[index]))
             word = tree_text(items[index])
             if macro_use and word != "mod":
                 raise items[index].error("macro_use requires a module")
@@ -2613,6 +2615,16 @@ CALL_ITEM = "@call"
 PROJECTION_BOUNDS = {}
 # `#![allow(overflowing_literals)]` makes out-of-range literals wrap instead of failing to compile.
 OVERFLOWING_LITERALS = [False]
+# Deny-by-default lints for operations on constant operands that rustc rejects unless allowed.
+ALLOWED_LINTS = set()
+# Positions of the `fn` keywords of `unsafe fn` items, whose bodies may use mutable statics.
+UNSAFE_FUNCTIONS = set()
+
+
+def token_position(token):
+    return token.line, token.column, token.source_file
+
+
 TYPE_BOUNDS = set()
 ARGS_ITEM = "@args"
 SUPERTRAITS = {
@@ -3236,6 +3248,7 @@ class Parser:
         self.constants = modules.constants if modules else {}
         self.statics = modules.statics if modules else {}
         self.current = next(self.tokens)
+        self.unsafe_depth = 0
         self.type_parameters = {}
         self.argument_parameters = None
         self.lifetime_scope = {}
@@ -3510,11 +3523,15 @@ class Parser:
                 self.impl_item(program, token)
                 continue
             constant = self.accept("const")
-            self.expect("fn")
+            unsafe = token_position(self.expect("fn")) in UNSAFE_FUNCTIONS
             name = self.declare_token(self.identifier())
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
-            function = self.function(name, declaration=self.in_std)
+            self.unsafe_depth += unsafe
+            try:
+                function = self.function(name, declaration=self.in_std)
+            finally:
+                self.unsafe_depth -= unsafe
             if constant:
                 self.validate_const_function(function)
             program.functions[name.text] = function
@@ -4381,7 +4398,11 @@ class Parser:
             return self.block()
         if self.current.text == "unsafe" and self.peek() == "{":
             self.advance()
-            return self.block()
+            self.unsafe_depth += 1
+            try:
+                return self.block()
+            finally:
+                self.unsafe_depth -= 1
         token = self.advance()
         word = token.text
         if word.startswith("@host:"):
@@ -4570,6 +4591,8 @@ class Parser:
                 return Expr("static_item", path, (self.statics[path.text],))
             if self.modules is not None and path.text in self.modules.lazy_items:
                 item = self.modules.lazy_items[path.text]
+                if item.kind == "static" and item.mutable and not self.unsafe_depth and not self.in_std:
+                    raise path.error("use of mutable static is unsafe and requires an unsafe block or function")
                 return Expr("lazy_" + item.kind, path, (item,))
             if allow_record and self.current.text == "{":
                 return Expr("record", path, self.record_fields(self.expression, "name"),
@@ -5899,6 +5922,7 @@ class Checker:
         self.unary_operands = []
         self.integer_literals = []
         self.float_literals = []
+        self.constant_lints = []
         self.deferred_binding_types = set()
         self.scalar_casts = []
         self.iterator_results = []
@@ -5982,6 +6006,38 @@ class Checker:
                     for key in keys:
                         del parameter.associated_bindings[key]
         self.finish_inference()
+        self.check_const_initializers()
+
+    def check_const_initializers(self):
+        """Reject calls that can never be const in const and static initializers."""
+        def visit(expr):
+            if isinstance(expr, (tuple, list)):
+                for part in expr:
+                    visit(part)
+                return
+            if not isinstance(expr, Expr) or expr.kind == "closure":
+                return
+            kind, word = expr.kind, expr.token.text
+            target = self.program.call_functions.get(id(expr))
+            dispatch = self.program.dispatches.get(id(expr))
+            if (kind == "string" and word.endswith("String::from")) or kind in {"box", "format"} or (
+                    kind in {"vector", "vector_repeat"} and word == "@vec" and expr.args):
+                shown = {"box": "Box::new", "format": "format!", "vector": "vec!",
+                         "vector_repeat": "vec!"}.get(kind, "String::from")
+                raise expr.token.error(f"cannot call non-const function {shown!r} in {item.kind}s")
+            if kind in {"call", "method"} and dispatch is not None and dispatch[0]:
+                raise expr.token.error(f"cannot call non-const method {dispatch[2]!r} of trait "
+                                       f"{dispatch[0].replace(MODULE_SEPARATOR, '::')} in {item.kind}s")
+            if (kind == "call" and isinstance(target, Function) and target.name.source_file != "<std>"
+                    and self.program.functions.get(target.name.text) is target
+                    and target.name.text not in self.modules.const_functions):
+                raise expr.token.error(f"cannot call non-const function {word!r} in {item.kind}s")
+            visit(expr.args)
+
+        for item in self.modules.lazy_items.values():
+            if item.name.source_file == "<std>" or (item.kind == "static" and item.name.expansion_site):
+                continue
+            visit(item.expression)
 
     def check_function(self, function):
         self.check_bounds(function.type_parameters, function.name)
@@ -6573,6 +6629,7 @@ class Checker:
                 self.require(annotation, expected, token)
         for key, value in self.program.expr_types.items():
             self.program.expr_types[key] = self.resolve(value)
+        self.check_constant_lints()
         for key, (types, arguments) in self.program.call_types.items():
             self.program.call_types[key] = (tuple(self.resolve(kind) for kind in types),
                                             {p: self.resolve(arg) for p, arg in arguments.items()})
@@ -6620,6 +6677,69 @@ class Checker:
             function.params = [(name, mutable, self.resolve(kind)) for name, mutable, kind in function.params]
             function.result = self.resolve(function.result)
             function.return_inputs = Parser.return_inputs(function.name, function.params, function.result, {})
+
+    def constant_integer(self, expr):
+        """The value of an integer operand built only from literals, or None."""
+        expr = ungroup(expr)
+        annotation = self.program.expr_types.get(id(expr))
+        if annotation not in INTEGER_TYPES:
+            return None
+        if expr.kind == "literal" and type(expr.args[1]) is int:
+            return expr.args[1]
+        if expr.kind == "unary" and expr.token.text == "-":
+            value = self.constant_integer(expr.args[0])
+            return None if value is None else -value
+        if expr.kind == "binary" and expr.token.text in {"+", "-", "*"}:
+            left, right = (self.constant_integer(arg) for arg in expr.args)
+            if left is None or right is None:
+                return None
+            value = ARITHMETIC[expr.token.text](left, right)
+            lower, upper = INTEGER_BOUNDS[annotation]
+            return value if lower <= value < upper else None
+        return None
+
+    def check_constant_lints(self):
+        # rustc's deny-by-default arithmetic_overflow and unconditional_panic lints, for operands
+        # that are literals.
+        for expr, length in self.constant_lints:
+            word = expr.token.text
+            if length is not None:
+                if expr.kind != "index" or "unconditional_panic" in ALLOWED_LINTS:
+                    continue
+                index = self.constant_integer(expr.args[1])
+                if (isinstance(length, ConstValue) and type(length.value) is int
+                        and index is not None and index >= length.value):
+                    raise expr.token.error("this operation will panic at runtime: index out of bounds: "
+                                           f"the length is {length.value} but the index is {index}")
+                continue
+            if expr.kind != "binary":
+                continue
+            annotation = self.program.expr_types.get(id(expr))
+            if annotation not in INTEGER_TYPES:
+                continue
+            right = self.constant_integer(expr.args[1])
+            if right is None:
+                continue
+            if word in {"/", "%"}:
+                if right == 0 and "unconditional_panic" not in ALLOWED_LINTS:
+                    action = "divide" if word == "/" else "calculate the remainder of"
+                    raise expr.token.error(f"this operation will panic at runtime: attempt to {action} by zero")
+                continue
+            if "arithmetic_overflow" in ALLOWED_LINTS:
+                continue
+            if word in SHIFTS:
+                if not 0 <= right < INTEGER_WIDTHS[annotation]:
+                    raise expr.token.error(f"this arithmetic operation will overflow: attempt to shift "
+                                           f"{'left' if word == '<<' else 'right'} by {right}")
+                continue
+            left = self.constant_integer(expr.args[0])
+            if left is None:
+                continue
+            value = ARITHMETIC[word](left, right)
+            lower, upper = INTEGER_BOUNDS[annotation]
+            if not lower <= value < upper:
+                raise expr.token.error(f"this arithmetic operation will overflow: "
+                                       f"attempt to compute {left} {word} {right} as {annotation}")
 
     def check_opaque_witnesses(self):
         witnesses = self.program.opaque_witnesses
@@ -7618,6 +7738,8 @@ class Checker:
         if kind in {"index", "range_index"}:
             base, *bounds = args
             annotation = self.type_of(base, scope)
+            if kind == "index" and isinstance(annotation, ArrayType) and token.source_file != "<std>":
+                self.constant_lints.append((expr, annotation.length))
             while isinstance(annotation, ReferenceType):
                 base = Expr("deref", base.token, (base, False))
                 expr.args = (base, *bounds)
@@ -7944,6 +8066,8 @@ class Checker:
                 self.binary_type(replace(token, text=operator), annotation, actual)
             return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
+            if token.text in {"+", "-", "*", "/", "%", *SHIFTS} and token.source_file != "<std>":
+                self.constant_lints.append((expr, None))
             hint = self.resolve(expected)
             if token.text in SHIFTS:
                 left, right = args
@@ -9311,6 +9435,8 @@ class Local:
     static: bool = False
     shared_capture: bool = False
     temporary: bool = False
+    # For the untraced referent of a reference local, that reference local.
+    untraced_holder: Local | None = None
 
 
 @dataclass(frozen=True)
@@ -9380,7 +9506,7 @@ class Effect:
     roots: frozenset = frozenset()
 
     def reference_uses(self):
-        if self.kind in {"declare", "uninitialized", "end_temporaries"}:
+        if self.kind in {"declare", "uninitialized", "end_temporaries", "storage_dead"}:
             return set()
         if self.place.holder:
             return {self.place.holder}
@@ -9407,9 +9533,12 @@ class PatternAccesses:
 class MoveState:
     missing: frozenset = frozenset()
     written: frozenset = frozenset()
+    # (reference local, borrowed local) pairs recorded when a borrow is assigned to a local.
+    pointing: frozenset = frozenset()
 
     def merge(self, other):
-        return MoveState(self.missing | other.missing, self.written | other.written)
+        return MoveState(self.missing | other.missing, self.written | other.written,
+                         self.pointing | other.pointing)
 
     def transfer(self, effect):
         if effect is None:
@@ -9418,18 +9547,37 @@ class MoveState:
         if kind == "write" and place.holder:
             return self
         if kind == "move":
-            return MoveState(self.missing | {(place, "moved")}, self.written)
+            return MoveState(self.missing | {(place, "moved")}, self.written, self.pointing)
+        if kind == "points_to":
+            pointing = frozenset(item for item in self.pointing if item[0] is not place.local)
+            return MoveState(self.missing, self.written,
+                             pointing | {(place.local, origin) for origin in effect.roots})
+        if kind == "storage_dead":
+            # References assigned a borrow of a local that goes out of scope dangle from here on.
+            dangling = {(Place(local), f"dangling:{origin.token.text}")
+                        for local, origin in self.pointing if origin is place.local}
+            pointing = frozenset(item for item in self.pointing if place.local not in item)
+            return MoveState(self.missing | dangling, self.written, pointing)
         if kind in {"declare", "uninitialized", "write"}:
             missing = frozenset(item for item in self.missing if not place.contains(item[0]))
+            pointing = self.pointing if place.fields else frozenset(
+                item for item in self.pointing if item[0] is not place.local)
             if kind == "uninitialized":
-                return MoveState(missing | {(place, "uninitialized")}, self.written - {place.local})
-            return MoveState(missing, self.written | {place.local})
+                return MoveState(missing | {(place, "uninitialized")}, self.written - {place.local}, pointing)
+            return MoveState(missing, self.written | {place.local}, pointing)
         return self
 
     def validate(self, effect):
         if effect is None:
             return
         kind, place, token = effect.kind, effect.place, effect.token
+        if kind not in {"declare", "uninitialized", "storage_dead", "points_to"} and not (
+                kind == "write" and not place.holder):
+            for item, reason in self.missing:
+                if reason.startswith("dangling:") and item.local in {place.local, place.holder,
+                                                                     place.local.untraced_holder}:
+                    raise token.error(f"borrowed value {reason.removeprefix('dangling:')!r} does not live "
+                                      f"long enough (still used through {item.name!r})")
         if kind == "return_reference":
             for owner in place.local.loan.regions():
                 if owner.local not in effect.roots and not owner.local.static:
@@ -9606,6 +9754,11 @@ class Ownership:
             if place.local.loan in live:
                 raise token.error("temporary value dropped while borrowed")
             return
+        if kind == "storage_dead":
+            # A block's local goes out of scope while a reference to it is still used later.
+            if any(origin.local is place.local for loan in live for origin in loan.regions()):
+                raise token.error(f"borrowed value {place.name!r} does not live long enough")
+            return
         if kind not in {"read", "write", "move", "borrow", "activate"}:
             return
         if kind == "borrow" and effect.loan.mutable and not place.holder and not place.local.mutable:
@@ -9705,7 +9858,7 @@ class Ownership:
         if holder.loan is None:
             # The checker did not trace where this reference points, so its referent is untracked.
             token = replace(holder.token, text=f"*{holder.token.text}")
-            return Place(Local(token, True, static=True))
+            return Place(Local(token, True, static=True, untraced_holder=holder))
         owner = holder.loan.place
         return Place(owner.local, owner.fields, holder)
 
@@ -10069,6 +10222,9 @@ class Ownership:
             finally:
                 if target:
                     self.loops.pop()
+            if expr is not self.function.body:
+                for local in inner.owned:
+                    cursor = self.emit(cursor, "storage_dead", Place(local), local.token)
             if target:
                 self.connect(cursor, target.finish)
                 return target.finish
@@ -10155,9 +10311,13 @@ class Ownership:
             left, right = args
             target_type = self.annotation(left)
             argument = None
+            origins = None
             if target_type == STRING and token.text == "+=" and self.annotation(right) != NEVER:
                 cursor, loan = self.lower_reference(right, scope, cursor)
                 cursor, argument = self.keep_loan(cursor, loan, right.token)
+            elif (token.text == "=" and isinstance(target_type, ReferenceType) and not is_static_str(target_type)
+                  and ungroup(left).kind == "name" and self.annotation(right) != NEVER):
+                cursor, origins = self.assigned_reference(ungroup(right), scope, cursor)
             else:
                 cursor = self.lower_stored_value(right, target_type, scope, cursor)
             cursor, target_place = self.lower_address(left, scope, cursor)
@@ -10173,6 +10333,8 @@ class Ownership:
             if target_place.indexed:
                 cursor = self.emit(cursor, "read", target_place, token)
             cursor = self.emit(cursor, action, target_place, token)
+            if origins and not target_place.fields and not target_place.holder:
+                cursor = self.emit(cursor, "points_to", target_place, token, roots=frozenset(origins))
             return self.emit(cursor, "read", argument, right.token) if argument else cursor
         if kind == "binary":
             if token.text in COMPARE and self.annotation(args[0]) not in CONST_TYPES:
@@ -10208,6 +10370,29 @@ class Ownership:
                 return None
             return self.lower_print(expr, scope, cursor)
         raise AssertionError(kind)
+
+    def assigned_reference(self, right, scope, cursor):
+        """Lower a reference assigned to a local, with the locals it borrows when they are traceable."""
+        if right.kind in {"call", "indirect_call", "vector_method", "string_method"}:
+            cursor, loan = self.lower_call(right, scope, cursor)
+            return cursor, loan and [origin.local for origin in loan.regions()]
+        cursor = self.lower(right, scope, cursor)
+        if right.kind == "name":
+            try:
+                local = scope.find(right.token)
+            except RustError:
+                return cursor, None
+            return cursor, local.loan and [origin.local for origin in local.loan.regions()]
+        if right.kind == "borrow":
+            root = place_root(right.args[0])
+            if root.kind == "name" and root.token.text not in self.program.constructors:
+                try:
+                    local = scope.find(root.token)
+                except RustError:
+                    return cursor, None
+                if local.loan is None and not local.static:
+                    return cursor, [local]
+        return cursor, None
 
     def lower_stored_value(self, expr, expected, scope, cursor):
         # Only a field declared as &'static str is checked; generic fields substituted with 'static are not.
@@ -14522,6 +14707,9 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     PROJECTION_BOUNDS.clear()
     TYPE_BOUNDS.clear()
     OVERFLOWING_LITERALS[0] = False
+    ALLOWED_LINTS.clear()
+    UNSAFE_FUNCTIONS.clear()
+    ALLOWED_LINTS.update(re.findall(r"\b(?:arithmetic_overflow|unconditional_panic)\b", source))
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
