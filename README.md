@@ -48,6 +48,9 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Borrowed `dyn` objects with dynamic dispatch, associated-type bindings, and supertrait upcasts
 - Generic associated types and const expressions evaluated at specialization
 - Definition-site macro bindings and labels, plus a rustc host for compiled procedural macros
+- Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
+- Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
+- Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -211,6 +214,15 @@ python3 rust_in_python.py --proc-extern demo_macros=./libdemo_macros.so program.
 
 On macOS, use the compiled `.dylib` path. The Python interpreter checks and runs the expanded program. The host exchanges expanded source text, so compiler span metadata is lost at that boundary.
 
+## Compare a crate against rustc
+
+```sh
+python3 rust_in_python.py --check src/main.rs
+python3 conformance.py --json src/main.rs examples/another_root.rs
+```
+
+Pass each crate's root source file. The interpreter loads sibling modules from their `.rs` files or `mod.rs` directories. The conformance runner records the reference compiler version and checks acceptance before comparing standard output and exit status. It exits unsuccessfully on a mismatch, crash, or timeout. Exact diagnostic text is outside the comparison.
+
 ## Scope
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
@@ -221,6 +233,6 @@ Generic bodies are checked against their declared trait bounds. Const parameters
 
 Trait objects currently use shared or mutable references. Generic associated types support type, const, and lifetime parameters, including lending projections on concrete receivers. Trait specialization and general borrow analysis for abstract lending projections remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity in supported scopes. Cross-module and exported-macro hygiene remain open.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual macro inheritance, `#[macro_export]`, crate-root paths, and macro re-exports work within a crate. Crate dependencies and cross-crate macro hygiene remain open.
 
-General reference types as type arguments, modules, the standard library, Cargo integration, and native code generation are also incomplete.
+General reference types as type arguments, complete closure capture analysis and callable trait bounds, standard library coverage, Cargo integration, and native code generation remain incomplete. `Result` propagation currently requires the same error type at the call and return sites.

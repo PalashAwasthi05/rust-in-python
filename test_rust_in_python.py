@@ -1,10 +1,12 @@
 """Regression cases that also run against rustc when it is installed."""
 
 from io import StringIO
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -873,6 +875,187 @@ VALID = [
         macro_rules! root { () => { $crate::answer() }; }
         fn main() { let answer = 3; println!("{} {answer}", root!()); }
     """, "42 3\n"),
+    ("nested modules resolve self, crate, and repeated super", """
+        fn base() -> i32 { 4 }
+        mod first {
+            fn value() -> i32 { 6 }
+            pub mod second {
+                pub mod third {
+                    pub fn run() -> i32 { super::super::value() + crate::base() }
+                }
+            }
+            pub fn run() -> i32 { self::second::third::run() }
+        }
+        fn main() { println!("{}", first::run()); }
+    """, "10\n"),
+    ("grouped aliases and reexports preserve target namespace", """
+        mod api {
+            mod internal {
+                #[derive(Debug)]
+                pub struct Data(pub i32);
+                pub fn make() -> Data { Data(5) }
+            }
+            pub use self::internal::{Data, make as create};
+        }
+        use crate::api::{self as alias, Data as Entry};
+        fn main() {
+            let item: Entry = alias::create();
+            let Entry(value) = item;
+            println!("{value}");
+        }
+    """, "5\n"),
+    ("explicit imports take precedence over globs", """
+        mod a { pub fn value() -> i32 { 1 } }
+        mod b { pub fn value() -> i32 { 2 } }
+        use a::*;
+        use b::value;
+        fn main() { println!("{}", value()); }
+    """, "2\n"),
+    ("glob follows a later reexport", """
+        mod source { pub fn value() -> i32 { 7 } }
+        mod reexport { pub use crate::source::value; }
+        use reexport::*;
+        fn main() { println!("{}", value()); }
+    """, "7\n"),
+    ("namespace with scoped trait method import", """
+        mod api {
+            pub trait Read { fn value(&self) -> i32; }
+            pub struct Data(i32);
+            impl Data { pub fn new(x: i32) -> Self { Self(x) } }
+            impl Read for Data { fn value(&self) -> i32 { self.0 } }
+        }
+        use crate::api::Read as _;
+        fn main() { let data = api::Data::new(8); println!("{}", data.value()); }
+    """, "8\n"),
+    ("sibling const references and namespaced turbofish", """
+        mod operations {
+            pub fn count<const N: usize>() -> usize { N }
+        }
+        mod sizes {
+            pub const LARGE: usize = SMALL + 3;
+            const SMALL: usize = 2;
+        }
+        fn main() { println!("{}", operations::count::<{ sizes::LARGE }>()); }
+    """, "5\n"),
+    ("inherited and re-exported macros follow textual and path scope", """
+        macro_rules! add_one { ($x:expr) => { $x + 1 }; }
+        mod declarations {
+            pub fn local() -> i32 { add_one!(3) }
+            #[macro_export]
+            macro_rules! root { () => { $crate::number() }; }
+        }
+        mod exports { pub use crate::root as alias; }
+        use crate::exports::alias;
+        fn number() -> i32 { 7 }
+        fn main() { println!("{} {} {}", declarations::local(), exports::alias!(), alias!()); }
+    """, "4 7 7\n"),
+    ("restricted visibility allows ancestor access", """
+        mod api {
+            pub mod nested {
+                pub(in crate::api) fn internal() -> i32 { 5 }
+            }
+            pub fn external() -> i32 { nested::internal() }
+        }
+        fn main() { println!("{}", api::external()); }
+    """, "5\n"),
+    ("linked Option and Result propagate through question mark", """
+        mod input {
+            pub fn read(ok: bool) -> Result<i32, &'static str> {
+                if ok { Ok(7) } else { Err("bad") }
+            }
+        }
+        fn double(ok: bool) -> Result<i32, &'static str> {
+            let number = input::read(ok)?;
+            Ok(number * 2)
+        }
+        fn option(ok: bool) -> Option<i32> {
+            let value = if ok { Some(5) } else { None };
+            Some(value? + 1)
+        }
+        fn main() {
+            println!("{:?} {:?} {:?} {}", double(false), double(true), option(false), option(true).unwrap_or(0));
+        }
+    """, 'Err("bad") Ok(14) None 6\n'),
+    ("prelude macros share the declarative expander", """
+        fn main() {
+            let value = Some(3);
+            assert!(matches!(value, Some(x) if x == 3));
+            assert_eq!(value, Some(3));
+            assert_ne!(value, None);
+            println!("{}", value.expect("valid"));
+        }
+    """, "3\n"),
+    ("prelude type names can be shadowed by user items", """
+        struct Option(i32);
+        fn main() {
+            let own = Option(3);
+            let standard: std::option::Option<i32> = Some(5);
+            println!("{} {}", own.0, standard.unwrap());
+        }
+    """, "3 5\n"),
+    ("function pointers and noncapturing closures take parameters", """
+        fn inc(x: i32) -> i32 { x + 1 }
+        fn apply(f: fn(i32) -> i32, x: i32) -> i32 { f(x) }
+        mod ops { pub fn double(n: i32) -> i32 { n * 2 } }
+        fn main() {
+            let plain: fn(i32) -> i32 = inc;
+            let closure = |n: i32| n + 3;
+            let inferred = |n| n;
+            println!("{} {} {} {} {}", apply(plain, 1), (ops::double)(3), closure(4), (|| 9)(), inferred(true));
+        }
+    """, "2 6 7 9 true\n"),
+    ("function pointer retains generic type specialization", """
+        fn value<T: Default>() -> T { T::default() }
+        fn main() { let call: fn() -> bool = value; println!("{}", call()); }
+    """, "false\n"),
+    ("indirect reference return retains borrow until last use", """
+        fn id(n: &i32) -> &i32 { n }
+        fn main() {
+            let pointer: fn(&i32) -> &i32 = id;
+            let mut n = 3;
+            let result = pointer(&n);
+            println!("{result}");
+            n = 7;
+            println!("{n}");
+        }
+    """, "3\n7\n"),
+    ("shared and move captures follow their own lifetimes", """
+        fn main() {
+            let mut base = 3;
+            let add = |n: i32| base + n;
+            let copy = add;
+            println!("{} {}", add(2), copy(3));
+            base = 8;
+            let original = move || base;
+            base = 9;
+            println!("{} {base}", original());
+        }
+    """, "5 6\n8 9\n"),
+    ("shared capture can read a non-Copy field repeatedly", """
+        struct Value(i32);
+        fn main() {
+            let value = Value(3);
+            let call = || value.0;
+            println!("{} {}", call(), call());
+        }
+    """, "3 3\n"),
+    ("mutable captures permit repeated calls and release at last use", """
+        fn main() {
+            let mut count = 1;
+            let mut next = || { count += 1; count };
+            println!("{} {}", next(), next());
+            println!("{count}");
+        }
+    """, "2 3\n3\n"),
+    ("move closure can consume an owned non-Copy capture", """
+        struct Item(i32);
+        fn consume(item: Item) -> i32 { item.0 }
+        fn main() {
+            let saved = Item(6);
+            let once = move || consume(saved);
+            println!("{}", once());
+        }
+    """, "6\n"),
 ]
 
 INVALID = [
@@ -1275,10 +1458,112 @@ INVALID = [
         macro_rules! invalid { () => { captured }; }
         fn main() { let captured = 4; println!("{}", invalid!()); }
     """, "unknown binding 'captured'"),
+    ("module function is private to its declaring scope", """
+        mod nested { fn secret() -> i32 { 3 } }
+        fn main() { let _value = nested::secret(); }
+    """, "'secret' is private"),
+    ("private record field cannot be read from the parent", """
+        mod nested {
+            pub struct Data { value: i32 }
+            pub fn make() -> Data { Data { value: 3 } }
+        }
+        fn main() { let _value = nested::make().value; }
+    """, "field 'value' is private"),
+    ("private tuple field hides constructor", """
+        mod nested { pub struct Data(i32); }
+        fn main() { let _value = nested::Data(3); }
+    """, "has private fields"),
+    ("inherent method visibility is checked", """
+        mod nested { pub struct Data; impl Data { fn hidden(&self) {} } }
+        fn main() { nested::Data.hidden(); }
+    """, "method 'hidden' is private"),
+    ("out of scope traits do not add methods", """
+        mod nested {
+            pub trait Read { fn get(&self) -> i32; }
+            pub struct Data;
+            impl Read for Data { fn get(&self) -> i32 { 3 } }
+        }
+        fn main() { let _value = nested::Data.get(); }
+    """, "no method 'get'"),
+    ("cannot reexport a private function publicly", """
+        mod nested { fn secret() {} pub use self::secret as exposed; }
+        fn main() {}
+    """, "cannot re-export private item"),
+    ("ambiguous glob imports need an explicit namespace", """
+        mod a { pub fn value() {} }
+        mod b { pub fn value() {} }
+        use a::*;
+        use b::*;
+        fn main() { value(); }
+    """, "ambiguous glob import 'value'"),
+    ("qualified const arguments require braces", """
+        mod sizes { pub const N: usize = 3; }
+        fn size<const N: usize>() -> usize { N }
+        fn main() { println!("{}", size::<sizes::N>()); }
+    """, "expected a usize constant"),
+    ("question mark requires a compatible return family", """
+        fn not_an_option() -> i32 { Some(3)? }
+        fn main() {}
+    """, "requires a function returning the same enum family"),
+    ("indirect call argument must match", """
+        fn target(n: i32) -> i32 { n }
+        fn main() { let f: fn(i32) -> i32 = target; let _ = f(true); }
+    """, "expected i32, found bool"),
+    ("shared closure capture prevents mutation until use", """
+        fn main() {
+            let mut base = 3;
+            let call = || base;
+            base = 4;
+            println!("{}", call());
+        }
+    """, "immutably borrowed"),
+    ("capturing closure cannot coerce to a function pointer", """
+        fn main() { let n = 3; let _call: fn() -> i32 = || n; }
+    """, "expected fn"),
+    ("mutable closure invocation requires a mutable receiver", """
+        fn main() { let mut n = 0; let call = || { n += 1; }; call(); }
+    """, "immutable binding"),
+    ("consuming a move closure makes another call invalid", """
+        struct Item(i32);
+        fn consume(item: Item) -> i32 { item.0 }
+        fn main() { let saved = Item(6); let once = move || consume(saved); once(); once(); }
+    """, "use of moved value 'once'"),
 ]
 
 
 class InterpreterTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_external_modules_and_conformance_report(self):
+        with TemporaryDirectory() as folder:
+            folder = Path(folder)
+            (folder / "outer").mkdir()
+            (folder / "outer" / "mod.rs").write_text(
+                "mod leaf; pub fn value() -> i32 { leaf::value() }", encoding="utf-8")
+            (folder / "outer" / "leaf.rs").write_text(
+                "pub(super) fn value() -> i32 { 6 }", encoding="utf-8")
+            (folder / "renamed.rs").write_text("pub fn value() -> i32 { 4 }", encoding="utf-8")
+            root = folder / "main.rs"
+            root.write_text("""
+                mod outer;
+                #[path = "renamed.rs"] mod alias;
+                fn main() { println!("{} {}", outer::value(), alias::value()); }
+            """, encoding="utf-8")
+            bad = folder / "invalid.rs"
+            bad.write_text("fn main() { let invalid: bool = 1; }", encoding="utf-8")
+            unsupported = folder / "capture.rs"
+            unsupported.write_text("fn main() { let x = 1; let r = &x; let f = || *r; println!(\"{}\", f()); }",
+                                   encoding="utf-8")
+            panics = folder / "panics.rs"
+            panics.write_text('fn main() { println!("before"); assert_eq!(1, 2); }', encoding="utf-8")
+            runner = Path(__file__).with_name("conformance.py")
+            report = subprocess.run([sys.executable, runner, "--json", root, bad, unsupported, panics],
+                                    text=True, capture_output=True, timeout=40, check=False)
+            self.assertEqual(report.returncode, 1, report.stderr)
+            cases = json.loads(report.stdout)["cases"]
+            self.assertEqual([case["outcome"] for case in cases],
+                             ["runtime_match", "both_rejected", "acceptance_mismatch", "runtime_match"])
+            self.assertEqual(cases[0]["run"]["python"]["stdout"], "6 4\n")
+
     def test_valid_programs(self):
         for name, source, expected in VALID:
             with self.subTest(name=name):

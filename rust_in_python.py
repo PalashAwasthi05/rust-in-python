@@ -30,6 +30,10 @@ class RustError(Exception):
     pass
 
 
+class RustPanic(Exception):
+    pass
+
+
 @dataclass(frozen=True)
 class Token:
     text: str
@@ -37,6 +41,8 @@ class Token:
     column: int
     context: tuple = ()
     definition: int | None = None
+    module: tuple = ()
+    child_module: tuple | None = None
 
     @property
     def key(self):
@@ -231,6 +237,8 @@ class MacroExpander:
         self.steps = 0
         self.match_steps = 0
         self.definitions = 0
+        self.qualified = {}
+        self.module_macros = {}
 
     def expand(self, items, inherited=None, depth=0):
         if depth > 64:
@@ -240,6 +248,10 @@ class MacroExpander:
         index = 0
         while index < len(items):
             item = items[index]
+            if isinstance(item, Token) and item.child_module is not None:
+                self.module_macros[item.child_module] = dict(macros)
+                index += 1
+                continue
             if tree_text(item) == "macro_rules" and index + 3 < len(items):
                 marker, name, body = items[index + 1:index + 4]
                 if tree_text(marker) != "!" or not isinstance(name, Token) or not isinstance(body, TokenGroup):
@@ -251,14 +263,24 @@ class MacroExpander:
                 if index < len(items) and tree_text(items[index]) == ";":
                     index += 1
                 continue
-            if (isinstance(item, Token) and item.text in macros and index + 2 < len(items)
-                    and tree_text(items[index + 1]) == "!" and isinstance(items[index + 2], TokenGroup)):
+            macro = macros.get(item.text) if isinstance(item, Token) else None
+            argument = index + 2
+            if isinstance(item, Token) and index + 4 < len(items) and tree_text(items[index + 1]) == "::":
+                path = [item.text]
+                position = index + 1
+                while position + 1 < len(items) and tree_text(items[position]) == "::":
+                    path.append(tree_text(items[position + 1]))
+                    position += 2
+                macro = self.qualified.get(tuple(path))
+                argument = position + 1
+            if (macro and argument < len(items) and tree_text(items[argument - 1]) == "!"
+                    and isinstance(items[argument], TokenGroup)):
                 self.steps += 1
                 if self.steps > 10_000:
                     raise item.error("macro expansion limit reached")
-                definition, rules = macros[item.text]
-                expanded = self.invoke(item, rules, items[index + 2].items, (definition, self.steps))
-                index += 3
+                definition, rules = macro
+                expanded = self.invoke(item, rules, items[argument].items, (definition, self.steps))
+                index = argument + 1
                 result.extend(self.expand(expanded, macros, depth + 1))
                 if (expanded and tree_text(expanded[0]) in {"#", "fn", "struct", "enum", "trait", "impl"}
                         and index < len(items) and tree_text(items[index]) == ";"):
@@ -394,18 +416,13 @@ class MacroExpander:
                 yield from MacroExpander.variables(node.items)
 
     def render(self, nodes, captures, path, mark):
-        skip_separator = False
         for index, node in enumerate(nodes):
-            if skip_separator:
-                skip_separator = False
-                continue
             if isinstance(node, MacroCapture):
                 if node.name.text == "crate":
                     following = nodes[index + 1] if index + 1 < len(nodes) else None
                     if not isinstance(following, Token) or following.text != "::":
                         raise node.name.error("expected a path after $crate")
-                    # This interpreter's single source file is the crate root.
-                    skip_separator = True
+                    yield replace(node.name, text="crate")
                     continue
                 for level in range(len(path), -1, -1):
                     key = (node.name.text, path[:level])
@@ -435,6 +452,525 @@ class MacroExpander:
                 yield replace(node, context=(*node.context, mark))
 
 
+MODULE_SEPARATOR = "§"
+OPTION = MODULE_SEPARATOR.join(("core", "option", "Option"))
+RESULT = MODULE_SEPARATOR.join(("core", "result", "Result"))
+PRELUDE_TYPES = {"Option": OPTION, "Result": RESULT}
+PRELUDE_VARIANTS = {"Some": OPTION, "None": OPTION, "Ok": RESULT, "Err": RESULT}
+PRELUDE_MACROS = """
+macro_rules! assert {
+    ($condition:expr $(,)?) => {{ if !$condition { panic!("assertion failed"); } }};
+    ($condition:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        if !$condition { panic!($format $(,$argument)*); }
+    }};
+}
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => {{
+        let left = &$left;
+        let right = &$right;
+        if *left != *right { panic!("assertion failed: left != right"); }
+    }};
+    ($left:expr, $right:expr, $format:expr $(, $argument:expr)* $(,)?) => {{
+        let left = &$left;
+        let right = &$right;
+        if *left != *right { panic!($format $(,$argument)*); }
+    }};
+}
+macro_rules! assert_ne {
+    ($left:expr, $right:expr $(,)?) => {{
+        let left = &$left;
+        let right = &$right;
+        if *left == *right { panic!("assertion failed: left == right"); }
+    }};
+}
+macro_rules! matches {
+    ($value:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
+        match $value { $pattern $(if $guard)? => true, _ => false }
+    }};
+}
+"""
+
+
+@dataclass(frozen=True)
+class ModuleSymbol:
+    path: tuple
+    kind: str
+    visible_from: tuple
+    token: Token
+
+    @property
+    def name(self):
+        return MODULE_SEPARATOR.join(self.path)
+
+
+@dataclass(frozen=True)
+class Import:
+    path: tuple
+    alias: str
+    token: Token
+    visible_from: tuple
+
+
+@dataclass
+class ModuleUnit:
+    path: tuple
+    directory: Path | None
+    items: tuple = ()
+    symbols: dict = field(default_factory=dict)
+    imports: list = field(default_factory=list)
+    aliases: dict = field(default_factory=dict)
+    constants: list = field(default_factory=list)
+    trait_imports: dict = field(default_factory=dict)
+    glob_aliases: dict = field(default_factory=dict)
+    hidden_traits: set = field(default_factory=set)
+
+
+class Modules:
+    def __init__(self, trees, source_path):
+        directory = Path(source_path).resolve().parent if source_path is not None else None
+        root = ModuleUnit((), directory)
+        self.units = {(): root}
+        self.exported = {}
+        self.macro_paths = {}
+        self.constants = {}
+        root.items = self.scan(root, trees)
+
+    def register(self, unit, token, kind, boundary):
+        if token.text in unit.symbols:
+            raise token.error(f"duplicate item {token.text!r}")
+        symbol = ModuleSymbol((*unit.path, token.text), kind, boundary, token)
+        unit.symbols[token.text] = symbol
+        return symbol
+
+    @staticmethod
+    def item_end(items, index, kind):
+        if kind == "macro_rules":
+            end = index + 4
+            if end < len(items) and tree_text(items[end]) == ";":
+                end += 1
+            return end
+        angles = 0
+        for position in range(index + 1, len(items)):
+            item = items[position]
+            word = tree_text(item)
+            if kind != "const":
+                if word == "<":
+                    angles += 1
+                elif word in {">", ">="}:
+                    angles = max(0, angles - 1)
+            if angles == 0:
+                if word == ";":
+                    return position + 1
+                if kind not in {"const", "use"} and isinstance(item, TokenGroup) and word == "{":
+                    return position + 1
+        return len(items)
+
+    def scan(self, unit, items, *, expanded=False):
+        output = []
+        index = 0
+        while index < len(items):
+            start = index
+            kept_attributes = []
+            export = False
+            custom_path = None
+            while index + 1 < len(items) and tree_text(items[index]) == "#":
+                inner = tree_text(items[index + 1]) == "!"
+                position = index + (2 if inner else 1)
+                if position >= len(items) or not isinstance(items[position], TokenGroup):
+                    break
+                attribute = items[position]
+                if not inner and len(attribute.items) == 1 and tree_text(attribute.items[0]) == "macro_export":
+                    export = True
+                elif (not inner and len(attribute.items) == 3
+                      and tuple(map(tree_text, attribute.items[:2])) == ("path", "=")
+                      and isinstance(attribute.items[2], Token)):
+                    custom_path = decode_string(attribute.items[2])
+                else:
+                    kept_attributes.extend(items[index:position + 1])
+                index = position + 1
+            if index >= len(items):
+                output.extend(kept_attributes)
+                break
+            boundary = unit.path
+            if tree_text(items[index]) == "pub":
+                index += 1
+                boundary = ()
+                if index < len(items) and isinstance(items[index], TokenGroup) and tree_text(items[index]) == "(":
+                    boundary = self.visibility(unit, items[index])
+                    index += 1
+            if index >= len(items):
+                output.extend(items[start:])
+                break
+            word = tree_text(items[index])
+            if word == "mod" and index + 2 < len(items):
+                token, body = items[index + 1:index + 3]
+                if not isinstance(token, Token):
+                    raise items[index].error("expected a module name")
+                symbol = self.register(unit, token, "module", boundary)
+                directory = unit.directory / token.text if unit.directory is not None else None
+                if custom_path is not None and unit.directory is not None:
+                    directory = (unit.directory / custom_path).resolve().parent
+                child = ModuleUnit(symbol.path, directory)
+                self.units[symbol.path] = child
+                if isinstance(body, TokenGroup) and tree_text(body) == "{":
+                    contents = body.items
+                elif tree_text(body) == ";":
+                    contents = self.load_module(unit, token, custom_path)
+                else:
+                    raise token.error("expected an inline module or ';'")
+                child.items = self.scan(child, contents)
+                if not expanded:
+                    output.append(replace(token, text="@module", child_module=symbol.path))
+                index += 3
+                continue
+            if word == "use":
+                end = self.item_end(items, index, "use")
+                if end == len(items) and tree_text(items[-1]) != ";":
+                    raise items[index].error("expected ';' after use")
+                unit.imports.extend(self.import_tree(items[index + 1:end - 1], (), boundary))
+                index = end
+                continue
+            if word in {"fn", "struct", "enum", "trait", "const", "impl", "macro_rules"}:
+                end = self.item_end(items, index, word)
+                if word not in {"impl", "macro_rules"} and index + 1 < len(items):
+                    name = items[index + 1]
+                    if isinstance(name, Token):
+                        kind = word
+                        if word == "struct" and not any(isinstance(part, TokenGroup)
+                                                        for part in items[index + 2:end]):
+                            kind = "unit_struct"
+                        original = unit.symbols.get(name.text)
+                        if not expanded or not original or original.token is not name:
+                            self.register(unit, name, kind, boundary)
+                if word == "const":
+                    unit.constants.append(items[index:end])
+                else:
+                    if export and word == "macro_rules":
+                        name, body = items[index + 2:index + 4]
+                        if name.text in self.exported and not expanded:
+                            raise name.error(f"duplicate exported macro {name.text!r}")
+                        self.exported[name.text] = body
+                    output.extend(kept_attributes)
+                    output.extend(items[index:end])
+                index = end
+                continue
+            output.extend(kept_attributes)
+            output.append(items[index])
+            index += 1
+        return tuple(output)
+
+    @staticmethod
+    def load_module(unit, token, custom_path=None):
+        if unit.directory is None:
+            raise token.error("an external module requires a source file path")
+        if custom_path is not None:
+            filename = unit.directory / custom_path
+            if not filename.is_file():
+                raise token.error(f"module {token.text!r} needs {filename}")
+            filenames = (filename,)
+        else:
+            filenames = (unit.directory / f"{token.text}.rs", unit.directory / token.text / "mod.rs")
+        found = [path for path in filenames if path.is_file()]
+        if len(found) != 1:
+            if found:
+                raise token.error(f"module {token.text!r} exists in both {filenames[0]} and {filenames[1]}")
+            raise token.error(f"module {token.text!r} needs {filenames[0]} or {filenames[1]}")
+        try:
+            return token_trees(lex(found[0].read_text(encoding="utf-8")))[0]
+        except RustError as error:
+            raise RustError(f"{found[0]}: {error}") from error
+
+    @staticmethod
+    def visibility(unit, group):
+        words = tuple(token.text for token in flatten_trees(group.items))
+        if words == ("crate",):
+            return ()
+        if words == ("self",):
+            return unit.path
+        if words == ("super",) and unit.path:
+            return unit.path[:-1]
+        if words[:2] == ("in", "crate"):
+            boundary = words[3::2]
+            if words[2::2] == ("::",) * len(boundary) and unit.path[:len(boundary)] == boundary:
+                return boundary
+        raise group.opening.error("visibility must name an ancestor module")
+
+    def import_tree(self, items, prefix, boundary):
+        if not items:
+            return []
+        index = 0
+        parts = list(prefix)
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, TokenGroup) and tree_text(item) == "{":
+                entries = []
+                start = 0
+                for position, child in enumerate((*item.items, Token(",", item.closing.line, item.closing.column))):
+                    if tree_text(child) == ",":
+                        entries.extend(self.import_tree(item.items[start:position], tuple(parts), boundary))
+                        start = position + 1
+                return entries
+            if not isinstance(item, Token):
+                raise item.opening.error("invalid import path")
+            name = item.text
+            index += 1
+            if name == "*":
+                return [Import(tuple(parts), "*", item, boundary)]
+            if name != "self" or not parts or index < len(items) and tree_text(items[index]) == "::":
+                parts.append(name)
+            if index < len(items) and tree_text(items[index]) == "::":
+                index += 1
+                continue
+            alias = parts[-1]
+            if index + 1 < len(items) and tree_text(items[index]) == "as":
+                alias = tree_text(items[index + 1])
+                index += 2
+            if index != len(items):
+                raise item.error("unexpected token in import")
+            return [Import(tuple(parts), alias, item, boundary)]
+        return []
+
+    def resolve(self, path, unit, token, *, origin=None):
+        origin = unit.path if origin is None else origin
+        path = list(path)
+        root = unit
+        absolute = False
+        if path[0] in {"crate", "self", "super"}:
+            head = path.pop(0)
+            absolute = True
+            if head == "crate":
+                root = self.units[()]
+            if head == "super":
+                current = unit.path
+                while True:
+                    if not current:
+                        raise token.error("super goes past the crate root")
+                    current = current[:-1]
+                    if not path or path[0] != "super":
+                        break
+                    path.pop(0)
+                root = self.units[current]
+        if not path:
+            return ModuleSymbol(root.path, "module", (), token)
+        first = path.pop(0)
+        symbol = self.lookup(root, first, origin, token)
+        if not symbol:
+            if absolute:
+                raise token.error("unresolved path")
+            return self.prelude((first, *path), token)
+        while path and symbol.kind == "module":
+            nested = self.units[symbol.path]
+            symbol = self.lookup(nested, path.pop(0), origin, token)
+            if not symbol:
+                raise token.error("unresolved path")
+        if not path:
+            return symbol
+        if len(path) == 1 and symbol.kind in {"struct", "unit_struct", "enum", "trait"}:
+            return ModuleSymbol((*symbol.path[:-1], f"{symbol.path[-1]}::{path[0]}"), "associated", (), token)
+        raise token.error("unresolved associated path")
+
+    @staticmethod
+    def prelude(path, token):
+        head, *tail = path
+        if head in {"std", "core"} and len(tail) >= 2:
+            module, head, *tail = tail
+            if (module, head) not in {("option", "Option"), ("result", "Result")}:
+                return None
+        if head in PRELUDE_TYPES and len(tail) <= 1:
+            parts = tuple(PRELUDE_TYPES[head].split(MODULE_SEPARATOR))
+            if tail:
+                return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{tail[0]}"), "associated", (), token)
+            return ModuleSymbol(parts, "enum", (), token)
+        if head in PRELUDE_VARIANTS and not tail:
+            parts = tuple(PRELUDE_VARIANTS[head].split(MODULE_SEPARATOR))
+            return ModuleSymbol((*parts[:-1], f"{parts[-1]}::{head}"), "associated", (), token)
+        return None
+
+    @staticmethod
+    def lookup(unit, name, origin, token):
+        symbol = unit.symbols.get(name) or unit.aliases.get(name)
+        if symbol is None and name in unit.glob_aliases:
+            symbol = unit.glob_aliases[name]
+            if symbol is None:
+                raise token.error(f"ambiguous glob import {name!r}")
+        if symbol and origin[:len(symbol.visible_from)] != symbol.visible_from:
+            raise token.error(f"{name!r} is private")
+        return symbol
+
+    def link_imports(self, *, strict=True):
+        for unit in self.units.values():
+            unit.aliases.clear()
+            unit.trait_imports.clear()
+            unit.glob_aliases.clear()
+            unit.hidden_traits.clear()
+        imports = [(unit, item) for unit in self.units.values() for item in unit.imports]
+        while True:
+            previous = [(dict(unit.aliases), dict(unit.glob_aliases)) for unit in self.units.values()]
+            unresolved = []
+            for unit, item in imports:
+                if (len(item.path) == 3 and item.path[0] in {"std", "core"}
+                        and TRAIT_MODULES.get(item.path[2]) == item.path[1]):
+                    unit.trait_imports[item.alias] = item.path[2]
+                    continue
+                try:
+                    target = self.resolve(item.path, unit, item.token)
+                except RustError as error:
+                    unresolved.append((unit, item, error))
+                    continue
+                if target is None:
+                    if self.is_macro_import(unit, item):
+                        continue
+                    unresolved.append((unit, item, item.token.error(f"unresolved import {'::'.join(item.path)}")))
+                    continue
+                if item.alias == "*":
+                    if target.kind != "module":
+                        unresolved.append((unit, item, item.token.error("glob imports require a module")))
+                        continue
+                    module = self.units[target.path]
+                    for name, member in (module.glob_aliases | module.aliases | module.symbols).items():
+                        if (member and unit.path[:len(member.visible_from)] == member.visible_from
+                                and item.visible_from[:len(member.visible_from)] == member.visible_from):
+                            alias = replace(member, visible_from=item.visible_from)
+                            if name not in unit.glob_aliases:
+                                unit.glob_aliases[name] = alias
+                            elif unit.glob_aliases[name] and unit.glob_aliases[name].path != alias.path:
+                                unit.glob_aliases[name] = None
+                elif item.alias == "_":
+                    if target.kind == "trait":
+                        unit.hidden_traits.add(target.name)
+                else:
+                    if item.visible_from[:len(target.visible_from)] != target.visible_from:
+                        unresolved.append((unit, item, item.token.error(f"cannot re-export private item {item.alias!r}")))
+                        continue
+                    existing = unit.symbols.get(item.alias) or unit.aliases.get(item.alias)
+                    if existing and existing.path != target.path:
+                        raise item.token.error(f"duplicate import {item.alias!r}")
+                    unit.aliases[item.alias] = replace(target, visible_from=item.visible_from)
+            current = [(unit.aliases, unit.glob_aliases) for unit in self.units.values()]
+            if current == previous:
+                if strict:
+                    for unit, item, error in unresolved:
+                        if not self.is_macro_import(unit, item):
+                            raise error
+                return
+
+    @staticmethod
+    def macro_path(unit, path):
+        head, *tail = path
+        if head == "crate":
+            return tuple(tail)
+        if head == "self":
+            return (*unit.path, *tail)
+        if head == "super":
+            base = unit.path[:-1]
+            while tail and tail[0] == "super":
+                base = base[:-1]
+                tail.pop(0)
+            return (*base, *tail)
+        alias = unit.aliases.get(head)
+        if alias and alias.kind == "module":
+            return (*alias.path, *tail)
+        return (*unit.path, *path)
+
+    def is_macro_import(self, unit, item):
+        entry = self.macro_paths.get(self.macro_path(unit, item.path))
+        return bool(entry and unit.path[:len(entry[1])] == entry[1])
+
+    def link_macros(self, exports):
+        self.macro_paths = {(name,): (macro, ()) for name, macro in exports.items()}
+        while True:
+            size = len(self.macro_paths)
+            for unit in self.units.values():
+                for item in unit.imports:
+                    if item.alias not in {"_", "*"} and self.is_macro_import(unit, item):
+                        definition, visible = self.macro_paths[self.macro_path(unit, item.path)]
+                        if item.visible_from[:len(visible)] != visible:
+                            raise item.token.error(f"cannot re-export private macro {item.alias!r}")
+                        self.macro_paths.setdefault((*unit.path, item.alias), (definition, item.visible_from))
+            if len(self.macro_paths) == size:
+                return
+
+    def macro_qualifiers(self, unit):
+        qualified = {}
+        for path, (macro, visible) in self.macro_paths.items():
+            if unit.path[:len(visible)] != visible:
+                continue
+            qualified[("crate", *path)] = macro
+            for ancestor in range(len(unit.path), -1, -1):
+                if path[:ancestor] == unit.path[:ancestor] and len(path) > ancestor:
+                    prefix = ("super",) * (len(unit.path) - ancestor) or ("self",)
+                    qualified[(*prefix, *path[ancestor:])] = macro
+                    if ancestor == len(unit.path):
+                        qualified[path[ancestor:]] = macro
+            aliases = unit.glob_aliases | unit.aliases
+            for local, symbol in aliases.items():
+                if symbol and symbol.kind == "module" and path[:len(symbol.path)] == symbol.path:
+                    qualified[(local, *path[len(symbol.path):])] = macro
+        return qualified
+
+    def name_token(self, unit, token, parts, *, bare=False, type_name=False):
+        symbol = self.resolve(parts, unit, token)
+        if symbol:
+            if bare and len(parts) == 1 and symbol.kind not in {"unit_struct", "associated", "const"}:
+                return token
+            return replace(token, text=symbol.name)
+        if len(parts) > 1:
+            return replace(token, text="::".join(parts))
+        if type_name and unit.path:
+            return replace(token, text=MODULE_SEPARATOR.join((*unit.path, token.text)))
+        return token
+
+    def expand(self):
+        expander = MacroExpander()
+        builtin_items, _ = token_trees(lex(PRELUDE_MACROS))
+        builtins = {}
+        for index in range(0, len(builtin_items), 4):
+            _, _, name, body = builtin_items[index:index + 4]
+            expander.definitions += 1
+            builtins[name.text] = (expander.definitions, expander.rules(body))
+        exports = {}
+        for name, body in self.exported.items():
+            expander.definitions += 1
+            exports[name] = (expander.definitions, expander.rules(body))
+        self.link_macros(exports)
+        self.link_imports(strict=False)
+        self.link_macros(exports)
+        pending = deque(self.units)
+        visited = set()
+        while pending:
+            path = pending.popleft()
+            if path in visited:
+                continue
+            visited.add(path)
+            unit = self.units[path]
+            macros = builtins | expander.module_macros.get(unit.path, {})
+            macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
+                           for item in unit.imports if self.is_macro_import(unit, item)})
+            expander.qualified = self.macro_qualifiers(unit)
+            expanded = expander.expand(unit.items, macros)
+            unit.items = self.scan(unit, expanded, expanded=True)
+            pending.extend(path for path in self.units if path not in visited)
+        self.link_imports()
+        self.read_constants()
+
+    def read_constants(self):
+        pending = [(unit, segment) for unit in self.units.values() for segment in unit.constants]
+        while pending:
+            remaining = []
+            for unit, segment in pending:
+                last = next(flatten_trees(segment))
+                parser = Parser("", tokens=(*flatten_trees(segment), replace(last, text="")),
+                                modules=self, unit=unit)
+                try:
+                    parser.expect("const")
+                    parser.constant_item()
+                except RustError as error:
+                    remaining.append((unit, segment, error))
+            if len(remaining) == len(pending):
+                raise remaining[0][2]
+            pending = [(unit, segment) for unit, segment, _ in remaining]
+
+
 @dataclass
 class Expr:
     kind: str
@@ -445,6 +981,7 @@ class Expr:
     auto_borrow: bool = False
     unsuffixed: bool = False
     qualified: tuple | None = None
+    local_callee: Token | None = None
 
 
 @dataclass
@@ -459,6 +996,9 @@ class Function:
     method_parameters: tuple = ()
     lifetimes: dict = field(default_factory=dict)
     self_sized: bool = False
+    visible_from: tuple = ()
+    captures: tuple = ()
+    consumes_captures: bool = False
 
 
 @dataclass(frozen=True)
@@ -467,6 +1007,7 @@ class Constructor:
     annotation: object
     style: str
     fields: tuple
+    visibility: tuple = ()
 
     def index(self, token):
         for index, (name, _) in enumerate(self.fields):
@@ -484,6 +1025,33 @@ class ReferenceType:
     def __str__(self):
         prefix = "&mut " if self.mutable else "&"
         return f"{prefix}{self.inner}"
+
+
+@dataclass(frozen=True)
+class FunctionType:
+    parameters: tuple
+    result: object
+    closure: str | None = None
+
+    def __str__(self):
+        arguments = ", ".join(map(str, self.parameters))
+        kind = "closure" if self.closure else "fn"
+        return f"{kind}({arguments}) -> {self.result}"
+
+
+@dataclass(frozen=True)
+class FunctionValue:
+    name: str
+    arguments: dict = field(default_factory=dict)
+    environment: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Capture:
+    name: Token
+    annotation: object
+    by_move: bool
+    mutable: bool = False
 
 
 @dataclass(frozen=True, eq=False)
@@ -683,6 +1251,9 @@ def substitute(annotation, arguments):
         return replace(annotation, inner=substitute(annotation.inner, arguments),
                        lifetime=(None if lifetime.name == "'_" else lifetime.name)
                        if lifetime else annotation.lifetime)
+    if isinstance(annotation, FunctionType):
+        return FunctionType(tuple(substitute(kind, arguments) for kind in annotation.parameters),
+                            substitute(annotation.result, arguments), annotation.closure)
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
     if isinstance(annotation, ArrayType):
@@ -711,6 +1282,27 @@ class Program:
     impls: list = field(default_factory=list)
     call_functions: dict = field(default_factory=dict)
     dispatches: dict = field(default_factory=dict)
+    traits_in_scope: dict = field(default_factory=dict)
+    values_in_scope: dict = field(default_factory=dict)
+
+    def add_prelude(self):
+        for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
+                            (RESULT, (("Ok", ("T",)), ("Err", ("E",))))):
+            letters = ("T",) if name == OPTION else ("T", "E")
+            parameters = {letter: TypeParameter(letter) for letter in letters}
+            constructors = tuple(
+                Constructor(f"{name}::{variant}", name, "tuple" if payload else "unit",
+                            tuple((str(index), parameters[letter]) for index, letter in enumerate(payload)))
+                for variant, payload in shape
+            )
+            token = Token(name, 1, 1)
+            self.types[name] = (token, constructors)
+            self.type_parameters[name] = tuple(parameters.values())
+            self.derives[name] = {trait: token for trait in ("Clone", "Copy", "Debug", "PartialEq",
+                                                            "Eq", "PartialOrd", "Ord")}
+            self.constructors.update({ctor.path: ctor for ctor in constructors})
+        self.derives[OPTION]["Default"] = self.types[OPTION][0]
+        self.default_variants[OPTION] = f"{OPTION}::None"
 
     def projection_trait(self, annotation):
         if annotation.trait:
@@ -748,6 +1340,9 @@ class Program:
             return annotation
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.normalize(annotation.inner, seen))
+        if isinstance(annotation, FunctionType):
+            return FunctionType(tuple(self.normalize(kind, seen) for kind in annotation.parameters),
+                                self.normalize(annotation.result, seen), annotation.closure)
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
         if isinstance(annotation, ArrayType):
@@ -805,6 +1400,14 @@ class Program:
             return trait in self.trait_closure({annotation.trait})
         if trait == "Sized":
             return True
+        if isinstance(annotation, FunctionType):
+            if annotation.closure:
+                captures = self.functions[annotation.closure].captures
+                return trait in {"Copy", "Clone"} and all(
+                    self.implements(capture.annotation, trait, assumed) if capture.by_move else not capture.mutable
+                    for capture in captures
+                )
+            return trait in {"Copy", "Clone", "PartialEq", "Eq"}
         if isinstance(annotation, AssociatedType):
             normalized = self.normalize(annotation)
             if not isinstance(normalized, AssociatedType):
@@ -847,24 +1450,28 @@ class Program:
 
 
 class Parser:
-    def __init__(self, source, *, tokens=None, fragment=False):
+    def __init__(self, source, *, tokens=None, fragment=False, modules=None, unit=None):
         self.tokens = iter(lex(source) if tokens is None else tokens)
         self.fragment = fragment
         self.lookahead = deque()
         self.self_type = None
         self.current_trait = None
         self.sized_receiver = False
-        self.constants = {}
+        self.modules = modules
+        self.unit = unit
+        self.constants = modules.constants if modules else {}
         self.current = next(self.tokens)
         self.type_parameters = {}
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
+        if unit:
+            self.trait_names.update(unit.trait_imports)
 
     def advance(self):
         token = self.current
         if not token.text:
             raise token.error("unexpected end of input")
         self.current = self.lookahead.popleft() if self.lookahead else next(self.tokens)
-        return token
+        return replace(token, module=self.unit.path) if self.unit and self.unit.path else token
 
     def accept(self, text):
         if self.current.text == text:
@@ -887,8 +1494,45 @@ class Parser:
             return self.advance()
         raise token.error("expected an identifier")
 
+    def qualified_token(self, token, parts, *, bare=False, type_name=False):
+        if self.modules:
+            return self.modules.name_token(self.unit, token, parts, bare=bare, type_name=type_name)
+        return replace(token, text="::".join(parts))
+
+    def declare_token(self, token):
+        if self.unit:
+            return replace(token, text=MODULE_SEPARATOR.join((*self.unit.path, token.text)))
+        return token
+
+    def member_visibility(self):
+        public = self.accept("pub")
+        if not public:
+            return self.unit.path if self.unit else ()
+        opening = self.accept("(")
+        if not opening:
+            return ()
+        parts = []
+        while self.current.text != ")":
+            parts.append(self.advance())
+        closing = self.expect(")")
+        if not self.unit:
+            return ()
+        return Modules.visibility(self.unit, TokenGroup(opening, tuple(parts), closing))
+
     def type_name(self, *, static_string=False, signature=None, output=False):
         token = self.advance()
+        if token.text == "fn":
+            self.expect("(")
+            arguments = []
+            while self.current.text != ")":
+                arguments.append(self.type_name(signature=signature))
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            result = self.type_name(signature=signature) if self.accept("->") else "()"
+            if static_string and isinstance(result, ReferenceType):
+                raise token.error("reference-returning function pointer fields are unsupported")
+            return FunctionType(tuple(arguments), result)
         if token.text == "dyn":
             trait = self.trait_path()
             bindings = []
@@ -943,13 +1587,20 @@ class Parser:
             return "()"
         if token.text == "!":
             return NEVER
-        if IDENT.fullmatch(token.text) and token.text not in RESERVED:
+        if ((IDENT.fullmatch(token.text) and token.text not in RESERVED)
+                or token.text in {"crate", "self", "super"}):
             if self.current.text == "::" and token.text in self.type_parameters:
                 self.advance()
                 return self.associated_projection(self.type_parameters[token.text])
+            if token.text in self.type_parameters:
+                return self.type_parameters[token.text]
+            parts = [token.text]
+            while self.accept("::"):
+                parts.append(self.advance().text if self.current.text == "super" else self.identifier().text)
+            name = self.qualified_token(token, parts, type_name=True).text
             if self.accept("<"):
-                return AppliedType(token.text, self.type_arguments())
-            return self.type_parameters.get(token.text, token.text)
+                return AppliedType(name, self.type_arguments())
+            return name
         raise token.error(f"unsupported type {token.text!r}")
 
     def associated_projection(self, owner, trait=None):
@@ -957,8 +1608,8 @@ class Parser:
         arguments = self.type_arguments(lifetimes=True) if self.accept("<") else ()
         return AssociatedType(owner, name.text, trait, arguments)
 
-    def parse(self):
-        program = Program()
+    def parse(self, program=None):
+        program = Program() if program is None else program
         while self.current.text:
             if self.accept("@macro_definition"):
                 continue
@@ -999,7 +1650,7 @@ class Parser:
                 self.impl_item(program, token)
                 continue
             self.expect("fn")
-            name = self.identifier()
+            name = self.declare_token(self.identifier())
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
             program.functions[name.text] = self.function(name)
@@ -1043,7 +1694,7 @@ class Parser:
         return function
 
     def constant_item(self):
-        name = self.identifier()
+        name = self.declare_token(self.identifier())
         if name.text in self.constants:
             raise name.error(f"duplicate constant {name.text!r}")
         self.expect(":")
@@ -1091,7 +1742,7 @@ class Parser:
         return name, mutable and not borrowed, annotation
 
     def trait_item(self, program):
-        name = self.identifier()
+        name = self.declare_token(self.identifier())
         if name.text in program.traits or name.text in TRAIT_MODULES:
             raise name.error(f"duplicate trait {name.text!r}")
         bounds = self.trait_bounds() if self.accept(":") else set()
@@ -1134,7 +1785,7 @@ class Parser:
         methods = {}
         associated = {}
         while not self.accept("}"):
-            self.accept("pub")
+            visible = self.member_visibility()
             if self.accept("type"):
                 name = self.identifier()
                 if not self.current_trait:
@@ -1178,6 +1829,7 @@ class Parser:
                                     type_parameters=tuple(self.type_parameters.values()), associated_const=True)
             else:
                 function = self.function(internal, method=True, declaration=declaration)
+            function.visible_from = visible
             methods[name.text] = function
             if function.body is not None:
                 program.functions[internal.text] = function
@@ -1234,15 +1886,17 @@ class Parser:
         return lifetimes, types
 
     def trait_path(self):
-        token = self.identifier()
+        token = self.advance() if self.current.text in {"crate", "self", "super"} else self.identifier()
         parts = [token.text]
         while self.accept("::"):
-            parts.append(self.identifier().text)
+            parts.append(self.advance().text if self.current.text == "super" else self.identifier().text)
         if len(parts) == 1 and parts[0] in self.trait_names:
             return self.trait_names[parts[0]]
         if (len(parts) == 3 and parts[0] in {"std", "core"}
                 and TRAIT_MODULES.get(parts[2]) == parts[1]):
             return parts[2]
+        if self.modules:
+            return self.qualified_token(token, parts, type_name=True).text
         if len(parts) == 1:
             return parts[0]
         raise token.error(f"unsupported trait {'::'.join(parts)!r}")
@@ -1360,7 +2014,7 @@ class Parser:
         return derives
 
     def type_item(self, program, item, derives):
-        name = self.identifier()
+        name = self.declare_token(self.identifier())
         if name.text in program.types or name.text in PRIMITIVES:
             raise name.error(f"duplicate type {name.text!r}")
         lifetimes, self.type_parameters = self.generic_parameters()
@@ -1407,29 +2061,41 @@ class Parser:
 
     def constructor(self, annotation, path):
         fields = []
+        visibility = []
+        variant = "::" in path
         if self.accept("{"):
             names = set()
             while self.current.text != "}":
-                self.accept("pub")
+                visible = self.field_visibility(variant)
                 name = self.identifier()
                 if name.text in names:
                     raise name.error(f"duplicate field {name.text!r}")
                 names.add(name.text)
                 self.expect(":")
                 fields.append((name.text, self.type_name(static_string=True)))
+                visibility.append((name.text, visible))
                 if not self.accept(","):
                     break
             self.expect("}")
-            return Constructor(path, annotation, "record", tuple(fields))
+            return Constructor(path, annotation, "record", tuple(fields), tuple(visibility))
         if self.accept("("):
             while self.current.text != ")":
-                self.accept("pub")
-                fields.append((str(len(fields)), self.type_name(static_string=True)))
+                visible = self.field_visibility(variant)
+                name = str(len(fields))
+                fields.append((name, self.type_name(static_string=True)))
+                visibility.append((name, visible))
                 if not self.accept(","):
                     break
             self.expect(")")
-            return Constructor(path, annotation, "tuple", tuple(fields))
+            return Constructor(path, annotation, "tuple", tuple(fields), tuple(visibility))
         return Constructor(path, annotation, "unit", ())
+
+    def field_visibility(self, variant):
+        if variant:
+            if self.current.text == "pub":
+                raise self.current.error("enum variant fields inherit visibility")
+            return ()
+        return self.member_visibility()
 
     def block(self):
         token = self.expect("{")
@@ -1473,7 +2139,13 @@ class Parser:
 
     def expression(self, minimum=1, *, allow_record=True):
         left = self.prefix(allow_record)
-        while self.current.text in {".", "["}:
+        while self.current.text in {".", "[", "?", "("}:
+            if self.current.text == "(":
+                left = Expr("indirect_call", left.token, (left, *self.arguments()))
+                continue
+            if question := self.accept("?"):
+                left = Expr("try", question, (left,))
+                continue
             if opening := self.accept("["):
                 index = self.expression()
                 self.expect("]")
@@ -1534,6 +2206,8 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word in {"|", "||"} or word == "move" and self.current.text in {"|", "||"}:
+            return self.closure(token, self.advance().text if word == "move" else word)
         if word == "<":
             owner = self.type_name()
             self.expect("as")
@@ -1545,6 +2219,19 @@ class Parser:
                 return Expr("call", member, self.arguments(), qualified=(owner, trait))
             return Expr("name", member, qualified=(owner, trait))
         if word == "Self" and self.self_type is not None:
+            if self.current.text != "::":
+                owner = self.self_type
+                arguments = owner.arguments if isinstance(owner, AppliedType) else None
+                name = owner.name if isinstance(owner, AppliedType) else owner
+                if not isinstance(name, str):
+                    raise token.error("abstract Self is not a constructor")
+                path = replace(token, text=name)
+                if self.current.text == "(":
+                    return Expr("call", path, self.arguments(), type_arguments=arguments)
+                if allow_record and self.current.text == "{":
+                    return Expr("record", path, (self.record_fields(self.expression, "name")[0],),
+                                type_arguments=arguments)
+                return Expr("name", path, type_arguments=arguments)
             self.expect("::")
             member = self.identifier()
             if self.current.text == "(":
@@ -1629,32 +2316,54 @@ class Parser:
         literal = self.literal(token)
         if literal:
             return literal
-        if word == "self" and (self.self_type is not None or self.fragment):
+        if word == "self" and self.current.text != "::" and (self.self_type is not None or self.fragment):
             return Expr("name", token)
-        if IDENT.fullmatch(word) and word not in RESERVED:
+        if (IDENT.fullmatch(word) and word not in RESERVED) or word in {"crate", "self", "super"}:
             if self.accept("!"):
                 opening = self.current.text
                 if opening not in DELIMITERS:
                     raise self.current.error("expected a macro delimiter")
+                if word in {"panic", "unreachable", "unimplemented", "todo"}:
+                    return Expr("panic", token, self.arguments(opening))
                 if word != "println":
                     if not self.fragment:
                         raise token.error(f"unknown macro {word!r}")
                     self.skip_group()
                     return Expr("literal", token, ("i32", 0))
                 return Expr("print", token, self.arguments(opening))
-            path, type_arguments = self.expression_path(token)
+            local = token if self.current.text != "::" else None
+            path, type_arguments = self.expression_path(token, allow_record=allow_record)
             if path.text in INTEGER_CONSTANTS:
                 return Expr("literal", path, ("i32", INTEGER_CONSTANTS[path.text]))
+            if path.text in self.constants:
+                constant = self.constants[path.text]
+                return Expr("literal", path, (constant.kind, constant.value))
             if allow_record and self.current.text == "{":
                 return Expr("record", path, (self.record_fields(self.expression, "name")[0],),
                             type_arguments=type_arguments)
             if self.current.text == "(":
-                return Expr("call", path, self.arguments(), type_arguments=type_arguments)
+                return Expr("call", path, self.arguments(), type_arguments=type_arguments,
+                            local_callee=local)
             owner, separator, member = path.text.partition("::")
             if separator and owner in self.type_parameters:
                 return Expr("name", replace(path, text=member), qualified=(self.type_parameters[owner], None))
             return Expr("name", path, type_arguments=type_arguments)
         raise token.error(f"unexpected token {word!r}")
+
+    def closure(self, token, opening):
+        params = []
+        if opening == "|":
+            while self.current.text != "|":
+                mutable = bool(self.accept("mut"))
+                name = self.accept("_") or self.identifier()
+                annotation = self.type_name() if self.accept(":") else None
+                params.append((name, mutable, annotation))
+                if not self.accept(","):
+                    break
+            self.expect("|")
+        result = self.type_name() if self.accept("->") else None
+        body = self.block() if result is not None else self.expression()
+        return Expr("closure", token, (params, result, body, token.text == "move"))
 
     @staticmethod
     def literal(token, negative=False):
@@ -1675,21 +2384,21 @@ class Parser:
             return Expr("literal", token, ("&str", decode_string(token)))
         return None
 
-    def expression_path(self, token):
-        if not self.accept("::"):
-            return token, None
+    def expression_path(self, token, *, allow_record=True):
+        parts = [token.text]
         arguments = None
-        if self.accept("<"):
-            arguments = self.type_arguments()
-            if not self.accept("::"):
-                return token, arguments
-        member = self.identifier()
-        path = Token(f"{token.text}::{member.text}", token.line, token.column)
-        if self.accept("::"):
-            if arguments is not None:
-                raise path.error("type arguments may appear only once in the path")
-            self.expect("<")
-            arguments = self.type_arguments()
+        while self.accept("::"):
+            if self.accept("<"):
+                if arguments is not None:
+                    raise token.error("type arguments may appear only once in the path")
+                arguments = self.type_arguments()
+            else:
+                member = self.advance() if self.current.text == "super" else self.identifier()
+                parts.append(member.text)
+        if parts[0] in self.type_parameters and len(parts) > 1:
+            return replace(token, text="::".join(parts)), arguments
+        starts_constructor = self.current.text == "(" or (allow_record and self.current.text == "{")
+        path = self.qualified_token(token, parts, bare=not starts_constructor and arguments is None)
         return path, arguments
 
     def type_arguments(self, *, lifetimes=False):
@@ -1701,7 +2410,8 @@ class Parser:
                 arguments.append(None)
             elif lifetimes and word.startswith("'"):
                 arguments.append(LifetimeArgument(self.advance().text))
-            elif (word in {"{", "-", "true", "false"} or word in self.constants or word[0].isdigit()
+            elif (word in {"{", "-", "true", "false"} or self.unqualified_constant()
+                  or word and word[0].isdigit()
                   or (parameter and parameter.const_type)):
                 arguments.append(self.const_argument())
             else:
@@ -1711,6 +2421,13 @@ class Parser:
         self.expect(">")
         return tuple(arguments)
 
+    def unqualified_constant(self):
+        token = self.current
+        if self.constants and IDENT.fullmatch(token.text) and self.peek() != "::":
+            path = self.qualified_token(token, (token.text,), bare=True)
+            return path.text in self.constants
+        return False
+
     def const_argument(self):
         if self.accept("{"):
             value = self.const_expression(self.expression())
@@ -1718,8 +2435,10 @@ class Parser:
             return value
         negative = self.accept("-")
         token = self.advance()
-        if token.text in self.constants and not negative:
-            return self.constants[token.text]
+        if not negative and self.constants and IDENT.fullmatch(token.text):
+            path = self.qualified_token(token, (token.text,), bare=True)
+            if path.text in self.constants:
+                return self.constants[path.text]
         parameter = self.type_parameters.get(token.text)
         if parameter and parameter.const_type and not negative:
             return parameter
@@ -1834,11 +2553,16 @@ class Parser:
             return literal
         if token.text == "mut":
             return Expr("bind", self.identifier(), (True,))
-        if not IDENT.fullmatch(token.text) or token.text in RESERVED:
+        if token.text not in {"crate", "self", "super"} and (
+            not IDENT.fullmatch(token.text) or token.text in RESERVED
+        ):
             raise token.error("expected a pattern")
         path, type_arguments = self.expression_path(token)
         if path.text in INTEGER_CONSTANTS:
             return Expr("literal", path, ("i32", INTEGER_CONSTANTS[path.text]))
+        if path.text in self.constants:
+            constant = self.constants[path.text]
+            return Expr("literal", path, (constant.kind, constant.value))
         if self.current.text == "{":
             return Expr("pattern_record", path, self.record_fields(self.pattern, "bind"),
                         type_arguments=type_arguments)
@@ -1930,9 +2654,12 @@ class Scope:
     bindings: dict = field(default_factory=dict)
     owned: set = field(default_factory=set)
     definitions: dict | None = None
+    captures: CaptureContext | None = None
 
     def __post_init__(self):
         self.definitions = self.parent.definitions if self.parent else {}
+        if self.parent:
+            self.captures = self.parent.captures
 
     def remember(self, token):
         frames = []
@@ -1959,7 +2686,35 @@ class Scope:
             snapshot = self.definitions.get(definition, {})
             if key in snapshot:
                 return snapshot[key]
+        if self.captures:
+            return self.captures.find(token)
         raise token.error(f"unknown binding {token.text!r}")
+
+
+@dataclass
+class CaptureContext:
+    enclosing: Scope
+    by_move: bool
+    captures: dict = field(default_factory=dict)
+
+    def find(self, token):
+        binding = self.enclosing.find(token)
+        self.captures.setdefault(token.key, Capture(token, binding.value, self.by_move))
+        return Binding(binding.value, binding.mutable)
+
+    @staticmethod
+    def mark_mutable(scope, expr):
+        root = place_root(expr)
+        if root.kind != "name" or scope.captures is None:
+            return
+        current = scope
+        while current:
+            if root.token.key in current.bindings:
+                return
+            current = current.parent
+        old = scope.captures.captures.get(root.token.key)
+        if old:
+            scope.captures.captures[root.token.key] = replace(old, mutable=True)
 
 
 def require(actual, expected, token):
@@ -1982,7 +2737,7 @@ def place_root(expr):
 
 def reference_source(expr):
     expr = ungroup(expr)
-    return expr.kind in {"name", "borrow", "call", "if", "match", "dyn_reference"} or (
+    return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "match", "dyn_reference"} or (
         expr.kind == "block" and not expr.label
     )
 
@@ -2289,6 +3044,9 @@ class Checker:
         self.array_integers = []
         self.parameters = {}
         self.ascriptions = []
+        self.closures = []
+        self.pointers = []
+        self.indirect_calls = []
 
     def check(self):
         finished = set()
@@ -2302,7 +3060,7 @@ class Checker:
             raise RustError("missing fn main()")
         if main.params or main.result != "()" or main.type_parameters:
             raise main.name.error("main must take no arguments and return ()")
-        for function in self.functions.values():
+        for function in tuple(self.functions.values()):
             self.check_bounds(function.type_parameters, function.name)
             self.parameters = {parameter.name: parameter for parameter in function.type_parameters}
             constructor = self.program.constructors.get(function.name.text)
@@ -2439,6 +3197,9 @@ class Checker:
             return result
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.resolve(annotation.inner))
+        if isinstance(annotation, FunctionType):
+            return FunctionType(tuple(map(self.resolve, annotation.parameters)), self.resolve(annotation.result),
+                                annotation.closure)
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
         if isinstance(annotation, ArrayType):
@@ -2457,6 +3218,8 @@ class Checker:
         annotation = self.resolve(annotation)
         if isinstance(annotation, ReferenceType):
             return self.occurs(variable, annotation.inner)
+        if isinstance(annotation, FunctionType):
+            return any(self.occurs(variable, kind) for kind in (*annotation.parameters, annotation.result))
         if isinstance(annotation, AppliedType):
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
         if isinstance(annotation, ArrayType):
@@ -2484,6 +3247,12 @@ class Checker:
         if isinstance(actual, ReferenceType) and isinstance(expected, ReferenceType):
             if actual.mutable == expected.mutable:
                 self.require(actual.inner, expected.inner, token)
+                return
+        if isinstance(actual, FunctionType) and isinstance(expected, FunctionType):
+            if actual.closure == expected.closure and len(actual.parameters) == len(expected.parameters):
+                for left, right in zip(actual.parameters, expected.parameters):
+                    self.require(left, right, token)
+                self.require(actual.result, expected.result, token)
                 return
         if isinstance(actual, AppliedType) and isinstance(expected, AppliedType):
             if actual.name == expected.name and len(actual.arguments) == len(expected.arguments):
@@ -2597,10 +3366,15 @@ class Checker:
         for variable in self.variables:
             if isinstance(self.resolve(variable), TypeVariable):
                 raise variable.token.error(f"type annotations needed for {variable.name}")
+        for function in self.closures:
+            function.captures = tuple(replace(capture, annotation=self.resolve(capture.annotation))
+                                      for capture in function.captures)
         for annotation, token in self.generic_arguments:
             annotation = self.resolve(annotation)
             if isinstance(annotation, ReferenceType):
                 raise token.error("references as generic type arguments are unsupported")
+            if isinstance(annotation, FunctionType) and annotation.closure:
+                raise token.error("capturing closures as generic type arguments are unsupported")
         for annotation, trait, token in self.obligations:
             annotation = self.resolve(annotation)
             if annotation != NEVER and not self.implements(annotation, trait):
@@ -2622,6 +3396,25 @@ class Checker:
         for expr in self.ascriptions:
             source, annotation, value, otherwise = expr.args
             expr.args = (source, self.resolve(annotation), value, otherwise)
+        for function in self.closures:
+            function.params = [(name, mutable, self.resolve(kind)) for name, mutable, kind in function.params]
+            function.result = self.resolve(function.result)
+            for capture in function.captures:
+                kind = capture.annotation
+                if isinstance(kind, ReferenceType) or isinstance(kind, FunctionType) and kind.closure:
+                    raise capture.name.error("capturing a reference or another capturing closure is unsupported")
+            if isinstance(function.result, ReferenceType):
+                if function.captures:
+                    raise function.name.error("reference results from capturing closures are unsupported")
+                function.return_inputs = Parser.return_inputs(function.name, function.params, function.result, {})
+        for expr in self.pointers:
+            name, arguments = expr.args
+            expr.args = (name, {parameter: self.resolve(kind) for parameter, kind in arguments.items()})
+        for expr in self.indirect_calls:
+            function = self.program.call_functions[id(expr)]
+            function.params = [(name, mutable, self.resolve(kind)) for name, mutable, kind in function.params]
+            function.result = self.resolve(function.result)
+            function.return_inputs = Parser.return_inputs(function.name, function.params, function.result, {})
 
     def resolve_pattern(self, pattern):
         tag = pattern.tag
@@ -2657,6 +3450,14 @@ class Checker:
         if isinstance(annotation, (TypeParameter, TypeVariable)):
             if annotation.const_type:
                 raise token.error("expected a type, found a const parameter")
+            return
+        if isinstance(annotation, FunctionType):
+            for kind in annotation.parameters:
+                self.check_type(kind, token)
+            self.check_type(annotation.result, token, allow_never=True)
+            if isinstance(annotation.result, ReferenceType):
+                params = [(token, False, kind) for kind in annotation.parameters]
+                Parser.return_inputs(token, params, annotation.result, {})
             return
         if isinstance(annotation, ArrayType):
             if isinstance(annotation.element, ReferenceType):
@@ -2792,6 +3593,8 @@ class Checker:
         ctor = self.program.constructors.get(token.text)
         if not ctor or ctor.style != style:
             raise token.error(f"unknown {style} constructor {token.text!r}")
+        if style == "tuple" and any(token.module[:len(scope)] != scope for _, scope in ctor.visibility):
+            raise token.error(f"constructor {token.text!r} has private fields")
         parameters = self.program.type_parameters[ctor.annotation]
         arguments = self.specialize(parameters, expr.type_arguments, token)
         if not arguments:
@@ -2808,12 +3611,20 @@ class Checker:
         if not declaration or len(declaration[1]) != 1 or "::" in declaration[1][0].path:
             raise token.error(f"{annotation} has no accessible fields")
         ctor = declaration[1][0]
+        self.visible_field(ctor, token)
         return ctor.fields[ctor.index(token)][1]
+
+    @staticmethod
+    def visible_field(ctor, token):
+        scope = dict(ctor.visibility).get(token.text, ())
+        if token.module[:len(scope)] != scope:
+            raise token.error(f"field {token.text!r} is private")
 
     @staticmethod
     def field_indices(ctor, fields, rest, token):
         indices = []
         for name, _ in fields:
+            Checker.visible_field(ctor, name)
             index = ctor.index(name)
             if index in indices:
                 raise name.error(f"duplicate field {name.text!r}")
@@ -3033,6 +3844,30 @@ class Checker:
 
     def check_expr(self, expr, scope, expected=None):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "closure":
+            return self.closure_type(expr, scope, expected)
+        if kind == "indirect_call":
+            callee = self.type_of(args[0], scope)
+            return self.indirect_type(expr, scope, expected, callee)
+        if kind in {"function_pointer", "closure_value"}:
+            return self.program.expr_types[id(expr)]
+        if kind == "try":
+            value = args[0]
+            enclosing = self.resolve(self.result)
+            hint = None
+            if expected is not None and isinstance(enclosing, AppliedType) and enclosing.name in {OPTION, RESULT}:
+                hint = AppliedType(enclosing.name, (expected, *enclosing.arguments[1:]))
+            actual = self.type_of(value, scope, hint)
+            if actual == NEVER:
+                return NEVER
+            if not isinstance(actual, AppliedType) or actual.name not in {OPTION, RESULT}:
+                raise token.error("? requires Option or Result")
+            if not isinstance(enclosing, AppliedType) or actual.name != enclosing.name:
+                raise token.error("? requires a function returning the same enum family")
+            if actual.name == RESULT:
+                self.require(actual.arguments[1], enclosing.arguments[1], token)
+            expr.args = (value, enclosing)
+            return self.resolve(actual.arguments[0])
         if kind == "macro_definition":
             scope.remember(token)
             self.macro_labels[token.definition] = tuple(self.loops)
@@ -3088,8 +3923,23 @@ class Checker:
                 if "::" not in token.text:
                     raise token.error("type arguments require a generic call or constructor")
             if expr.qualified or "::" in token.text:
-                return self.constant_type(expr, scope, expected)
-            return scope.find(token).value
+                if token.text not in self.functions:
+                    return self.constant_type(expr, scope, expected)
+            binding = self.local_binding(scope, token)
+            if binding is not None:
+                return binding.value
+            name = self.program.values_in_scope.get(token.module, {}).get(token.text, token.text)
+            function = self.functions.get(name)
+            if not function:
+                return scope.find(token).value
+            arguments = self.specialize(function.type_parameters, expr.type_arguments, token)
+            annotation = FunctionType(tuple(substitute(kind, arguments) for _, _, kind in function.params),
+                                      substitute(function.result, arguments))
+            if isinstance(expected, FunctionType):
+                self.require(annotation, expected, token)
+            expr.kind, expr.args = "function_pointer", (function.name.text, arguments)
+            self.pointers.append(expr)
+            return self.resolve(annotation)
         if kind == "field":
             value, name = args
             annotation = self.type_of(value, scope)
@@ -3105,6 +3955,8 @@ class Checker:
             if annotation == NEVER:
                 return NEVER
             self.require_place(value, write=mutable, allow_temporary=True)
+            if mutable:
+                CaptureContext.mark_mutable(scope, value)
             result = ReferenceType(annotation, mutable)
             self.check_type(result, token)
             return result
@@ -3224,6 +4076,7 @@ class Checker:
             left, right = args
             annotation = self.type_of(left, scope)
             self.require_place(left, write=True)
+            CaptureContext.mark_mutable(scope, left)
             if isinstance(annotation, ReferenceType):
                 raise token.error("reassigning reference bindings is unsupported")
             hint = annotation if token.text == "=" or right.unsuffixed else None
@@ -3246,9 +4099,9 @@ class Checker:
             return self.binary_type(token, left, right)
         if kind == "call":
             return self.call_type(expr, scope, expected)
-        if kind == "print":
+        if kind in {"print", "panic"}:
             if not args:
-                return "()"
+                return NEVER if kind == "panic" else "()"
             template, *values = args
             template = ungroup(template)
             expr.args = (template, *values)
@@ -3270,7 +4123,7 @@ class Checker:
                 if mode == "display" and actual == "()":
                     raise token.error("() requires debug formatting")
                 self.obligation(actual, "Debug" if mode == "debug" else "Display", token)
-            return NEVER if NEVER in types else "()"
+            return NEVER if kind == "panic" or NEVER in types else "()"
         raise AssertionError(kind)
 
     def array_type(self, expr, scope, expected):
@@ -3313,6 +4166,13 @@ class Checker:
 
     def call_type(self, expr, scope, expected):
         token, args = expr.token, expr.args
+        if expr.local_callee:
+            local = self.local_binding(scope, expr.local_callee)
+            if local is not None:
+                pointer = Expr("name", expr.local_callee)
+                self.program.expr_types[id(pointer)] = self.resolve(local.value)
+                expr.kind, expr.args = "indirect_call", (pointer, *args)
+                return self.indirect_type(expr, scope, expected, local.value)
         if expr.qualified:
             owner, trait = expr.qualified
             self.check_type(owner, token)
@@ -3370,6 +4230,8 @@ class Checker:
 
     def check_call(self, expr, scope, expected, params, result, arguments, first=None):
         token, args = expr.token, expr.args
+        if expr.kind == "indirect_call":
+            args = args[1:]
         if len(args) != len(params):
             raise token.error(f"{token.text} takes {len(params)} arguments")
         defer_projection = isinstance(self.resolve(result), AssociatedType)
@@ -3387,6 +4249,71 @@ class Checker:
         return NEVER if NEVER in actual_types else self.resolve(result)
 
     @staticmethod
+    def local_binding(scope, token):
+        try:
+            return scope.find(token)
+        except RustError:
+            return None
+
+    def indirect_type(self, expr, scope, expected, callee):
+        callee = self.resolve(callee)
+        if callee == NEVER:
+            expr.kind, expr.args = "group", (expr.args[0],)
+            return NEVER
+        if not isinstance(callee, FunctionType):
+            raise expr.token.error(f"expected a callable value, found {callee}")
+        token = expr.token
+        params = [(replace(token, text="_"), False, kind) for kind in callee.parameters]
+        inputs = Parser.return_inputs(token, params, callee.result, {})
+        self.program.call_functions[id(expr)] = Function(token, params, callee.result, None, inputs)
+        self.indirect_calls.append(expr)
+        return self.check_call(expr, scope, expected, callee.parameters, callee.result, {})
+
+    def closure_type(self, expr, scope, expected):
+        raw, declared, body, by_move = expr.args
+        hint = self.resolve(expected)
+        if isinstance(hint, FunctionType) and len(hint.parameters) != len(raw):
+            raise expr.token.error("closure has a different parameter count")
+        params = []
+        captures = CaptureContext(scope, by_move)
+        local = Scope(captures=captures)
+        for index, (name, mutable, annotation) in enumerate(raw):
+            if annotation is None and isinstance(hint, FunctionType):
+                annotation = hint.parameters[index]
+            if annotation is None:
+                annotation = TypeVariable(name.text, name)
+                self.variables.append(annotation)
+            self.check_type(annotation, name)
+            if name.text != "_":
+                if name.key in local.bindings:
+                    raise name.error(f"duplicate closure parameter {name.text!r}")
+                local.bindings[name.key] = Binding(annotation, mutable)
+            params.append((name, mutable, annotation))
+        result = declared if declared is not None else hint.result if isinstance(hint, FunctionType) else None
+        if result is None:
+            result = TypeVariable("closure result", expr.token)
+            self.variables.append(result)
+        previous_result, previous_loops = self.result, self.loops
+        self.result, self.loops = result, []
+        try:
+            actual = self.type_of(body, local, result)
+        finally:
+            self.result, self.loops = previous_result, previous_loops
+        self.require_argument(actual, result, expr.token)
+        if actual == NEVER and isinstance(self.resolve(result), TypeVariable):
+            self.require(result, "()", expr.token)
+        name = replace(expr.token, text=f"@closure:{len(self.closures)}")
+        arguments = {parameter: parameter for parameter in self.parameters.values()}
+        function = Function(name, params, result, body, type_parameters=tuple(arguments))
+        function.captures = tuple(captures.captures.values())
+        self.closures.append(function)
+        self.program.functions[name.text] = function
+        expr.kind, expr.args = ("closure_value" if function.captures else "function_pointer"), (name.text, arguments)
+        self.pointers.append(expr)
+        return FunctionType(tuple(kind for _, _, kind in params), self.resolve(result),
+                            name.text if function.captures else None)
+
+    @staticmethod
     def has_receiver(method):
         return bool(method.params and method.params[0][0].text == "self")
 
@@ -3398,6 +4325,10 @@ class Checker:
             expr.kind, expr.args = "group", (original,)
             return NEVER
         base = actual.inner if isinstance(actual, ReferenceType) else actual
+        if isinstance(base, AppliedType) and base.name in {OPTION, RESULT}:
+            result = self.prelude_method(expr, scope, original, actual, base, rest)
+            if result is not None:
+                return result
         if isinstance(base, ArrayType) and name == "len" and not rest:
             if isinstance(actual, ReferenceType):
                 original = Expr("deref", expr.token, (original, False))
@@ -3414,10 +4345,12 @@ class Checker:
             ):
                 method = impl.methods[name]
                 if self.has_receiver(method):
+                    self.visible_method(method, expr.token)
                     return self.receiver_call(expr, scope, expected, method, arguments, actual)
         candidates = [trait for trait in self.program.traits.values()
                       if name in trait.methods and self.has_receiver(trait.methods[name])
-                      and self.implements(base, trait.name.text)]
+                      and self.implements(base, trait.name.text)
+                      and self.trait_available(base, trait.name.text, expr.token)]
         if len(candidates) > 1:
             raise expr.token.error(f"multiple traits provide method {name!r}")
         if candidates:
@@ -3431,6 +4364,47 @@ class Checker:
             expr.kind = "clone"
             return self.check_expr(expr, scope, expected)
         raise expr.token.error(f"no method {name!r} for {base}")
+
+    def prelude_method(self, expr, scope, original, actual, base, rest):
+        name = expr.token.text
+        checks = {"is_some": "Some", "is_none": "None"} if base.name == OPTION else {
+            "is_ok": "Ok", "is_err": "Err"
+        }
+        unwrap = name in {"unwrap", "expect", "unwrap_or"}
+        if not unwrap and name not in checks:
+            return None
+        if base.name == RESULT and name in {"unwrap", "expect"}:
+            self.obligation(base.arguments[1], "Debug", expr.token)
+        count = int(name in {"expect", "unwrap_or"})
+        if len(rest) != count:
+            raise expr.token.error(f"{name} takes {count} arguments")
+        if isinstance(actual, ReferenceType):
+            original = Expr("deref", original.token, (original, False))
+            self.type_of(original, scope)
+        expr.kind = "enum_method"
+        success = ("Some" if base.name == OPTION else "Ok") if unwrap else checks[name]
+        expr.args = (original, tuple(rest), success, unwrap)
+        result = base.arguments[0] if unwrap else "bool"
+        if rest:
+            hint = "&str" if name == "expect" else result
+            actual = self.type_of(rest[0], scope, hint)
+            self.require(actual, hint, rest[0].token)
+            if actual == NEVER:
+                return NEVER
+        return self.resolve(result)
+
+    def trait_available(self, base, name, token):
+        if isinstance(base, DynType):
+            return name in self.program.trait_closure({base.trait})
+        if isinstance(base, TypeParameter) and name in self.program.trait_closure(base.bounds):
+            return True
+        return name in self.program.traits_in_scope.get(token.module, ())
+
+    @staticmethod
+    def visible_method(method, token):
+        scope = method.visible_from
+        if token.module[:len(scope)] != scope:
+            raise token.error(f"method {token.text!r} is private")
 
     def receiver_call(self, expr, scope, expected, method, arguments, actual):
         original, *rest = expr.args
@@ -3469,6 +4443,7 @@ class Checker:
             raise expr.token.error(f"unknown or ambiguous associated function {expr.token.text!r}")
         impl = candidates[0]
         method = impl.methods[name]
+        self.visible_method(method, expr.token)
         explicit = None if method.method_parameters else expr.type_arguments
         arguments = self.specialize(impl.parameters, explicit, expr.token)
         return self.function_call(expr, scope, expected, method, arguments)
@@ -3498,12 +4473,14 @@ class Checker:
                 continue
             args = {}
             if match_types(impl.target, owner, impl.parameters, args):
+                self.visible_method(impl.methods[name], expr.token)
                 for parameter, argument in args.items():
                     for trait in parameter.bounds:
                         self.obligation(argument, trait, expr.token)
                 return self.function_call(expr, scope, expected, impl.methods[name], args)
         traits = [trait.name.text for trait in self.program.traits.values()
-                  if name in trait.methods and self.implements(owner, trait.name.text)]
+                  if name in trait.methods and self.implements(owner, trait.name.text)
+                  and self.trait_available(owner, trait.name.text, expr.token)]
         if len(traits) == 1:
             return self.trait_call(expr, scope, expected, owner, traits[0], name)
         raise expr.token.error(f"unknown or ambiguous associated function {name!r} for {owner}")
@@ -3530,6 +4507,7 @@ class Local:
     mutable: bool
     loan: Loan | None = None
     static: bool = False
+    shared_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -3653,6 +4631,8 @@ class MoveState:
             raise token.error(f"cannot move out of borrowed place {place.name!r}")
         if kind == "indexed_move":
             raise token.error(f"cannot move out of array index in {place.name!r}")
+        if kind == "capture_move":
+            raise token.error(f"cannot move out of shared capture {place.name!r}")
         if kind == "guard_move":
             raise token.error(f"cannot move out of {place.name!r} in a pattern guard")
         if kind == "guard_write":
@@ -3687,11 +4667,22 @@ class Ownership:
         self.guard_tests = ()
 
     def check(self):
-        for function in self.program.functions.values():
+        functions = tuple(self.program.functions.values())
+        ordered = tuple(function for function in functions if function.name.text.startswith("@closure:"))
+        ordered += tuple(function for function in functions if not function.name.text.startswith("@closure:"))
+        for function in ordered:
             scope = Scope()
             entry = FlowNode()
             cursor = entry
             self.return_roots = set()
+            self.function = function
+            self.owned_captures = set()
+            for capture in function.captures:
+                local = Local(capture.name, capture.mutable, shared_capture=not capture.by_move)
+                if capture.by_move:
+                    self.owned_captures.add(local)
+                scope.bindings[capture.name.key] = local
+                cursor = self.emit(cursor, "declare", Place(local), capture.name)
             for index, (token, mutable, annotation) in enumerate(function.params):
                 if token.text == "_":
                     continue
@@ -3877,7 +4868,7 @@ class Ownership:
         if expr.kind == "dyn_reference":
             return self.lower_reference(expr.args[0], scope, cursor, reborrow=reborrow,
                                         two_phase=two_phase, extend_to=extend_to)
-        if expr.kind == "call":
+        if expr.kind in {"call", "indirect_call"}:
             return self.lower_call(expr, scope, cursor)
         if expr.kind == "block":
             statements, tail = expr.args
@@ -3978,9 +4969,24 @@ class Ownership:
 
     def lower_call(self, expr, scope, cursor):
         token, args = expr.token, expr.args
+        temporaries = []
+        if expr.kind == "indirect_call":
+            pointer, *args = args
+            annotation = self.annotation(pointer)
+            if isinstance(annotation, FunctionType) and annotation.closure:
+                closure = self.program.functions[annotation.closure]
+                cursor, lease = self.lower_closure(pointer, scope, cursor, consume=closure.consumes_captures)
+                if not closure.consumes_captures and any(capture.mutable for capture in closure.captures):
+                    receiver = ungroup(pointer)
+                    if receiver.kind == "name":
+                        cursor = self.emit(cursor, "write", Place(scope.find(receiver.token)), receiver.token)
+                if lease:
+                    cursor, holder = self.keep_loan(cursor, lease, pointer.token)
+                    temporaries.append((holder, pointer.token))
+            else:
+                cursor = self.lower(pointer, scope, cursor)
         function = self.program.call_functions.get(id(expr))
         expected, _ = self.program.call_types[id(expr)]
-        temporaries = []
         passed = {}
         for index, (expr, annotation) in enumerate(zip(args, expected)):
             if isinstance(annotation, ReferenceType) and self.annotation(expr) != NEVER:
@@ -4048,12 +5054,27 @@ class Ownership:
             return "indexed_move"
         if place.holder:
             return "deref_move"
+        if place.local.shared_capture:
+            return "capture_move"
+        if place.local in self.owned_captures:
+            self.function.consumes_captures = True
         if place.local in self.guarded or any(place.overlaps(item) for item in self.guard_borrows):
             return "guard_move"
         return "move"
 
     def lower(self, expr, scope, cursor, *, consume=True):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind == "closure_value":
+            cursor, _ = self.lower_closure(expr, scope, cursor)
+            return cursor
+        if kind == "try":
+            return self.lower(args[0], scope, cursor)
+        if kind == "enum_method":
+            receiver, arguments, _, consuming = args
+            cursor = self.lower(receiver, scope, cursor, consume=consuming)
+            for argument in arguments:
+                cursor = self.lower(argument, scope, cursor)
+            return cursor
         if kind == "macro_definition":
             scope.remember(token)
             return cursor
@@ -4062,7 +5083,7 @@ class Ownership:
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
-        if kind in {"literal", "name", "default", "const_value"}:
+        if kind in {"literal", "name", "default", "const_value", "function_pointer"}:
             return cursor
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
@@ -4100,6 +5121,10 @@ class Ownership:
             pattern, types = self.program.patterns[id(source)]
             if value is None:
                 return self.declare(source, types, scope, cursor, initialized=False)
+            value_type = self.annotation(value)
+            if isinstance(value_type, FunctionType) and value_type.closure:
+                cursor, lease = self.lower_closure(value, scope, cursor)
+                return self.declare(source, types, scope, cursor, loan=lease)
             if isinstance(self.annotation(value), ReferenceType):
                 static = isinstance(annotation, ReferenceType) and annotation.lifetime == "'static"
                 if not types and not static and ungroup(value).kind == "name":
@@ -4179,12 +5204,34 @@ class Ownership:
             for _, value in args[0]:
                 cursor = self.lower(value, scope, cursor)
             return cursor
-        if kind == "call":
+        if kind in {"call", "indirect_call"}:
             cursor, _ = self.lower_call(expr, scope, cursor)
             return None if self.annotation(expr) == NEVER else cursor
-        if kind == "print":
+        if kind in {"print", "panic"}:
+            if kind == "panic":
+                self.lower_print(token, args, scope, cursor)
+                return None
             return self.lower_print(token, args, scope, cursor)
         raise AssertionError(kind)
+
+    def lower_closure(self, expr, scope, cursor, *, consume=True):
+        expr = ungroup(expr)
+        if expr.kind == "name":
+            return self.lower(expr, scope, cursor, consume=consume), scope.find(expr.token).loan
+        if expr.kind == "clone":
+            return self.lower_closure(expr.args[0], scope, cursor, consume=False)
+        if expr.kind != "closure_value":
+            raise expr.token.error(f"capturing closure from {expr.kind} is unsupported")
+        function = self.program.functions[expr.args[0]]
+        leases = []
+        for capture in function.captures:
+            place = Place(scope.find(capture.name))
+            if capture.by_move:
+                cursor = self.access(cursor, place, capture.annotation, capture.name, consume=True)
+            else:
+                cursor, lease = self.start_loan(cursor, place, capture.mutable, capture.name)
+                leases.append(lease)
+        return cursor, self.merge_loans(tuple(leases), False)
 
     def lower_comparison(self, operands, scope, cursor):
         temporaries = []
@@ -4375,7 +5422,7 @@ def display(value, debug):
         return "[" + ", ".join(display(item, True) for item in value.items) + "]"
     if isinstance(value, Value):
         ctor = value.constructor
-        name = ctor.path.rsplit("::", 1)[-1]
+        name = ctor.path.rsplit("::", 1)[-1].rsplit(MODULE_SEPARATOR, 1)[-1]
         if ctor.style == "unit" or not ctor.fields:
             return name
         fields = [display(item, True) for item in value.fields]
@@ -4439,9 +5486,9 @@ class Interpreter:
             return Value(ctor, tuple(self.placeholder(kind) for _, kind in ctor.fields))
         return None
 
-    def call(self, name, values, arguments=None):
+    def call(self, name, values, arguments=None, environment=None):
         function = self.functions[name]
-        bindings = {
+        bindings = dict(environment or {}) | {
             param.key: Binding(value, mutable)
             for (param, mutable, _), value in zip(function.params, values)
             if param.text != "_"
@@ -4477,6 +5524,8 @@ class Interpreter:
                 if result:
                     return result
             return len(left.items) - len(right.items)
+        if isinstance(left, FunctionValue):
+            return int(left != right)
         if isinstance(left, Value):
             if left.constructor.path != right.constructor.path:
                 variants = self.program.layout(left.constructor.annotation)[1]
@@ -4518,6 +5567,43 @@ class Interpreter:
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
+        if kind in {"function_pointer", "closure_value"}:
+            name, arguments = args
+            environment = {}
+            for capture in self.program.functions[name].captures:
+                binding = scope.find(capture.name)
+                environment[capture.name.key] = Binding(binding.value, capture.mutable) if capture.by_move else binding
+            return FunctionValue(name, {parameter: self.program.normalize(substitute(value, self.type_arguments))
+                                        for parameter, value in arguments.items()}, environment)
+        if kind == "indirect_call":
+            callee = self.eval(args[0], scope)
+            values = tuple(self.eval(argument, scope) for argument in args[1:])
+            return self.call(callee.name, values, callee.arguments, callee.environment)
+        if kind == "try":
+            value, enclosing = args
+            value = self.eval(value, scope)
+            variant = value.constructor.path.rsplit("::", 1)[-1]
+            if variant in {"Some", "Ok"}:
+                return value.fields[0]
+            target = self.program.normalize(substitute(enclosing, self.type_arguments))
+            ctor = next(item for item in self.program.layout(target)[1]
+                        if item.path.endswith(f"::{variant}"))
+            raise Return(Value(ctor, value.fields))
+        if kind == "enum_method":
+            receiver, arguments, wanted, consuming = args
+            value = self.eval(receiver, scope)
+            actual = value.constructor.path.rsplit("::", 1)[-1]
+            supplied = [self.eval(item, scope) for item in arguments]
+            if not consuming:
+                return actual == wanted
+            if actual == wanted:
+                return value.fields[0]
+            if token.text == "unwrap_or":
+                return supplied[0]
+            message = supplied[0] if token.text == "expect" else f"called {token.text} on {actual}"
+            if actual == "Err":
+                message += f": {display(value.fields[0], True)}"
+            raise RustPanic(message)
         if kind == "macro_definition":
             scope.remember(token)
             return None
@@ -4710,8 +5796,10 @@ class Interpreter:
                 else:
                     arguments = arguments | {self.program.traits[trait].self_type: receiver}
             return self.call(function.name.text, values, arguments)
-        if kind == "print":
+        if kind in {"print", "panic"}:
             if not args:
+                if kind == "panic":
+                    raise RustPanic(token.text)
                 print(file=self.stdout)
                 return None
             template, *values = args
@@ -4727,7 +5815,10 @@ class Interpreter:
                 else:
                     item = next(evaluated)
                 rendered.append(display(item, mode == "debug"))
-            print("".join(rendered), file=self.stdout)
+            rendered = "".join(rendered)
+            if kind == "panic":
+                raise RustPanic(rendered)
+            print(rendered, file=self.stdout)
             return None
         raise AssertionError(kind)
 
@@ -4749,7 +5840,7 @@ def render_source(trees):
     return " ".join(token.text for token in flatten_trees(trees))
 
 
-def rustc_source(source, libraries):
+def rustc_source(source, libraries, source_path=None):
     # rustc's expanded text lowers standard derives and println into internal
     # library calls. Preserve those two interpreter entry points through it.
     prefix = "__rust_in_python_host"
@@ -4813,14 +5904,13 @@ def rustc_source(source, libraries):
         start += 3
     source = render_source(trees[:start]) + "\n" + macro + render_source(trees[start:])
     with TemporaryDirectory(prefix="rust-in-python-") as folder:
-        path = Path(folder) / "input.rs"
-        path.write_text(source, encoding="utf-8")
+        directory = Path(source_path).resolve().parent if source_path is not None else folder
         args = ["rustc", "--edition=2021", "--crate-name", "rust_in_python_input",
-                "--crate-type", "lib", "-Zunpretty=expanded", str(path)]
+                "--crate-type", "lib", "-Zunpretty=expanded", "-"]
         for name, library in libraries.items():
             args.extend(("--extern", f"{name}={library}"))
         try:
-            compiler = subprocess.run(args, cwd=folder, text=True, capture_output=True, timeout=30,
+            compiler = subprocess.run(args, cwd=directory, input=source, text=True, capture_output=True, timeout=30,
                                       env={**os.environ, "RUSTC_BOOTSTRAP": "1"}, check=False)
         except subprocess.TimeoutExpired as error:
             raise RustError("procedural macro expansion exceeded 30 seconds") from error
@@ -4888,14 +5978,29 @@ def proc_libraries(values):
     return libraries
 
 
-def run(source, stdout=None, *, proc_extern=()):
+def compile_program(source, *, proc_extern=(), source_path=None):
     if proc_extern:
-        source = rustc_source(source, proc_libraries(proc_extern))
+        source = rustc_source(source, proc_libraries(proc_extern), source_path)
     trees, end = token_trees(lex(source))
-    expanded = MacroExpander().expand(trees)
-    program = Parser("", tokens=(*flatten_trees(expanded), end)).parse()
+    modules = Modules(trees, source_path)
+    modules.expand()
+    program = Program()
+    program.add_prelude()
+    for unit in modules.units.values():
+        Parser("", tokens=(*flatten_trees(unit.items), end), modules=modules, unit=unit).parse(program)
+        symbols = unit.glob_aliases | unit.aliases | unit.symbols
+        program.traits_in_scope[unit.path] = unit.hidden_traits | {
+            symbol.name for symbol in symbols.values() if symbol and symbol.kind == "trait"
+        }
+        program.values_in_scope[unit.path] = {name: symbol.name for name, symbol in symbols.items()
+                                              if symbol and symbol.kind == "fn"}
     Checker(program).check()
     Ownership(program).check()
+    return program
+
+
+def run(source, stdout=None, *, proc_extern=(), source_path=None):
+    program = compile_program(source, proc_extern=proc_extern, source_path=source_path)
     Interpreter(program, sys.stdout if stdout is None else stdout).call("main", ())
 
 
@@ -4903,6 +6008,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", nargs="?", help="Rust source file, or - for stdin")
     parser.add_argument("--demo", action="store_true", help="run a built-in Rust program")
+    parser.add_argument("--check", action="store_true", help="check the source without running it")
     parser.add_argument("--proc-extern", action="append", default=[], metavar="NAME=PATH",
                         help="load a compiled Rust procedural macro crate through rustc")
     args = parser.parse_args()
@@ -4916,10 +6022,15 @@ def main():
             source = sys.stdin.read()
         else:
             source = Path(args.source).read_text(encoding="utf-8")
-        run(source, proc_extern=args.proc_extern)
+        source_path = None if args.demo or args.source == "-" else args.source
+        operation = compile_program if args.check else run
+        operation(source, proc_extern=args.proc_extern, source_path=source_path)
     except (RustError, OSError, UnicodeError) as error:
-        print(f"{label}: {error}", file=sys.stderr)
+        print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
         return 1
+    except RustPanic as error:
+        print(f"{label}: {error}", file=sys.stderr)
+        return 101
     except RecursionError:
         print(f"{label}: Python recursion limit reached", file=sys.stderr)
         return 1
