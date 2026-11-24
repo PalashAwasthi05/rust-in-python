@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from decimal import Decimal
 import functools
 import itertools
@@ -63,7 +64,7 @@ class Token:
     source_file: str | None = field(default=None, compare=False, repr=False)
     expansion_site: Token | None = field(default=None, compare=False, repr=False)
 
-    @property
+    @functools.cached_property
     def key(self):
         name = identifier_text(self.text)
         return (name, self.context) if self.context else name
@@ -98,6 +99,23 @@ FLOAT_PREDICATES = {"is_nan": math.isnan, "is_finite": math.isfinite, "is_infini
 CHAR_LIMIT = 0x110000
 SURROGATES = range(0xD800, 0xE000)
 SCALAR_BOUNDS = {**INTEGER_BOUNDS, "char": (0, CHAR_LIMIT)}
+
+
+FAST_REPLACE = set()
+
+
+def replace(instance, **changes):
+    """dataclasses.replace, with a fast path for the plain frozen dataclasses the interpreter copies often."""
+    if type(instance) in FAST_REPLACE:
+        copy = object.__new__(type(instance))
+        copy.__dict__.update(instance.__dict__)
+        copy.__dict__.update(changes)
+        copy.__dict__.pop("key", None)
+        return copy
+    return dataclass_replace(instance, **changes)
+
+
+FAST_REPLACE.add(Token)
 
 
 class Character(str):
@@ -2003,6 +2021,9 @@ class IteratorType:
         return f"iterator with item type {self.item}"
 
 
+FAST_REPLACE.update({ReferenceType, FunctionType})
+
+
 def borrowing_iterator(annotation):
     return isinstance(annotation, IteratorType) and annotation.borrowed
 
@@ -2411,6 +2432,7 @@ def overlapping_types(first, second):
     return first == second
 
 
+FAST_REPLACE.update({Expr, IteratorType, AppliedType, AssociatedType})
 TRAIT_MODULES = {
     "Clone": "clone", "Copy": "marker", "Sized": "marker", "Default": "default",
     "Debug": "fmt", "Display": "fmt", "PartialEq": "cmp", "Eq": "cmp",
@@ -2532,6 +2554,8 @@ class Program:
     try_conversions: dict = field(default_factory=dict)
     moves: set = field(default_factory=set)
     lazy_items: dict = field(default_factory=dict)
+    normalized: dict | None = None
+    dispatch_cache: dict = field(default_factory=dict)
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -2615,6 +2639,17 @@ class Program:
         return matches[0] if len(matches) == 1 else None
 
     def normalize(self, annotation, seen=()):
+        if self.normalized is not None and not seen:
+            try:
+                return self.normalized[annotation]
+            except KeyError:
+                result = self.normalized[annotation] = self.normalize_type(annotation)
+                return result
+            except TypeError:
+                pass
+        return self.normalize_type(annotation, seen)
+
+    def normalize_type(self, annotation, seen=()):
         if isinstance(annotation, AssociatedType):
             owner = self.normalize(annotation.owner, seen)
             annotation = replace(annotation, owner=owner,
@@ -11310,7 +11345,14 @@ class Interpreter:
                     if isinstance(values[0], DynAddress):
                         values = (values[0].address, *values[1:])
                 receiver = self.program.concrete_type(receiver)
-                implementation = self.program.implementation(receiver, trait, arguments_wanted=wanted or None)
+                cache_key = (receiver, trait, wanted)
+                try:
+                    implementation = self.program.dispatch_cache[cache_key]
+                except KeyError:
+                    implementation = self.program.dispatch_cache[cache_key] = self.program.implementation(
+                        receiver, trait, arguments_wanted=wanted or None)
+                except TypeError:
+                    implementation = self.program.implementation(receiver, trait, arguments_wanted=wanted or None)
                 if implementation is None and trait == TERMINATION:
                     return ExitCodeValue(self.exit_status(values[0], receiver))
                 if implementation is None and trait in BUILTIN_OPERATORS:
@@ -13632,6 +13674,7 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
                                                      item.annotation, item.expression)
     Checker(program, modules).check()
     Ownership(program).check()
+    program.normalized = {}
     return program
 
 
