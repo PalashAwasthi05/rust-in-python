@@ -1,0 +1,34 @@
+0
+Version { major: 1, minor: 2, patch: 3 } == Version { major: 1, minor: 2, patch: 3 }: true
+Version { major: 1, minor: 2, patch: 3 } != Version { major: 1, minor: 10, patch: 0 }: true
+a < b: true
+a <= c: true
+b > a: true
+a.cmp(&b): Less
+b.cmp(&a): Greater
+a.cmp(&c): Equal
+partial: Some(Less)
+0.9.9
+1.2.3
+1.2.3
+1.10.0
+1.10.1
+2.0.0
+max: Some(Version { major: 2, minor: 0, patch: 0 })
+min: Some(Version { major: 0, minor: 9, patch: 9 })
+after dedup: 5
+Zed Adams 50
+Jane Doe 29
+Jane Doe 31
+Anna Smith 22
+John Smith 40
+desc: ["Smith/40", "Smith/22", "Doe/31", "Doe/29", "Adams/50"]
+p < r: false
+r < p: true
+p vs q: None
+q == q: false
+p == p: true
+p <= q: false, p >= q: false
+longest: Meters(12)
+Unit == Unit: true, cmp: Equal
+ordering lt: true

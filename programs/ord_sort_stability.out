@@ -1,0 +1,29 @@
+0
+1 leo 7
+1 eli 6
+2 noa 8
+2 kai 7
+3 mia 9
+3 ava 8
+3 zoe 9
+["6:eli", "7:kai", "7:leo", "8:ava", "8:noa", "9:mia", "9:zoe"]
+["mia", "zoe", "ava", "noa", "leo", "kai", "eli"]
+["mia", "ava", "zoe", "noa", "kai", "leo", "eli"]
+["eli", "leo", "kai", "ava", "noa", "mia", "zoe"]
+["eli", "kai", "leo", "ava", "noa", "mia", "zoe"]
+["eli", "leo", "kai", "noa", "ava", "mia", "zoe"]
+["zoe", "mia", "ava", "noa", "kai", "leo", "eli"]
+search exact: Ok(3)
+search missing: Err(3)
+search before all: Err(0)
+search after all: Err(7)
+by name: Ok(3)
+by name missing: Err(1)
+by key: Ok(6)
+ages [6, 7, 7, 8, 8, 9, 9]
+partition_point(<8) = 3
+insert at 0
+[6, 7, 7, 7, 8, 8, 9, 9]
+[(5, 'e'), (4, 'd'), (3, 'c'), (2, 'b'), (1, 'a')]
+[(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')]
+is_sorted: true

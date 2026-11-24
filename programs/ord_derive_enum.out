@@ -1,0 +1,30 @@
+0
+[Low, Low, Medium, High, Critical]
+High > Medium: true
+Low >= Low: true
+max: Critical
+cmp: Greater
+Circle(1.5)
+Circle(3.0)
+Rect { w: 1.0, h: 5.0 }
+Rect { w: 2.0, h: 1.0 }
+Empty
+circle < rect: true
+rect cmp: Some(Less)
+nan: None
+nan vs other variant: Some(Less)
+Num(-7)
+Num(42)
+Ident("alpha")
+Ident("zeta")
+Pair(0, 100)
+Pair(1, -5)
+Pair(1, 2)
+Eof
+biggest: Eof
+Num(5) vs Ident: Less
+equal: true
+[B, C, A]
+A > B: true
+as i32: [2, 7, 10]
+[None, Some(Low), Some(High)]

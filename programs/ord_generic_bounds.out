@@ -1,0 +1,25 @@
+0
+9
+8.25
+z
+Pair { first: 2, second: 0 }
+[Pair { first: "a", second: "c" }, Pair { first: "a", second: "z" }, Pair { first: "b", second: "a" }]
+[("x", 3), ("y", 2), ("z", 1)]
+[(Pair { first: 0, second: 5 }, 1), (Pair { first: 1, second: 2 }, 2)]
+[(None, 3), (Some(3), 2)]
+Leaf(-3)
+Leaf(5)
+Node(Leaf(1), Leaf(1))
+Node(Leaf(1), Leaf(2))
+Node(Node(Leaf(0), Leaf(0)), Leaf(9))
+leaf < node: true
+tree eq: true
+["one", "two", "pair"]
+[(Leaf('a'), 2), (Node(Leaf('a'), Leaf('b')), 2)]
+Some(Less)
+true
+true
+false
+Greater
+Less
+Equal

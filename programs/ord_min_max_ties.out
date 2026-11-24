@@ -1,0 +1,33 @@
+0
+max_by_key len: Some("cherry")
+min_by_key len: Some("fig")
+max_by len: Some("cherry")
+min_by len: Some("fig")
+rev max_by_key: Some("banana")
+rev min_by_key: Some("pea")
+max: Some(Item { id: 4, weight: 9 })
+min: Some(Item { id: 3, weight: 2 })
+max_by_key: Some(Item { id: 4, weight: 9 })
+min_by_key: Some(Item { id: 3, weight: 2 })
+cmp::max ties: Item { id: 4, weight: 9 }
+cmp::min ties: Item { id: 3, weight: 2 }
+a.max(b) ties: Item { id: 4, weight: 9 }
+a.min(b) ties: Item { id: 3, weight: 2 }
+max_by_key fn: Item { id: 4, weight: 9 }
+min_by_key fn: Item { id: 3, weight: 2 }
+max_by fn: Item { id: 3, weight: 2 }
+min_by fn: Item { id: 1, weight: 5 }
+best: bo 50
+best by score: al
+worst: cy
+longest name: ann
+shortest name: bo
+cmp::max: bo
+index of max: Some(2)
+index of min reverse: Some(1)
+empty max: None
+empty min_by_key: None
+cmp::max(3, 7) = 7
+cmp::min("b", "a") = a
+max of strings: Some("pear")
+max float by total_cmp: Some(9.25)

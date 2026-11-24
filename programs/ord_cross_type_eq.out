@@ -1,0 +1,32 @@
+0
+s == "hello": true
+s != "world": true
+"hello" == s: true
+s == *"hello": true
+s == String: true
+s == MyStr: true
+s.eq(&"x"): false
+s.ne(&"x"): true
+find b: Some(1)
+find z: None
+contains c: true
+vec eq: true
+100C == 212F: true
+100C != 211F: true
+100C < 300F: true
+100C > 100F: true
+100C >= 212F: true
+cmp: Some(Greater)
+C vs C: Some(Less)
+C < C: true
+price == 499: true
+price < 500: true
+price > 1000: false
+price <= 499: true
+cheap: [Cents(100), Cents(250)]
+String == &str: true
+&String == &str: true
+str == String: true
+Vec<char> == [char;2]: true
+Option<&str> == Some("x"): true
+as_deref: true

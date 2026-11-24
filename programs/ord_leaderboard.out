@@ -1,0 +1,22 @@
+0
+1. eli    Gold  150pts   5900ms
+2. cleo   Gold  150pts   6000ms
+3. ben    Gold   90pts   4100ms
+4. ana    Silver  120pts   5300ms
+5. fay    Silver  120pts   5300ms
+6. dev    Bronze  200pts   3000ms
+7. gus    Bronze   10pts   9000ms
+ana == fay (same rank): true
+ana id == fay id: false
+Gold: 3 players, best eli, total 390
+Silver: 2 players, best ana, total 240
+Bronze: 2 players, best dev, total 210
+podium: ["eli", "cleo", "ben"]
+eli: eli    Gold  150pts   5900ms
+zed: None
+[(Gold, 150), (Gold, 90), (Silver, 120), (Bronze, 200), (Bronze, 10)]
+fastest dev slowest gus
+top points dev
+ties at 120: 2
+insert position for gold/100: Err(2)
+["eli", "cleo", "ben"]

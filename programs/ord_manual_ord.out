@@ -1,0 +1,21 @@
+0
+frank  admin   60 #6
+bob    eng    150 #3
+carol  eng    120 #1
+dave   eng    120 #4
+erin   sales   95 #5
+alice  sales   90 #2
+first < last: true
+max: alice
+min: frank
+cmp::max -> carol
+cmp::min -> bob
+14d 14s 10c 10h 2c
+2c 10h 10c 14s 14d
+3h > 9h: true
+max of 3h,9h: Card { rank: 3, suit: 'h' }
+min of 3h,9h: Card { rank: 9, suit: 'h' }
+clamp: 10
+ordering chain: Greater
+["apple", "Apple", "banana", "Banana", "cherry"]
+["banana", "Banana", "cherry", "apple", "Apple"]

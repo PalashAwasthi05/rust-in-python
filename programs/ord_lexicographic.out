@@ -1,0 +1,41 @@
+0
+None vs Some(0)              Less lt=true le=true gt=false ge=false eq=false ne=true
+Some(3) vs Some(2)           Greater lt=false le=false gt=true ge=true eq=false ne=true
+Some(1) < None: false
+[None, None, Some(-1), Some(0), Some(3)]
+max opt: Some(Some(3))
+Ok(100) vs Err(a)            Less lt=true le=true gt=false ge=false eq=false ne=true
+[Ok(2), Ok(5), Err(0), Err(1)]
+(1,2,3) vs (1,2,4)           Less lt=true le=true gt=false ge=false eq=false ne=true
+(2,'a') vs (1,'z')           Greater lt=false le=false gt=true ge=true eq=false ne=true
+(1, "b") < (1, "ab"): false
+[(1, "z", 0.0), (2, "a", 9.0), (2, "b", -1.0), (2, "b", 1.5)]
+tuple eq: true
+unit cmp: Equal
+[1,2,3] vs [1,2]             Greater lt=false le=false gt=true ge=true eq=false ne=true
+[1,2] vs [1,3]               Less lt=true le=true gt=false ge=false eq=false ne=true
+[] vs [0]                    Less lt=true le=true gt=false ge=false eq=false ne=true
+[[], [1, 9], [1, 9, 9], [1, 10], [2]]
+slice lt: true
+array eq: true
+vec == array: true
+vec == slice: true
+abc vs abd                   Less lt=true le=true gt=false ge=false eq=false ne=true
+Zebra vs apple               Less lt=true le=true gt=false ge=false eq=false ne=true
+ab vs abc                    Less lt=true le=true gt=false ge=false eq=false ne=true
+String < String: true
+String == &str: true
+&str == String: true
+String.as_str() cmp: Equal
+["Alice", "Bob", "alice", "bob", "zed", "ábc", "émile"]
+["Alice", "alice", "Bob", "bob", "zed", "ábc", "émile"]
+char cmp: Greater true
+bool cmp: Less true
+reverse(Less)                Greater lt=false le=false gt=true ge=true eq=false ne=true
+Equal.then(Greater)          Greater lt=false le=false gt=true ge=true eq=false ne=true
+Less.then(Greater)           Less lt=true le=true gt=false ge=false eq=false ne=true
+Ordering as i32: -1 0 1
+Ordering sort: [Less, Equal, Greater]
+greater
+cmp on refs: Greater Greater
+is_sorted-ish: true
