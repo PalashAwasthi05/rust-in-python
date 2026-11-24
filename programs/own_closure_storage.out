@@ -1,0 +1,15 @@
+0
+ok: clicked by ann
+got 1
+seen so far [1]
+got 2
+seen so far [1, 2]
+total = 24
+120 3628800 120
+calls = 2
+    ab: ["too short"]
+ admin: ["banned"]
+   Zed: ["lowercase"]
+ carol: []
+add 14
+sub 6

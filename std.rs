@@ -730,6 +730,8 @@ pub mod slice {
         pub fn split_last(&self) -> Option<(&T, &[T])>;
         pub fn split_at(&self, mid: usize) -> (&[T], &[T]);
         pub fn split_at_mut(&mut self, mid: usize) -> (&mut [T], &mut [T]);
+        pub fn split_first_mut(&mut self) -> Option<(&mut T, &mut [T])>;
+        pub fn split_last_mut(&mut self) -> Option<(&mut T, &mut [T])>;
         pub fn contains(&self, x: &T) -> bool where T: PartialEq;
         pub fn starts_with(&self, needle: &[T]) -> bool where T: PartialEq;
         pub fn ends_with(&self, needle: &[T]) -> bool where T: PartialEq;
@@ -813,6 +815,7 @@ pub mod mem {
     pub fn swap<T>(x: &mut T, y: &mut T);
     pub fn take<T: Default>(dest: &mut T) -> T { replace(dest, T::default()) }
     pub fn drop<T>(_value: T) {}
+    pub fn forget<T>(value: T);
 }
 
 pub mod option {
@@ -932,15 +935,24 @@ pub mod option {
         pub fn as_deref(&self) -> Option<&str> {
             match self { Some(value) => Some(value.as_str()), None => None }
         }
+        pub fn as_deref_mut(&mut self) -> Option<&mut str> {
+            match self { Some(value) => Some(value.as_mut_str()), None => None }
+        }
     }
     impl<T> Option<Box<T>> {
         pub fn as_deref(&self) -> Option<&T> {
             match self { Some(value) => Some(&**value), None => None }
         }
+        pub fn as_deref_mut(&mut self) -> Option<&mut T> {
+            match self { Some(value) => Some(&mut **value), None => None }
+        }
     }
     impl<T> Option<Vec<T>> {
         pub fn as_deref(&self) -> Option<&[T]> {
             match self { Some(value) => Some(value.as_slice()), None => None }
+        }
+        pub fn as_deref_mut(&mut self) -> Option<&mut [T]> {
+            match self { Some(value) => Some(value.as_mut_slice()), None => None }
         }
     }
 

@@ -1,0 +1,53 @@
+0
+-- list
+built 1
+node 1
+node 2
+node 3
+-- btree
+drop "two"
+size 3
+drop "one"
+drop "two-b"
+drop "three"
+-- deque
+drop 'a'
+popped front
+drop 'b'
+drop 'c'
+-- wrapper
+drop "i0"
+drop "i1"
+drop "w"
+-- pick
+drop 2
+picked 1
+drop 1
+picked 2
+-- temp in condition
+drop 5
+in then
+drop -1
+-- temp in let
+drop [1, 2]
+len 2
+extended 77
+-- match on temp
+small 8
+drop 8
+-- vec of tuples
+drop 2
+a 1
+drop 1
+drop 3
+drop 4
+-- assign whole
+drop "x"
+drop "y"
+assigned x2
+drop "x2"
+drop "y2"
+end
+drop 77
+drop 2
+drop 1

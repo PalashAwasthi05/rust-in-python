@@ -1,0 +1,17 @@
+0
+[1, 2, 3, 7, 15, 31] counter 4
+c2 fresh10
+fresh10
+Waiting(0)
+Active { left: 2, log: [] }
+Active { left: 1, log: ["left 2"] }
+Active { left: 0, log: ["left 2", "left 1"] }
+Finished
+Finished
+["al", "BERTHA", "cy"]
+[55, 89, 144, 233, 466]
+20
+abab abababab
+[0, 1, 1]
+[[1, 1, 1], [1, 2, 3], [1, 3, 6]]
+[9, 1, 1]

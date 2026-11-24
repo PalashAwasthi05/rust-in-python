@@ -1,0 +1,73 @@
+0
+-- match temp
+five
+drop scrut
+-- if let temp
+len 5
+drop iflet
+-- update syntax
+s2 built a2
+drop a2
+drop b1
+drop c1
+drop a1
+-- params
+in params x y
+drop z-local
+drop y
+drop x
+-- closure
+f = 3
+drop cap
+closure dropped
+-- hashmap
+drop m1
+replaced
+drop m1b
+removed
+drop m2
+-- question
+got 1
+drop q-guard
+drop q-guard
+-- field assign
+drop fb
+assigned
+drop fa
+drop fb2
+drop fc
+-- pop
+drop p3
+popped
+kept
+drop p2
+drop p1
+-- into_iter partial
+first taken
+drop i2
+drop i3
+iter dropped
+drop i1
+-- rc
+a gone
+drop rc
+b gone
+-- forget
+-- break value
+drop loop-local
+r = 5
+-- nested vec
+drop n00
+drop n01
+drop n10
+-- drain
+drained 2
+drop d1
+drop d2
+drop d0
+drop d3
+-- replace
+replaced
+drop old
+drop new
+end

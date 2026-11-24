@@ -1,0 +1,18 @@
+0
+count with handlers 4
+value 30
+count after drop 1
+count with closure 2
+f = 30
+count after closure 1
+ring one
+ringer says one
+ring two
+inner says two
+ring three
+opt says three
+before consume
+consuming four
+ring four
+after consume
+end

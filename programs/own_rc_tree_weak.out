@@ -1,0 +1,19 @@
+0
+root/usr/local
+root/bin
+nodes: 4
+usr strong=2 weak=1
+root strong=1 weak=2
+inside: tmp/leaf
+drop tmp
+after: leaf
+parent alive: false
+["usr", "bin"]
+dropped handles
+drop usr
+drop local
+removed usr subtree
+end of main
+drop leaf
+drop root
+drop bin

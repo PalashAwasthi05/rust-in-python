@@ -1,0 +1,12 @@
+0
+Big spends: 3 rows, total 957.50
+largest: Some(2)
+tags: ["food", "rent", "fixed", "fun"]
+first after report: Record { id: 1, tags: ["food"], amount: 12.5 }
+[7, 14, 15, 20]
+best pair [8, 5]
+key | value=more
+value | more
+key=value=more
+["value", "more", "key"]
+[(5, "value"), (4, "more"), (3, "key")]

@@ -1,0 +1,21 @@
+0
+["dev", "cto", "ceo"]
+["dev", "cto", "ceo"]
+ceo visits 2 cto visits 2
+ceo reports 2
+cto strong 2 weak 1
+dev handle dropped; cto reports 1
+bye dev
+cleared
+live 2
+live 1
+["1:a", "2:a", "1:b"]
+log strong 2
+x = 2
+y = 1
+counter 15 strong 4
+strong 1
+end
+bye ceo
+bye cto
+bye ops

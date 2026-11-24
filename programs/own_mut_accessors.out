@@ -1,0 +1,11 @@
+0
+Stats { hits: 14, misses: 1, log: ["start", "hits=14"] }
+[12, 1, 2, 3, 3, 3]
+first = 12
+after largest_mut: [12, 1, 2, 3, 3, 3, 99]
+out of range
+[[60, 2, 3], [4, 5, 60]]
+Some("ABCDEF")
+None
+Some(42)
+["a", "b!?"]

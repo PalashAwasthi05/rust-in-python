@@ -1,0 +1,15 @@
+0
+Running { name: "job", ticks: 0 }
+Running { name: "job", ticks: 1 }
+Running { name: "job", ticks: 2 }
+Done(["job tick 0", "job tick 1", "job finished"])
+Done(["job tick 0", "job tick 1", "job finished"])
+line="hello" current=""
+[3] [1, 2]
+old=[3] a=[9, 9, 9]
+[1, 2, 3, 4]
+Some(3) None
+Some(4) Some(7)
+6 5
+"y" ["z", "", "x"]
+right! left

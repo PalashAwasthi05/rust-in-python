@@ -1,0 +1,56 @@
+0
+drop T100
+drop T101
+drop T102
+len 2
+-- deref assign
+drop T1
+a = T2
+drop T2
+-- loop reassign
+drop T10
+cur T11
+drop T11
+cur T12
+-- vec ops
+drop T21
+deduped
+swap_removed T20
+drop T21
+resized 2
+drop T22
+indexed assign
+drop T23
+retained 1
+drop T20
+drop T24
+-- option replace
+old Some(30)
+drop T31
+set none
+inserted
+drop T30
+drop T32
+-- match arm guard
+small T40
+drop T41
+drop T40
+-- closure consumes
+calling
+closure has T200
+drop T200
+closure done
+called
+-- nested shadow
+inner T52
+drop T52
+drop T51
+outer T50
+-- struct literal temp
+drop T61
+pair T60 61
+end
+drop T60
+drop T50
+drop T12
+drop T3
