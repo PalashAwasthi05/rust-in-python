@@ -583,6 +583,167 @@ VALID = [
             println!("{result:?}");
         }
     """, "Wrapped(Wrapped(false))\n"),
+    ("inherent generic impl and two-phase mutable receiver", """
+        struct Data<T>(T);
+        impl<T: Copy> Data<T> {
+            fn new(value: T) -> Self { Data(value) }
+            fn get(&self) -> T { self.0 }
+            fn set(&mut self, value: T) { self.0 = value; }
+        }
+        fn main() {
+            let mut value = Data::new(4);
+            value.set(value.get() + 1);
+            println!("{}", Data::get(&value));
+        }
+    """, "5\n"),
+    ("trait defaults and dispatch through generic bounds", """
+        trait Score { fn score(&self) -> i32; }
+        trait Double: Score {
+            fn doubled(&self) -> i32 { self.score() * 2 }
+        }
+        struct Data(i32);
+        impl Score for Data { fn score(&self) -> i32 { self.0 } }
+        impl Double for Data {}
+        fn score<T: Double>(value: &T) -> i32 {
+            value.doubled() + <T as Score>::score(value)
+        }
+        fn main() { println!("{}", score(&Data(7))); }
+    """, "21\n"),
+    ("associated functions and default Self dispatch", """
+        trait Create: Sized {
+            fn new() -> Self;
+            fn default_value() -> Self { Self::new() }
+        }
+        struct Data(i32);
+        impl Create for Data { fn new() -> Self { Data(9) } }
+        fn main() {
+            let first: Data = Create::default_value();
+            let second = <Data as Create>::new();
+            println!("{} {}", first.0, second.0);
+        }
+    """, "9 9\n"),
+    ("trait associated type and constant through a generic caller", """
+        use std::fmt::Debug;
+        trait Read {
+            type Item: Debug;
+            const SIZE: usize = 0;
+            fn read(&self) -> Self::Item;
+        }
+        struct Wrap<T>(T);
+        impl<T: Copy + Debug> Read for Wrap<T> {
+            type Item = T;
+            const SIZE: usize = 1;
+            fn read(&self) -> Self::Item { self.0 }
+        }
+        fn read<T: Read>(value: &T) -> T::Item {
+            println!("{}", T::SIZE);
+            value.read()
+        }
+        fn main() {
+            let value: <Wrap<i32> as Read>::Item = read(&Wrap(3));
+            println!("{value}");
+        }
+    """, "1\n3\n"),
+    ("trait methods specialize their own generics", """
+        trait Make { fn make<T: Default>(&self) -> T; }
+        struct Data;
+        impl Make for Data { fn make<U: Default>(&self) -> U { U::default() } }
+        fn main() { let n: i32 = Data.make(); println!("{n} {}", Data.make::<bool>()); }
+    """, "0 false\n"),
+    ("blanket trait implementation uses bounds", """
+        trait Score { fn score(&self) -> i32; }
+        impl<T: Copy> Score for T { fn score(&self) -> i32 { 3 } }
+        fn show<T: Copy>(value: T) -> i32 { value.score() }
+        fn main() { println!("{}", show(true)); }
+    """, "3\n"),
+    ("trait receiver lifetime feeds borrow checking", """
+        trait Read { fn read(&self) -> &i32; }
+        struct Data(i32);
+        impl Read for Data { fn read(&self) -> &i32 { &self.0 } }
+        fn main() {
+            let mut value = Data(4);
+            let first = value.read();
+            println!("{first}");
+            value.0 = 8;
+            println!("{}", value.read());
+        }
+    """, "4\n8\n"),
+    ("const inference from arrays and contextual result", """
+        fn fill<const N: usize>(value: i32) -> [i32; N] { [value; N] }
+        fn length<T, const N: usize>(array: &[T; N]) -> usize { array.len() }
+        fn main() {
+            let mut array: [i32; 3] = fill(7);
+            array[1] += 2;
+            println!("{array:?} {}", length(&array));
+        }
+    """, "[7, 9, 7] 3\n"),
+    ("const expressions and numeric const parameters", """
+        const COUNT: usize = 4;
+        fn fill<const N: usize>() -> [usize; N] {
+            let mut result = [0; N];
+            for i in 0..N { result[i] = i + 1; }
+            result
+        }
+        fn flag<const FLAG: bool>() -> bool { FLAG }
+        fn signed<const VALUE: i32>() -> i32 { VALUE }
+        fn main() {
+            println!("{:?} {} {}", fill::<COUNT>(), flag::<{true && false}>(), signed::<{-4}>());
+        }
+    """, "[1, 2, 3, 4] false -4\n"),
+    ("const args through a generic type and trait impl", """
+        trait Size { const LEN: usize; fn size(&self) -> usize { Self::LEN } }
+        struct Chunk<T, const N: usize>([T; N]);
+        impl<T, const N: usize> Size for Chunk<T, N> { const LEN: usize = N; }
+        impl<T, const N: usize> Chunk<T, N> { fn new(data: [T; N]) -> Self { Chunk(data) } }
+        fn main() {
+            let wrapped = Chunk::new([1, 2, 3]);
+            println!("{} {}", wrapped.size(), <Chunk<i32, {1 + 2}> as Size>::LEN);
+        }
+    """, "3 3\n"),
+    ("const generic array trait impl", """
+        trait Len { fn count(&self) -> usize; }
+        impl<T, const N: usize> Len for [T; N] { fn count(&self) -> usize { N } }
+        fn main() { println!("{}", [true, false].count()); }
+    """, "2\n"),
+    ("macro captures preserve expression precedence and local hygiene", """
+        macro_rules! double { ($value:expr) => { $value * 2 }; }
+        macro_rules! plus_one {
+            ($value:expr) => {{ let n = 1; n + $value }};
+        }
+        fn main() {
+            let n = 5;
+            println!("{} {} {n}", double!(1 + 2), plus_one!(double!(n)));
+        }
+    """, "6 11 5\n"),
+    ("macro repetitions with separators and optional trailing comma", """
+        macro_rules! array {
+            ($($item:expr),+ $(,)?) => { [$($item),+] };
+        }
+        macro_rules! sum {
+            ($first:expr $(, $item:expr)*) => { $first $(+ $item)* };
+        }
+        fn main() {
+            println!("{:?} {} {}", array!(1, 2, 3,), sum!(1, 2, 3), sum!(4));
+        }
+    """, "[1, 2, 3] 6 4\n"),
+    ("macro emits an item and trait implementation", """
+        trait Score { fn score(&self) -> i32; }
+        macro_rules! make {
+            ($name:ident, $value:literal) => {
+                struct $name;
+                impl Score for $name { fn score(&self) -> i32 { $value } }
+            };
+        }
+        make!(Data, -7);
+        fn main() { println!("{}", Data.score()); }
+    """, "-7\n"),
+    ("recursive token-tree macro and alternate rules", """
+        macro_rules! count {
+            () => { 0 };
+            ($first:tt $($rest:tt)*) => { 1 + count!($($rest)*) };
+        }
+        fn main() { println!("{} {}", count!(a (b c) [d]), count!()); }
+    """, "3 0\n"),
 ]
 
 INVALID = [
@@ -894,6 +1055,57 @@ INVALID = [
             let _answer = value == { value = Item(2); Item(3) };
         }
     """, "immutably borrowed"),
+    ("trait implementation must provide required methods", """
+        trait Read { fn read(&self) -> i32; }
+        struct Data;
+        impl Read for Data {}
+        fn main() {}
+    """, "missing method 'read'"),
+    ("trait implementation signature must match", """
+        trait Read { fn read(&self) -> i32; }
+        struct Data;
+        impl Read for Data { fn read(&self) -> bool { true } }
+        fn main() {}
+    """, "incompatible trait signature"),
+    ("overlapping trait impls are rejected", """
+        trait Read {}
+        struct Data;
+        impl<T> Read for T {}
+        impl Read for Data {}
+        fn main() {}
+    """, "conflicting implementations"),
+    ("trait bound is required on generic calls", """
+        trait Read { fn read(&self) -> i32; }
+        fn consume<T: Read>(value: T) { let _x = value.read(); }
+        fn main() { consume(7); }
+    """, "i32 does not implement Read"),
+    ("associated type bounds are enforced", """
+        trait Read { type Item: Copy; }
+        struct Data;
+        struct Item;
+        impl Read for Data { type Item = Item; }
+        fn main() {}
+    """, "Item does not implement Copy"),
+    ("const argument kinds are checked", """
+        fn read<const N: usize>() -> usize { N }
+        fn main() { let _value = read::<true>(); }
+    """, "expected a usize constant"),
+    ("inferred const lengths must agree", """
+        fn pair<const N: usize>(_: [i32; N], _: [i32; N]) {}
+        fn main() { pair([1, 2], [1]); }
+    """, "expected 2, found 1"),
+    ("repeat with generic const length requires Copy", """
+        fn array<T, const N: usize>(value: T) -> [T; N] { [value; N] }
+        fn main() {}
+    """, "T does not implement Copy"),
+    ("moving non-Copy array element by index is rejected", """
+        struct Item(i32);
+        fn main() { let items = [Item(1)]; let _moved = items[0]; }
+    """, "cannot move out of array index"),
+    ("declarative macro reports no matching arm", """
+        macro_rules! require_name { ($name:ident) => { 0 }; }
+        fn main() { let _value = require_name!(3); }
+    """, "no matching rule for require_name"),
 ]
 
 

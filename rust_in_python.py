@@ -3,10 +3,9 @@
 Run: python3 rust_in_python.py program.rs
 Demo: python3 rust_in_python.py --demo
 
-Supported types: i32, bool, &str (string literals), (), structs, and enums.
-Supported syntax: functions, let bindings, mut, blocks, if/else,
-while, loop, for over integer ranges, return, break, continue, scalar operators,
-exhaustive match, and println!. Integers use checked i32 arithmetic.
+Supported types include i32, usize, bool, string slices, arrays, structs, and enums.
+Includes type and const generic parameters, trait and inherent implementations,
+declarative macros, and checked integer arithmetic.
 This subset checks moves, initialization, and local shared and mutable loans.
 Reference returns support elision and named lifetimes on function signatures.
 References in aggregates and the standard library are outside its scope.
@@ -40,8 +39,8 @@ class Token:
 TOKEN = re.compile(
     r'\s+|//[^\n]*|/\*|"(?:(?:\\[\s\S])|[^"\\])*"|'
     r"'[A-Za-z_][A-Za-z_0-9]*|"
-    r'[0-9][0-9_]*(?:i32)?|[A-Za-z_][A-Za-z_0-9]*|'
-    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}()[\]#.:,;=!+*/%&<>|\-]'
+    r'[0-9][0-9_]*(?:i32|usize)?|[A-Za-z_][A-Za-z_0-9]*|'
+    r'\.\.=|\.\.|::|->|=>|==|!=|<=|>=|&&|\|\||[+*/%\-]=|[{}()[\]#$?.:,;=!+*/%&<>|\-]'
 )
 COMMENT_EDGE = re.compile(r'/\*|\*/')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
@@ -57,8 +56,9 @@ PRECEDENCE = {
     "+": 5, "-": 5, "*": 6, "/": 6, "%": 6,
 }
 BLOCK_EXPRESSIONS = {"block", "if", "while", "while_let", "loop", "for", "match"}
-PRIMITIVES = {"i32", "bool", "&str", "()"}
+PRIMITIVES = {"i32", "usize", "bool", "&str", "()"}
 LIMIT = 2**31
+USIZE_LIMIT = 2**64
 NEVER = "!"
 INTEGER_CONSTANTS = {"i32::MIN": -LIMIT, "i32::MAX": LIMIT - 1}
 
@@ -92,6 +92,330 @@ def lex(source):
     yield Token("", line, column)
 
 
+DELIMITERS = {"(": ")", "[": "]", "{": "}"}
+
+
+@dataclass(frozen=True)
+class TokenGroup:
+    opening: Token
+    items: tuple
+    closing: Token
+
+
+def token_trees(tokens):
+    stack = [(None, [])]
+    for token in tokens:
+        if not token.text:
+            if len(stack) != 1:
+                raise stack[-1][0].error("unclosed delimiter")
+            return tuple(stack[0][1]), token
+        if token.text in DELIMITERS:
+            stack.append((token, []))
+        elif token.text in DELIMITERS.values():
+            opening, items = stack[-1]
+            if opening is None or DELIMITERS[opening.text] != token.text:
+                raise token.error("mismatched delimiter")
+            stack.pop()
+            stack[-1][1].append(TokenGroup(opening, tuple(items), token))
+        else:
+            stack[-1][1].append(token)
+    raise AssertionError("missing end of input")
+
+
+def flatten_trees(trees):
+    for tree in trees:
+        if isinstance(tree, TokenGroup):
+            yield tree.opening
+            yield from flatten_trees(tree.items)
+            yield tree.closing
+        else:
+            yield tree
+
+
+def tree_text(tree):
+    return tree.opening.text if isinstance(tree, TokenGroup) else tree.text
+
+
+@dataclass(frozen=True)
+class MacroCapture:
+    name: Token
+    fragment: str = ""
+
+
+@dataclass(frozen=True)
+class MacroRepeat:
+    body: tuple
+    separator: Token | None
+    count: str
+
+
+def macro_sequence(items, *, matcher):
+    result = []
+    index = 0
+    while index < len(items):
+        tree = items[index]
+        index += 1
+        if isinstance(tree, TokenGroup):
+            result.append(replace(tree, items=macro_sequence(tree.items, matcher=matcher)))
+            continue
+        if tree.text != "$":
+            result.append(tree)
+            continue
+        if index >= len(items):
+            raise tree.error("expected a macro metavariable or repetition")
+        next_item = items[index]
+        index += 1
+        if isinstance(next_item, TokenGroup):
+            if next_item.opening.text != "(" or index >= len(items):
+                raise tree.error("expected a macro repetition")
+            separator = None
+            if tree_text(items[index]) not in {"*", "+", "?"}:
+                separator = items[index]
+                index += 1
+            if index >= len(items) or tree_text(items[index]) not in {"*", "+", "?"}:
+                raise tree.error("expected '*', '+', or '?' after macro repetition")
+            count = tree_text(items[index])
+            index += 1
+            if count == "?" and separator is not None:
+                raise tree.error("optional repetition cannot have a separator")
+            result.append(MacroRepeat(macro_sequence(next_item.items, matcher=matcher), separator, count))
+            continue
+        if not IDENT.fullmatch(next_item.text):
+            raise next_item.error("invalid macro metavariable")
+        fragment = ""
+        if matcher:
+            if index + 1 >= len(items) or tree_text(items[index]) != ":":
+                raise next_item.error("macro matcher requires a fragment specifier")
+            fragment = tree_text(items[index + 1])
+            index += 2
+            if fragment not in {"tt", "ident", "literal", "expr", "ty", "pat", "path", "block"}:
+                raise next_item.error(f"unsupported macro fragment {fragment!r}")
+        result.append(MacroCapture(next_item, fragment))
+    return tuple(result)
+
+
+class MacroExpander:
+    def __init__(self):
+        self.steps = 0
+        self.match_steps = 0
+
+    def expand(self, items, inherited=None, depth=0):
+        if depth > 64:
+            raise next(flatten_trees(items), Token("macro", 1, 1)).error("macro expansion recursion limit reached")
+        macros = dict(inherited or {})
+        result = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if tree_text(item) == "macro_rules" and index + 3 < len(items):
+                marker, name, body = items[index + 1:index + 4]
+                if tree_text(marker) != "!" or not isinstance(name, Token) or not isinstance(body, TokenGroup):
+                    raise item.error("invalid macro_rules definition")
+                macros[name.text] = self.rules(body)
+                index += 4
+                if index < len(items) and tree_text(items[index]) == ";":
+                    index += 1
+                continue
+            if (isinstance(item, Token) and item.text in macros and index + 2 < len(items)
+                    and tree_text(items[index + 1]) == "!" and isinstance(items[index + 2], TokenGroup)):
+                self.steps += 1
+                if self.steps > 10_000:
+                    raise item.error("macro expansion limit reached")
+                expanded = self.invoke(item, macros[item.text], items[index + 2].items)
+                index += 3
+                result.extend(self.expand(expanded, macros, depth + 1))
+                if (expanded and tree_text(expanded[0]) in {"#", "fn", "struct", "enum", "trait", "impl"}
+                        and index < len(items) and tree_text(items[index]) == ";"):
+                    index += 1
+                continue
+            if isinstance(item, TokenGroup):
+                item = replace(item, items=self.expand(item.items, macros, depth))
+            result.append(item)
+            index += 1
+        return tuple(result)
+
+    @staticmethod
+    def rules(group):
+        items = group.items
+        rules = []
+        index = 0
+        while index < len(items):
+            if index + 2 >= len(items):
+                raise group.opening.error("incomplete macro rule")
+            matcher, arrow, body = items[index:index + 3]
+            if not isinstance(matcher, TokenGroup) or tree_text(arrow) != "=>" or not isinstance(body, TokenGroup):
+                raise group.opening.error("expected a macro matcher and transcriber")
+            rules.append((macro_sequence(matcher.items, matcher=True),
+                          macro_sequence(body.items, matcher=False)))
+            index += 3
+            if index < len(items):
+                if tree_text(items[index]) not in {";", ","}:
+                    raise group.opening.error("expected ';' between macro rules")
+                index += 1
+        return rules
+
+    def invoke(self, token, rules, items):
+        self.match_steps = 0
+        for matcher, body in rules:
+            for offset, captures in self.match(matcher, items, 0, {}, ()):
+                if offset == len(items):
+                    # Keep literal local declarations separate from caller tokens.
+                    names = self.local_names(body)
+                    renamed = {name: f"__macro_{self.steps}_{name}" for name in names}
+                    return tuple(self.render(body, captures, (), renamed))
+        raise token.error(f"no matching rule for {token.text}!")
+
+    def match(self, nodes, items, pos, captures, path):
+        self.match_steps += 1
+        if self.match_steps > 100_000:
+            token = next(flatten_trees(items), Token("macro", 1, 1))
+            raise token.error("macro matcher search limit reached")
+        if not nodes:
+            yield pos, captures
+            return
+        node, *rest = nodes
+        if isinstance(node, MacroRepeat):
+            matches = [(pos, captures)]
+            stack = [(pos, captures, 0)]
+            while stack:
+                cursor, stored, count = stack.pop()
+                if node.count == "?" and count:
+                    continue
+                start = cursor
+                if count and node.separator is not None:
+                    if start == len(items) or tree_text(items[start]) != tree_text(node.separator):
+                        continue
+                    start += 1
+                for end, found in self.match(node.body, items, start, stored, (*path, count)):
+                    if end > start:
+                        matches.append((end, found))
+                        stack.append((end, found, count + 1))
+            if node.count == "+":
+                matches = matches[1:]
+            for end, found in sorted(matches, key=lambda match: -match[0]):
+                yield from self.match(rest, items, end, found, path)
+            return
+        if pos == len(items):
+            return
+        item = items[pos]
+        if isinstance(node, MacroCapture):
+            length = 1 if node.fragment in {"tt", "ident", "literal", "block"} else len(items) - pos
+            if node.fragment == "literal" and tree_text(item) == "-":
+                length = min(2, len(items) - pos)
+            for end in range(pos + length, pos, -1):
+                part = items[pos:end]
+                if self.fragment(node.fragment, part):
+                    key = (node.name.text, path)
+                    if key in captures:
+                        raise node.name.error(f"duplicate macro matcher binding {node.name.text!r}")
+                    yield from self.match(rest, items, end, captures | {key: (node.fragment, part)}, path)
+        elif isinstance(node, TokenGroup):
+            if isinstance(item, TokenGroup) and node.opening.text == item.opening.text:
+                for end, found in self.match(node.items, item.items, 0, captures, path):
+                    if end == len(item.items):
+                        yield from self.match(rest, items, pos + 1, found, path)
+        elif isinstance(item, Token) and node.text == item.text:
+            yield from self.match(rest, items, pos + 1, captures, path)
+
+    @staticmethod
+    def fragment(fragment, items):
+        item = items[0]
+        if fragment == "tt":
+            return True
+        if fragment == "ident":
+            return isinstance(item, Token) and bool(IDENT.fullmatch(item.text))
+        if fragment == "literal":
+            if len(items) == 2:
+                return (tree_text(item) == "-" and isinstance(items[1], Token)
+                        and items[1].text[0].isdigit())
+            return isinstance(item, Token) and (item.text[0].isdigit() or item.text.startswith('"')
+                                               or item.text in {"true", "false"})
+        if fragment == "block":
+            return isinstance(item, TokenGroup) and item.opening.text == "{"
+        tokens = list(flatten_trees(items))
+        first = tokens[0]
+        parser = Parser("", tokens=(*tokens, Token("", first.line, first.column)), fragment=True)
+        try:
+            if fragment == "expr":
+                parser.expression()
+            elif fragment == "ty":
+                parser.type_name()
+            elif fragment == "pat":
+                parser.pattern()
+            elif fragment == "path":
+                parser.expression_path(parser.identifier())
+            return not parser.current.text
+        except RustError:
+            return False
+
+    @staticmethod
+    def variables(nodes):
+        for node in nodes:
+            if isinstance(node, MacroCapture):
+                yield node.name.text
+            elif isinstance(node, MacroRepeat):
+                yield from MacroExpander.variables(node.body)
+            elif isinstance(node, TokenGroup):
+                yield from MacroExpander.variables(node.items)
+
+    @staticmethod
+    def local_names(nodes):
+        names = set()
+        for index, node in enumerate(nodes):
+            if isinstance(node, TokenGroup):
+                names.update(MacroExpander.local_names(node.items))
+            elif isinstance(node, MacroRepeat):
+                names.update(MacroExpander.local_names(node.body))
+            elif isinstance(node, Token) and node.text in {"let", "for"}:
+                following = index + 1
+                if following < len(nodes) and isinstance(nodes[following], Token) and nodes[following].text == "mut":
+                    following += 1
+                if following < len(nodes) and isinstance(nodes[following], Token):
+                    name = nodes[following].text
+                    if IDENT.fullmatch(name) and name not in RESERVED:
+                        names.add(name)
+        return names
+
+    def render(self, nodes, captures, path, renamed):
+        for index, node in enumerate(nodes):
+            if isinstance(node, MacroCapture):
+                for level in range(len(path), -1, -1):
+                    key = (node.name.text, path[:level])
+                    if key in captures:
+                        fragment, items = captures[key]
+                        if fragment in {"expr", "pat"}:
+                            opening = replace(node.name, text="(")
+                            closing = replace(node.name, text=")")
+                            yield TokenGroup(opening, items, closing)
+                        else:
+                            yield from items
+                        break
+                else:
+                    raise node.name.error(f"metavariable {node.name.text!r} has no value at this repetition depth")
+            elif isinstance(node, TokenGroup):
+                yield replace(node, items=tuple(self.render(node.items, captures, path, renamed)))
+            elif isinstance(node, MacroRepeat):
+                names = set(self.variables(node.body))
+                if not names:
+                    token = next((node for node in node.body if isinstance(node, Token)), Token("macro", 1, 1))
+                    raise token.error("macro repetition needs a metavariable")
+                indices = {key[len(path)] for name, key in captures
+                           if name in names and len(key) > len(path) and key[:len(path)] == path}
+                for position, index_in_path in enumerate(sorted(indices)):
+                    if position and node.separator is not None:
+                        yield node.separator
+                    yield from self.render(node.body, captures, (*path, index_in_path), renamed)
+            else:
+                previous = nodes[index - 1] if index else None
+                field = isinstance(previous, Token) and previous.text in {".", "::"}
+                if node.text.startswith('"') and renamed:
+                    template = re.sub(r"(?<!\{)\{([A-Za-z_][A-Za-z_0-9]*)(?=[:}])",
+                                      lambda found: "{" + renamed.get(found[1], found[1]), node.text)
+                    yield replace(node, text=template)
+                else:
+                    yield replace(node, text=renamed[node.text]) if node.text in renamed and not field else node
+
+
 @dataclass
 class Expr:
     kind: str
@@ -99,6 +423,9 @@ class Expr:
     args: tuple = ()
     label: Token | None = None
     type_arguments: tuple | None = None
+    auto_borrow: bool = False
+    unsuffixed: bool = False
+    qualified: tuple | None = None
 
 
 @dataclass
@@ -109,6 +436,8 @@ class Function:
     body: Expr
     return_inputs: tuple = ()
     type_parameters: tuple = ()
+    associated_const: bool = False
+    method_parameters: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +469,7 @@ class ReferenceType:
 class TypeParameter:
     name: str
     bounds: set = field(default_factory=set)
+    const_type: str | None = None
 
     def __str__(self):
         return self.name
@@ -149,6 +479,8 @@ class TypeParameter:
 class TypeVariable:
     name: str
     token: Token
+    const_type: str | None = None
+    integer_literal: bool = False
 
     def __str__(self):
         return self.name
@@ -163,6 +495,85 @@ class AppliedType:
         return f"{self.name}<{', '.join(map(str, self.arguments))}>"
 
 
+@dataclass(frozen=True)
+class ConstValue:
+    value: int | bool
+    kind: str | None = field(default=None, compare=False)
+    boolean: bool = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "boolean", type(self.value) is bool)
+
+    def __str__(self):
+        return str(self.value).lower()
+
+
+@dataclass(frozen=True)
+class ArrayType:
+    element: object
+    length: object
+
+    def __str__(self):
+        return f"[{self.element}; {self.length}]"
+
+
+@dataclass(frozen=True)
+class AssociatedType:
+    owner: object
+    item: str
+    trait: str | None = None
+
+    def __str__(self):
+        return f"{self.owner}::{self.item}"
+
+
+@dataclass(frozen=True)
+class Trait:
+    name: Token
+    self_type: TypeParameter
+    bounds: set
+    methods: dict
+    associated: dict
+
+
+@dataclass(frozen=True)
+class Implementation:
+    token: Token
+    target: object
+    trait: str | None
+    parameters: tuple
+    methods: dict
+    associated: dict
+
+
+def match_types(template, actual, parameters, result):
+    if template in parameters:
+        if template in result:
+            return result[template] == actual
+        result[template] = actual
+        return True
+    if isinstance(template, AppliedType) and isinstance(actual, AppliedType):
+        return (template.name == actual.name and len(template.arguments) == len(actual.arguments)
+                and all(match_types(left, right, parameters, result)
+                        for left, right in zip(template.arguments, actual.arguments)))
+    if isinstance(template, ArrayType) and isinstance(actual, ArrayType):
+        return (match_types(template.element, actual.element, parameters, result)
+                and match_types(template.length, actual.length, parameters, result))
+    return template == actual
+
+
+def overlapping_types(first, second):
+    if isinstance(first, TypeParameter) or isinstance(second, TypeParameter):
+        return True
+    if isinstance(first, AppliedType) and isinstance(second, AppliedType):
+        return (first.name == second.name and len(first.arguments) == len(second.arguments)
+                and all(overlapping_types(a, b) for a, b in zip(first.arguments, second.arguments)))
+    if isinstance(first, ArrayType) and isinstance(second, ArrayType):
+        return (overlapping_types(first.element, second.element)
+                and overlapping_types(first.length, second.length))
+    return first == second
+
+
 TRAIT_MODULES = {
     "Clone": "clone", "Copy": "marker", "Sized": "marker", "Default": "default",
     "Debug": "fmt", "Display": "fmt", "PartialEq": "cmp", "Eq": "cmp",
@@ -175,15 +586,15 @@ SUPERTRAITS = {
 DERIVABLE = set(TRAIT_MODULES) - {"Display", "Sized"}
 
 
-def implies(bounds, trait):
-    return trait in bounds or any(trait in SUPERTRAITS.get(bound, ()) for bound in bounds)
-
-
 def substitute(annotation, arguments):
     if isinstance(annotation, ReferenceType):
         return replace(annotation, inner=substitute(annotation.inner, arguments))
     if isinstance(annotation, AppliedType):
         return AppliedType(annotation.name, tuple(substitute(arg, arguments) for arg in annotation.arguments))
+    if isinstance(annotation, ArrayType):
+        return ArrayType(substitute(annotation.element, arguments), substitute(annotation.length, arguments))
+    if isinstance(annotation, AssociatedType):
+        return replace(annotation, owner=substitute(annotation.owner, arguments))
     return arguments.get(annotation, annotation)
 
 
@@ -198,6 +609,77 @@ class Program:
     call_types: dict = field(default_factory=dict)
     type_parameters: dict = field(default_factory=dict)
     default_variants: dict = field(default_factory=dict)
+    traits: dict = field(default_factory=dict)
+    impls: list = field(default_factory=list)
+    call_functions: dict = field(default_factory=dict)
+    dispatches: dict = field(default_factory=dict)
+
+    def projection_trait(self, annotation):
+        if annotation.trait:
+            trait = self.traits.get(annotation.trait)
+            return trait if trait and annotation.item in trait.associated else None
+        if isinstance(annotation.owner, TypeParameter):
+            bounds = self.trait_closure(annotation.owner.bounds)
+            matches = [trait for name, trait in self.traits.items()
+                       if name in bounds and annotation.item in trait.associated]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    def normalize(self, annotation, seen=()):
+        if isinstance(annotation, AssociatedType):
+            owner = self.normalize(annotation.owner, seen)
+            annotation = replace(annotation, owner=owner)
+            if annotation in seen:
+                return annotation
+            trait = self.projection_trait(annotation)
+            if trait:
+                annotation = replace(annotation, trait=trait.name.text)
+                if not isinstance(owner, (TypeParameter, TypeVariable)):
+                    implementation = self.implementation(owner, trait.name.text)
+                    if implementation:
+                        impl, arguments = implementation
+                        if annotation.item in impl.associated:
+                            resolved = substitute(impl.associated[annotation.item], arguments)
+                            return self.normalize(resolved, (*seen, annotation))
+            return annotation
+        if isinstance(annotation, ReferenceType):
+            return replace(annotation, inner=self.normalize(annotation.inner, seen))
+        if isinstance(annotation, AppliedType):
+            return AppliedType(annotation.name, tuple(self.normalize(arg, seen) for arg in annotation.arguments))
+        if isinstance(annotation, ArrayType):
+            return ArrayType(self.normalize(annotation.element, seen), annotation.length)
+        return annotation
+
+    def trait_closure(self, bounds):
+        pending = list(bounds)
+        result = set()
+        while pending:
+            trait = pending.pop()
+            if trait in result:
+                continue
+            result.add(trait)
+            pending.extend(SUPERTRAITS.get(trait, ()))
+            if trait in self.traits:
+                pending.extend(self.traits[trait].bounds)
+        return result
+
+    def implementation(self, annotation, trait, seen=()):
+        key = (annotation, trait)
+        if key in seen:
+            return None
+        for impl in self.impls:
+            if impl.trait != trait:
+                continue
+            arguments = {}
+            if match_types(impl.target, annotation, impl.parameters, arguments) and all(
+                parameter in arguments for parameter in impl.parameters
+            ) and all(
+                self.implements(arguments[parameter], bound, seen=(*seen, key))
+                for parameter in impl.parameters for bound in parameter.bounds
+            ):
+                return impl, arguments
+        return None
 
     def layout(self, annotation):
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
@@ -215,11 +697,21 @@ class Program:
         return replace(ctor, annotation=annotation,
                        fields=tuple((name, substitute(kind, arguments)) for name, kind in ctor.fields))
 
-    def implements(self, annotation, trait, assumed=()):
+    def implements(self, annotation, trait, assumed=(), *, seen=()):
         if trait == "Sized":
             return True
+        if isinstance(annotation, AssociatedType):
+            normalized = self.normalize(annotation)
+            if not isinstance(normalized, AssociatedType):
+                return self.implements(normalized, trait, assumed, seen=seen)
+            declaration = self.projection_trait(normalized)
+            return bool(declaration and trait in self.trait_closure(declaration.associated[normalized.item]))
         if isinstance(annotation, TypeParameter):
-            return annotation in assumed or implies(annotation.bounds, trait)
+            if annotation in assumed or trait in self.trait_closure(annotation.bounds):
+                return True
+            return trait in self.traits and self.implementation(annotation, trait, seen) is not None
+        if trait in self.traits:
+            return self.implementation(annotation, trait, seen) is not None
         if isinstance(annotation, ReferenceType):
             if trait in {"Copy", "Clone"}:
                 return not annotation.mutable
@@ -228,7 +720,17 @@ class Program:
             if trait == "Default" and annotation.name in self.default_variants:
                 return True
             return (trait in self.derives.get(annotation.name, {})
-                    and all(self.implements(arg, trait, assumed) for arg in annotation.arguments))
+                    and all(self.implements(arg, trait, assumed) for p, arg in
+                            zip(self.type_parameters[annotation.name], annotation.arguments) if not p.const_type))
+        if isinstance(annotation, ArrayType):
+            if trait == "Display":
+                return False
+            if trait == "Default" and (not isinstance(annotation.length, ConstValue)
+                                       or annotation.length.value > 32):
+                return False
+            if trait == "Default" and annotation.length.value == 0:
+                return True
+            return self.implements(annotation.element, trait, assumed)
         if annotation in PRIMITIVES:
             return trait != "Display" or annotation != "()"
         return trait in self.derives.get(annotation, {})
@@ -238,8 +740,13 @@ class Program:
 
 
 class Parser:
-    def __init__(self, source):
-        self.tokens = iter(lex(source))
+    def __init__(self, source, *, tokens=None, fragment=False):
+        self.tokens = iter(lex(source) if tokens is None else tokens)
+        self.fragment = fragment
+        self.lookahead = deque()
+        self.self_type = None
+        self.current_trait = None
+        self.constants = {}
         self.current = next(self.tokens)
         self.type_parameters = {}
         self.trait_names = {name: name for name in TRAIT_MODULES if TRAIT_MODULES[name] != "fmt"}
@@ -248,7 +755,7 @@ class Parser:
         token = self.current
         if not token.text:
             raise token.error("unexpected end of input")
-        self.current = next(self.tokens)
+        self.current = self.lookahead.popleft() if self.lookahead else next(self.tokens)
         return token
 
     def accept(self, text):
@@ -274,8 +781,25 @@ class Parser:
 
     def type_name(self, *, static_string=False, signature=None, output=False):
         token = self.advance()
-        if token.text in {"i32", "bool"}:
+        if token.text == "Self" and self.self_type is not None:
+            if self.accept("::"):
+                return AssociatedType(self.self_type, self.identifier().text, self.current_trait)
+            return self.self_type
+        if token.text == "<":
+            owner = self.type_name(signature=signature)
+            self.expect("as")
+            trait = self.trait_path()
+            self.expect(">")
+            self.expect("::")
+            return AssociatedType(owner, self.identifier().text, trait)
+        if token.text in {"i32", "usize", "bool"}:
             return token.text
+        if token.text == "[":
+            element = self.type_name(static_string=static_string, signature=signature)
+            self.expect(";")
+            length = self.const_argument()
+            self.expect("]")
+            return ArrayType(element, length)
         if token.text == "&":
             lifetime = self.advance() if self.current.text.startswith("'") else None
             if lifetime and lifetime.text == "'_":
@@ -300,6 +824,9 @@ class Parser:
         if token.text == "!":
             return NEVER
         if IDENT.fullmatch(token.text) and token.text not in RESERVED:
+            if self.current.text == "::" and token.text in self.type_parameters:
+                self.advance()
+                return AssociatedType(self.type_parameters[token.text], self.identifier().text)
             if self.accept("<"):
                 return AppliedType(token.text, self.type_arguments())
             return self.type_parameters.get(token.text, token.text)
@@ -311,6 +838,9 @@ class Parser:
             if self.accept("use"):
                 self.trait_import()
                 continue
+            if self.accept("const"):
+                self.constant_item()
+                continue
             derives = self.attributes()
             self.accept("pub")
             item = self.accept("struct") or self.accept("enum")
@@ -319,31 +849,184 @@ class Parser:
                 continue
             if derives:
                 raise self.current.error("derive requires a struct or enum")
+            if self.accept("trait"):
+                self.trait_item(program)
+                continue
+            if token := self.accept("impl"):
+                self.impl_item(program, token)
+                continue
             self.expect("fn")
             name = self.identifier()
             if name.text in program.functions:
                 raise name.error(f"duplicate function {name.text!r}")
-            lifetimes, self.type_parameters = self.generic_parameters()
-            self.expect("(")
-            params = []
-            while self.current.text != ")":
+            program.functions[name.text] = self.function(name)
+        return program
+
+    def function(self, name, *, method=False, declaration=False):
+        outer_parameters = self.type_parameters
+        lifetimes, parameters = self.generic_parameters()
+        self.type_parameters = outer_parameters | parameters
+        self.expect("(")
+        params = []
+        receiver = False
+        while self.current.text != ")":
+            if method and not params and self.is_self_parameter():
+                param, mutable, annotation = self.self_parameter(lifetimes)
+                receiver = True
+            else:
                 mutable = bool(self.accept("mut"))
                 param = self.accept("_") or self.identifier()
                 if mutable and param.text == "_":
                     raise param.error("wildcard parameters cannot be mutable")
                 self.expect(":")
-                params.append((param, mutable, self.type_name(signature=lifetimes)))
-                if not self.accept(","):
-                    break
-            self.expect(")")
-            result = self.type_name(signature=lifetimes, output=True) if self.accept("->") else "()"
-            self.where_clause(lifetimes)
+                annotation = self.type_name(signature=lifetimes)
+            params.append((param, mutable, annotation))
+            if not self.accept(","):
+                break
+        self.expect(")")
+        result = self.type_name(signature=lifetimes, output=True) if self.accept("->") else "()"
+        self.where_clause(lifetimes)
+        if receiver and isinstance(params[0][2], ReferenceType) and isinstance(result, ReferenceType) and not result.lifetime:
+            return_inputs = (0,)
+        else:
             return_inputs = self.return_inputs(name, params, result, lifetimes)
-            parameters = tuple(self.type_parameters.values())
-            program.functions[name.text] = Function(name, params, result, self.block(),
-                                                    return_inputs, parameters)
-            self.type_parameters = {}
-        return program
+        body = None if declaration and self.accept(";") else self.block()
+        function = Function(name, params, result, body, return_inputs, tuple(self.type_parameters.values()),
+                            method_parameters=tuple(parameters.values()) if method else ())
+        self.type_parameters = outer_parameters
+        return function
+
+    def constant_item(self):
+        name = self.identifier()
+        if name.text in self.constants:
+            raise name.error(f"duplicate constant {name.text!r}")
+        self.expect(":")
+        annotation = self.type_name()
+        if annotation not in {"i32", "usize", "bool"}:
+            raise name.error("unsupported constant type")
+        self.expect("=")
+        value = self.const_expression(self.expression())
+        if not isinstance(value, ConstValue) or (value.kind and value.kind != annotation):
+            raise name.error(f"expected a {annotation} constant")
+        if (annotation == "bool") != value.boolean:
+            raise name.error(f"expected a {annotation} constant")
+        if not value.boolean:
+            checked(value.value, name, annotation)
+        self.expect(";")
+        self.constants[name.text] = ConstValue(value.value, annotation)
+
+    def peek(self, offset=0):
+        while len(self.lookahead) <= offset:
+            self.lookahead.append(next(self.tokens, Token("", self.current.line, self.current.column)))
+        return self.lookahead[offset].text
+
+    def is_self_parameter(self):
+        if self.current.text == "self":
+            return True
+        if self.current.text == "mut":
+            return self.peek() == "self"
+        if self.current.text != "&":
+            return False
+        offset = int(self.peek().startswith("'"))
+        if self.peek(offset) == "mut":
+            offset += 1
+        return self.peek(offset) == "self"
+
+    def self_parameter(self, lifetimes):
+        borrowed = self.accept("&")
+        lifetime = self.advance() if borrowed and self.current.text.startswith("'") else None
+        if lifetime and lifetime.text not in lifetimes:
+            raise lifetime.error("undeclared receiver lifetime")
+        mutable = bool(self.accept("mut"))
+        name = self.expect("self")
+        annotation = self.self_type
+        if borrowed:
+            annotation = ReferenceType(annotation, mutable, lifetime.text if lifetime else None)
+        return name, mutable and not borrowed, annotation
+
+    def trait_item(self, program):
+        name = self.identifier()
+        if name.text in program.traits or name.text in TRAIT_MODULES:
+            raise name.error(f"duplicate trait {name.text!r}")
+        bounds = self.trait_bounds() if self.accept(":") else set()
+        self_type = TypeParameter("Self", {name.text, *bounds})
+        old_self = self.self_type
+        self.self_type = self_type
+        self.current_trait = name.text
+        self.type_parameters = {"Self": self_type}
+        self.expect("{")
+        methods, associated = self.methods(program, declaration=True, prefix=f"@trait:{name.text}")
+        self.self_type = old_self
+        self.current_trait = None
+        self.type_parameters = {}
+        program.traits[name.text] = Trait(name, self_type, bounds, methods, associated)
+
+    def impl_item(self, program, token):
+        lifetimes, parameters = self.generic_parameters()
+        if lifetimes:
+            raise token.error("impl lifetime parameters are unsupported")
+        self.type_parameters = parameters
+        target = self.type_name()
+        trait = None
+        if self.accept("for"):
+            if not isinstance(target, str):
+                raise token.error("expected a trait name in impl")
+            trait = target
+            target = self.type_name()
+        self.where_clause(lifetimes)
+        self.expect("{")
+        old_self = self.self_type
+        self.self_type = target
+        self.current_trait = trait
+        methods, associated = self.methods(program, declaration=False, prefix=f"@impl:{len(program.impls)}")
+        self.self_type = old_self
+        self.current_trait = None
+        program.impls.append(Implementation(token, target, trait, tuple(parameters.values()), methods, associated))
+        self.type_parameters = {}
+
+    def methods(self, program, *, declaration, prefix):
+        methods = {}
+        associated = {}
+        while not self.accept("}"):
+            self.accept("pub")
+            if self.accept("type"):
+                name = self.identifier()
+                if not self.current_trait:
+                    raise name.error("associated types require a trait")
+                if name.text in associated:
+                    raise name.error(f"duplicate associated type {name.text!r}")
+                if declaration:
+                    associated[name.text] = self.trait_bounds() if self.accept(":") else set()
+                else:
+                    self.expect("=")
+                    associated[name.text] = self.type_name()
+                self.expect(";")
+                continue
+            constant = self.accept("const")
+            if not constant:
+                self.expect("fn")
+            name = self.identifier()
+            if name.text in methods:
+                raise name.error(f"duplicate method {name.text!r}")
+            internal = replace(name, text=f"{prefix}:{name.text}")
+            if constant:
+                self.expect(":")
+                annotation = self.type_name()
+                body = None
+                if self.accept("="):
+                    body = self.expression()
+                    self.const_expression(body)
+                elif not declaration:
+                    raise name.error("associated constant needs a value")
+                self.expect(";")
+                function = Function(internal, [], annotation, body,
+                                    type_parameters=tuple(self.type_parameters.values()), associated_const=True)
+            else:
+                function = self.function(internal, method=True, declaration=declaration)
+            methods[name.text] = function
+            if function.body is not None:
+                program.functions[internal.text] = function
+        return methods, associated
 
     def generic_parameters(self):
         lifetimes = {}
@@ -358,6 +1041,15 @@ class Parser:
                 if token.text in lifetimes:
                     raise token.error(f"duplicate lifetime {token.text}")
                 lifetimes[token.text] = self.lifetime_bounds() if self.accept(":") else set()
+            elif token.text == "const":
+                name = self.identifier()
+                if name.text in types:
+                    raise name.error(f"duplicate generic parameter {name.text}")
+                self.expect(":")
+                kind = self.advance()
+                if kind.text not in {"i32", "usize", "bool"}:
+                    raise kind.error("unsupported const parameter type")
+                types[name.text] = TypeParameter(name.text, const_type=kind.text)
             elif IDENT.fullmatch(token.text) and token.text not in RESERVED:
                 if token.text in types:
                     raise token.error(f"duplicate type parameter {token.text}")
@@ -382,6 +1074,8 @@ class Parser:
         if (len(parts) == 3 and parts[0] in {"std", "core"}
                 and TRAIT_MODULES.get(parts[2]) == parts[1]):
             return parts[2]
+        if len(parts) == 1:
+            return parts[0]
         raise token.error(f"unsupported trait {'::'.join(parts)!r}")
 
     def trait_import(self):
@@ -595,15 +1289,26 @@ class Parser:
 
     def expression(self, minimum=1, *, allow_record=True):
         left = self.prefix(allow_record)
-        while dot := self.accept("."):
+        while self.current.text in {".", "["}:
+            if opening := self.accept("["):
+                index = self.expression()
+                self.expect("]")
+                left = Expr("index", opening, (left, index))
+                continue
+            dot = self.expect(".")
             name = self.advance()
             if not (IDENT.fullmatch(name.text) or re.fullmatch(r'0|[1-9][0-9]*', name.text)):
                 raise name.error("expected a field name or tuple field index")
-            left = Expr("field", dot, (left, name))
-            if name.text == "clone" and self.current.text == "(":
-                if self.arguments():
-                    raise name.error("clone takes no arguments")
-                left = Expr("clone", name, (left.args[0],))
+            type_arguments = None
+            if self.accept("::"):
+                self.expect("<")
+                type_arguments = self.type_arguments()
+            if self.current.text == "(":
+                left = Expr("method", name, (left, *self.arguments()), type_arguments=type_arguments)
+            else:
+                if type_arguments is not None:
+                    raise name.error("explicit method arguments require a call")
+                left = Expr("field", dot, (left, name))
         compared = False
         while PRECEDENCE.get(self.current.text, 0) >= minimum:
             token = self.advance()
@@ -618,14 +1323,24 @@ class Parser:
             left = Expr("assign" if precedence == 1 else "binary", token, (left, right))
         return left
 
-    def arguments(self):
-        self.expect("(")
+    def skip_group(self):
+        close = DELIMITERS[self.advance().text]
+        while self.current.text != close:
+            if self.current.text in DELIMITERS:
+                self.skip_group()
+            else:
+                self.advance()
+        self.expect(close)
+
+    def arguments(self, opening="("):
+        self.expect(opening)
+        close = DELIMITERS[opening]
         args = []
-        while self.current.text != ")":
+        while self.current.text != close:
             args.append(self.expression())
             if not self.accept(","):
                 break
-        self.expect(")")
+        self.expect(close)
         return tuple(args)
 
     def prefix(self, allow_record=True):
@@ -633,6 +1348,22 @@ class Parser:
             return self.block()
         token = self.advance()
         word = token.text
+        if word == "<":
+            owner = self.type_name()
+            self.expect("as")
+            trait = self.trait_path()
+            self.expect(">")
+            self.expect("::")
+            member = self.identifier()
+            if self.current.text == "(":
+                return Expr("call", member, self.arguments(), qualified=(owner, trait))
+            return Expr("name", member, qualified=(owner, trait))
+        if word == "Self" and self.self_type is not None:
+            self.expect("::")
+            member = self.identifier()
+            if self.current.text == "(":
+                return Expr("call", member, self.arguments(), qualified=(self.self_type, self.current_trait))
+            return Expr("name", member, qualified=(self.self_type, self.current_trait))
         if word.startswith("'"):
             if word in {"'static", "'_"} or word[1:] in RESERVED:
                 raise token.error("invalid label")
@@ -691,14 +1422,40 @@ class Parser:
             value = self.expression()
             self.expect(")")
             return Expr("group", token, (value,))
+        if word == "[":
+            if self.accept("]"):
+                return Expr("array", token)
+            first = self.expression()
+            if self.accept(";"):
+                count = self.const_argument()
+                self.expect("]")
+                return Expr("array_repeat", token, (first, count))
+            elements = [first]
+            while self.accept(",") and self.current.text != "]":
+                elements.append(self.expression())
+            self.expect("]")
+            return Expr("array", token, tuple(elements))
+        if (parameter := self.type_parameters.get(word)) and parameter.const_type:
+            return Expr("const_value", token, (parameter,))
+        if word in self.constants:
+            constant = self.constants[word]
+            return Expr("literal", token, (constant.kind, constant.value))
         literal = self.literal(token)
         if literal:
             return literal
+        if word == "self" and (self.self_type is not None or self.fragment):
+            return Expr("name", token)
         if IDENT.fullmatch(word) and word not in RESERVED:
             if self.accept("!"):
+                opening = self.current.text
+                if opening not in DELIMITERS:
+                    raise self.current.error("expected a macro delimiter")
                 if word != "println":
-                    raise token.error(f"unsupported macro {word!r}")
-                return Expr("print", token, self.arguments())
+                    if not self.fragment:
+                        raise token.error(f"unknown macro {word!r}")
+                    self.skip_group()
+                    return Expr("literal", token, ("i32", 0))
+                return Expr("print", token, self.arguments(opening))
             path, type_arguments = self.expression_path(token)
             if path.text in INTEGER_CONSTANTS:
                 return Expr("literal", path, ("i32", INTEGER_CONSTANTS[path.text]))
@@ -707,6 +1464,9 @@ class Parser:
                             type_arguments=type_arguments)
             if self.current.text == "(":
                 return Expr("call", path, self.arguments(), type_arguments=type_arguments)
+            owner, separator, member = path.text.partition("::")
+            if separator and owner in self.type_parameters:
+                return Expr("name", replace(path, text=member), qualified=(self.type_parameters[owner], None))
             return Expr("name", path, type_arguments=type_arguments)
         raise token.error(f"unexpected token {word!r}")
 
@@ -714,11 +1474,13 @@ class Parser:
     def literal(token, negative=False):
         word = token.text
         if word[0].isdigit():
-            digits = word.removesuffix("i32").replace("_", "").lstrip("0") or "0"
-            if len(digits) > 10 or int(digits) > LIMIT:
-                raise token.error("integer literal out of range for i32")
+            kind = "usize" if word.endswith("usize") else "i32"
+            digits = word.removesuffix("usize").removesuffix("i32").replace("_", "").lstrip("0") or "0"
+            if len(digits) > 20 or int(digits) >= USIZE_LIMIT:
+                raise token.error("integer literal out of range")
             value = int(digits)
-            return Expr("literal", token, ("i32", -value if negative else value))
+            return Expr("literal", token, (kind, -value if negative else value),
+                        unsuffixed=not word.endswith(("i32", "usize")))
         if negative:
             raise token.error("expected an integer after '-'")
         if word in {"true", "false"}:
@@ -747,11 +1509,65 @@ class Parser:
     def type_arguments(self):
         arguments = []
         while self.current.text not in {">", ">="}:
-            arguments.append(None if self.accept("_") else self.type_name())
+            word = self.current.text
+            parameter = self.type_parameters.get(word)
+            if self.accept("_"):
+                arguments.append(None)
+            elif (word in {"{", "-", "true", "false"} or word in self.constants or word[0].isdigit()
+                  or (parameter and parameter.const_type)):
+                arguments.append(self.const_argument())
+            else:
+                arguments.append(self.type_name())
             if not self.accept(","):
                 break
         self.expect(">")
         return tuple(arguments)
+
+    def const_argument(self):
+        if self.accept("{"):
+            value = self.const_expression(self.expression())
+            self.expect("}")
+            return value
+        negative = self.accept("-")
+        token = self.advance()
+        if token.text in self.constants and not negative:
+            return self.constants[token.text]
+        parameter = self.type_parameters.get(token.text)
+        if parameter and parameter.const_type and not negative:
+            return parameter
+        literal = self.literal(token, negative=bool(negative))
+        if literal is None or literal.args[0] not in {"i32", "usize", "bool"}:
+            raise token.error("expected a constant value or parameter")
+        kind, value = literal.args
+        return ConstValue(value, None if literal.unsuffixed else kind)
+
+    def const_expression(self, expr):
+        expr = ungroup(expr)
+        if expr.kind == "const_value":
+            return expr.args[0]
+        if expr.kind == "literal" and expr.args[0] in {"i32", "usize", "bool"}:
+            kind, value = expr.args
+            return ConstValue(value, None if expr.unsuffixed else kind)
+        if expr.kind == "unary" and expr.token.text == "-":
+            value = self.const_expression(expr.args[0])
+            if isinstance(value, ConstValue) and type(value.value) is int:
+                return ConstValue(-value.value, value.kind)
+        if expr.kind == "binary":
+            left, right = (self.const_expression(arg) for arg in expr.args)
+            word = expr.token.text
+            if all(isinstance(arg, ConstValue) for arg in (left, right)):
+                if left.boolean and right.boolean and word in {"&&", "||"}:
+                    return ConstValue((left.value and right.value) if word == "&&"
+                                      else (left.value or right.value), "bool")
+                if word in COMPARE and left.boolean == right.boolean and (
+                    not left.kind or not right.kind or left.kind == right.kind
+                ):
+                    return ConstValue(COMPARE[word](left.value, right.value), "bool")
+                kind = left.kind or right.kind
+                if (not left.boolean and not right.boolean and word in {*ARITHMETIC, "/", "%"}
+                        and (not left.kind or not right.kind or left.kind == right.kind)):
+                    return ConstValue(binary(word, left.value, right.value, expr.token, kind or "i32"), kind)
+        raise expr.token.error("unsupported constant expression")
 
     def record_fields(self, parse_value, shorthand):
         self.expect("{")
@@ -936,7 +1752,7 @@ def ungroup(expr):
 
 def place_root(expr):
     root = ungroup(expr)
-    while root.kind == "field":
+    while root.kind in {"field", "index"}:
         root = ungroup(root.args[0])
     return root
 
@@ -965,7 +1781,7 @@ class Address:
     def read(self):
         value = self.binding.value
         for name in self.fields:
-            value = value.fields[value.constructor.index(name)]
+            value = value.at(name)
         return value
 
     def write(self, value):
@@ -979,6 +1795,9 @@ class Value:
     constructor: Constructor
     fields: tuple
 
+    def at(self, name):
+        return self.fields[self.constructor.index(name)]
+
     def replace(self, path, value):
         if not path:
             return value
@@ -986,6 +1805,26 @@ class Value:
         fields = list(self.fields)
         fields[index] = self.fields[index].replace(path[1:], value) if path[1:] else value
         return Value(self.constructor, tuple(fields))
+
+
+@dataclass(frozen=True)
+class ArrayValue:
+    items: tuple
+
+    def index(self, token):
+        index = int(token.text)
+        if not 0 <= index < len(self.items):
+            raise token.error(f"array index {index} out of bounds for length {len(self.items)}")
+        return index
+
+    def at(self, token):
+        return self.items[self.index(token)]
+
+    def replace(self, path, value):
+        index = self.index(path[0])
+        items = list(self.items)
+        items[index] = items[index].replace(path[1:], value) if path[1:] else value
+        return ArrayValue(tuple(items))
 
 
 @dataclass(frozen=True)
@@ -1190,20 +2029,24 @@ class Checker:
         self.generic_arguments = []
         self.numeric_operands = []
         self.unary_results = []
+        self.array_integers = []
         self.parameters = {}
         self.ascriptions = []
 
     def check(self):
         finished = set()
         for name, (token, _) in self.program.types.items():
+            self.check_bounds(self.program.type_parameters[name], token)
             self.check_layout(name, token, set(), finished)
             self.check_derives(name)
+        self.check_implementations()
         main = self.functions.get("main")
         if main is None:
             raise RustError("missing fn main()")
         if main.params or main.result != "()" or main.type_parameters:
             raise main.name.error("main must take no arguments and return ()")
         for function in self.functions.values():
+            self.check_bounds(function.type_parameters, function.name)
             self.parameters = {parameter.name: parameter for parameter in function.type_parameters}
             constructor = self.program.constructors.get(function.name.text)
             if constructor and constructor.style != "record":
@@ -1222,6 +2065,80 @@ class Checker:
             self.require_argument(result, function.result, function.body.token)
         self.finish_inference()
 
+    def check_bounds(self, parameters, token):
+        for parameter in parameters:
+            for name in parameter.bounds:
+                if name not in TRAIT_MODULES and name not in self.program.traits:
+                    raise token.error(f"unknown trait {name!r}")
+
+    def check_implementations(self):
+        for trait in self.program.traits.values():
+            self.check_bounds((trait.self_type,), trait.name)
+            if trait.name.text in self.program.trait_closure(trait.bounds):
+                raise trait.name.error("cyclic supertrait relationship")
+            for bounds in trait.associated.values():
+                for bound in bounds:
+                    if bound not in TRAIT_MODULES and bound not in self.program.traits:
+                        raise trait.name.error(f"unknown trait {bound!r}")
+            for method in trait.methods.values():
+                self.check_bounds(method.type_parameters, method.name)
+                by_value = (method.result is trait.self_type
+                            or any(kind is trait.self_type for _, _, kind in method.params))
+                if method.body and by_value and "Sized" not in self.program.trait_closure(trait.self_type.bounds):
+                    raise method.name.error("default body using Self by value requires Self: Sized")
+                for name, _, annotation in method.params:
+                    self.check_type(annotation, name)
+                self.check_type(method.result, method.name, allow_never=True)
+        for index, impl in enumerate(self.program.impls):
+            self.check_bounds(impl.parameters, impl.token)
+            self.check_type(impl.target, impl.token)
+            target_parameters = set(self.type_parts(impl.target))
+            if any(parameter not in target_parameters for parameter in impl.parameters):
+                raise impl.token.error("unconstrained impl parameter")
+            if impl.trait is None and self.program.layout(impl.target) is None:
+                raise impl.token.error("inherent impl requires a declared struct or enum")
+            for previous in self.program.impls[:index]:
+                if previous.trait == impl.trait and overlapping_types(previous.target, impl.target):
+                    if impl.trait or previous.methods.keys() & impl.methods.keys():
+                        raise impl.token.error("conflicting implementations")
+            if impl.trait is None:
+                continue
+            trait = self.program.traits.get(impl.trait)
+            if trait is None:
+                raise impl.token.error(f"unknown or unsupported implemented trait {impl.trait!r}")
+            for bound in sorted(trait.bounds):
+                self.obligation(impl.target, bound, impl.token)
+            for name in impl.associated.keys() ^ trait.associated.keys():
+                raise impl.token.error(f"missing or unexpected associated type {name!r}")
+            for name, kind in impl.associated.items():
+                self.check_type(kind, impl.token)
+                if isinstance(self.resolve(kind), (ReferenceType, AssociatedType)):
+                    raise impl.token.error("associated types must resolve to a non-reference type")
+                for bound in sorted(trait.associated[name]):
+                    self.obligation(kind, bound, impl.token)
+            for name in impl.methods.keys() - trait.methods.keys():
+                raise impl.methods[name].name.error(f"{name!r} is not a method of {impl.trait}")
+            for name, required in trait.methods.items():
+                method = impl.methods.get(name)
+                if not method:
+                    if required.body is None:
+                        raise impl.token.error(f"missing method {name!r} for {impl.trait}")
+                    continue
+                bindings = {trait.self_type: impl.target}
+                if (len(required.method_parameters) != len(method.method_parameters)
+                        or any(first.bounds != second.bounds or first.const_type != second.const_type
+                               for first, second in zip(required.method_parameters, method.method_parameters))):
+                    raise method.name.error(f"method {name!r} has incompatible generic parameters")
+                bindings.update(zip(required.method_parameters, method.method_parameters))
+                required_types = tuple(self.resolve(substitute(kind, bindings)) for _, _, kind in required.params)
+                actual_types = tuple(self.resolve(kind) for _, _, kind in method.params)
+                if (required_types != actual_types
+                        or self.resolve(method.result) != self.resolve(substitute(required.result, bindings))
+                        or method.return_inputs != required.return_inputs
+                        or method.associated_const != required.associated_const
+                        or self.has_receiver(method) != self.has_receiver(required)):
+                    raise method.name.error(f"method {name!r} has an incompatible trait signature")
+
     def resolve(self, annotation):
         if isinstance(annotation, TypeVariable) and annotation in self.substitutions:
             result = self.resolve(self.substitutions[annotation])
@@ -1231,6 +2148,11 @@ class Checker:
             return replace(annotation, inner=self.resolve(annotation.inner))
         if isinstance(annotation, AppliedType):
             return AppliedType(annotation.name, tuple(self.resolve(arg) for arg in annotation.arguments))
+        if isinstance(annotation, ArrayType):
+            return ArrayType(self.resolve(annotation.element), self.resolve(annotation.length))
+        if isinstance(annotation, AssociatedType):
+            projected = replace(annotation, owner=self.resolve(annotation.owner))
+            return self.program.normalize(projected)
         return annotation
 
     def occurs(self, variable, annotation):
@@ -1239,6 +2161,10 @@ class Checker:
             return self.occurs(variable, annotation.inner)
         if isinstance(annotation, AppliedType):
             return any(self.occurs(variable, arg) for arg in annotation.arguments)
+        if isinstance(annotation, ArrayType):
+            return self.occurs(variable, annotation.element) or self.occurs(variable, annotation.length)
+        if isinstance(annotation, AssociatedType):
+            return self.occurs(variable, annotation.owner)
         return annotation is variable
 
     def require(self, actual, expected, token):
@@ -1246,9 +2172,11 @@ class Checker:
         if actual in {NEVER, expected}:
             return
         if isinstance(expected, TypeVariable) and not self.occurs(expected, actual):
+            self.check_variable_binding(expected, actual, token)
             self.substitutions[expected] = actual
             return
         if isinstance(actual, TypeVariable) and expected != NEVER and not self.occurs(actual, expected):
+            self.check_variable_binding(actual, expected, token)
             self.substitutions[actual] = expected
             return
         if isinstance(actual, ReferenceType) and isinstance(expected, ReferenceType):
@@ -1260,6 +2188,10 @@ class Checker:
                 for left, right in zip(actual.arguments, expected.arguments):
                     self.require(left, right, token)
                 return
+        if isinstance(actual, ArrayType) and isinstance(expected, ArrayType):
+            self.require(actual.element, expected.element, token)
+            self.require(actual.length, expected.length, token)
+            return
         raise token.error(f"expected {expected}, found {actual}")
 
     def require_argument(self, actual, expected, token):
@@ -1273,6 +2205,26 @@ class Checker:
     def obligation(self, annotation, trait, token):
         self.obligations.append((annotation, trait, token))
 
+    def check_variable_binding(self, variable, value, token):
+        if variable.const_type:
+            self.check_const(value, variable.const_type, token)
+        elif isinstance(value, ConstValue) or getattr(value, "const_type", None):
+            raise token.error("expected a type argument, found a constant")
+
+    def check_const(self, value, kind, token):
+        value = self.resolve(value)
+        if isinstance(value, (TypeParameter, TypeVariable)) and value.const_type == kind:
+            return
+        if not isinstance(value, ConstValue) or (value.kind and value.kind != kind):
+            raise token.error(f"expected a {kind} constant")
+        if kind == "bool":
+            if not value.boolean:
+                raise token.error("expected a bool constant")
+        elif value.boolean:
+            raise token.error(f"expected a {kind} constant")
+        else:
+            checked(value.value, token, kind)
+
     def specialize(self, parameters, explicit, token):
         if explicit is not None and (not parameters or len(explicit) != len(parameters)):
             raise token.error(f"{token.text} expects {len(parameters)} type arguments")
@@ -1280,13 +2232,16 @@ class Checker:
         for index, parameter in enumerate(parameters):
             argument = explicit[index] if explicit is not None else None
             if argument is None:
-                argument = TypeVariable(parameter.name, token)
+                argument = TypeVariable(parameter.name, token, parameter.const_type)
                 self.variables.append(argument)
+            elif parameter.const_type:
+                self.check_const(argument, parameter.const_type, token)
             else:
                 argument = self.fill_holes(argument, token)
                 self.check_type(argument, token)
             arguments[parameter] = argument
-            self.generic_arguments.append((argument, token))
+            if not parameter.const_type:
+                self.generic_arguments.append((argument, token))
             for trait in sorted(parameter.bounds):
                 self.obligation(argument, trait, token)
         return arguments
@@ -1299,15 +2254,33 @@ class Checker:
         if isinstance(annotation, ReferenceType):
             return replace(annotation, inner=self.fill_holes(annotation.inner, token))
         if isinstance(annotation, AppliedType):
-            return AppliedType(annotation.name, tuple(self.fill_holes(arg, token)
-                                                       for arg in annotation.arguments))
+            parameters = self.program.type_parameters.get(annotation.name, ())
+            arguments = []
+            for index, arg in enumerate(annotation.arguments):
+                if arg is None and index < len(parameters) and parameters[index].const_type:
+                    variable = TypeVariable(parameters[index].name, token, parameters[index].const_type)
+                    self.variables.append(variable)
+                    arguments.append(variable)
+                else:
+                    arguments.append(self.fill_holes(arg, token))
+            return AppliedType(annotation.name, tuple(arguments))
+        if isinstance(annotation, ArrayType):
+            return ArrayType(self.fill_holes(annotation.element, token), annotation.length)
         return annotation
 
     def finish_inference(self):
+        for annotation, value, token in self.array_integers:
+            resolved = self.resolve(annotation)
+            if isinstance(resolved, TypeVariable):
+                self.require(resolved, "i32", token)
+                resolved = "i32"
+            if resolved not in {"i32", "usize"}:
+                raise token.error(f"expected an integer, found {resolved}")
+            checked(value, token, resolved)
         for operand, result, token in self.unary_results:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
-                if operand not in {"i32", "bool"}:
+                if operand not in {"i32", "usize", "bool"}:
                     raise token.error(f"cannot negate {operand} with '!'")
                 self.require(result, operand, token)
         for variable in self.variables:
@@ -1321,13 +2294,15 @@ class Checker:
             annotation = self.resolve(annotation)
             if annotation != NEVER and not self.implements(annotation, trait):
                 raise token.error(f"{annotation} does not implement {trait}")
-        for annotation, token in self.numeric_operands:
-            self.require(annotation, "i32", token)
+        for annotation, expected, token in self.numeric_operands:
+            self.require(annotation, expected, token)
         for key, value in self.program.expr_types.items():
             self.program.expr_types[key] = self.resolve(value)
         for key, (types, arguments) in self.program.call_types.items():
             self.program.call_types[key] = (tuple(self.resolve(kind) for kind in types),
                                             {p: self.resolve(arg) for p, arg in arguments.items()})
+        for key, (trait, receiver, method) in self.program.dispatches.items():
+            self.program.dispatches[key] = (trait, self.resolve(receiver), method)
         for key, (pattern, bindings) in self.program.patterns.items():
             self.program.patterns[key] = (
                 self.resolve_pattern(pattern),
@@ -1369,6 +2344,21 @@ class Checker:
         if annotation is None:
             raise token.error("type placeholders are unsupported in item signatures")
         if isinstance(annotation, (TypeParameter, TypeVariable)):
+            if annotation.const_type:
+                raise token.error("expected a type, found a const parameter")
+            return
+        if isinstance(annotation, ArrayType):
+            if isinstance(annotation.element, ReferenceType):
+                raise token.error("reference elements in arrays are unsupported")
+            self.check_type(annotation.element, token)
+            self.check_const(annotation.length, "usize", token)
+            return
+        if isinstance(annotation, AssociatedType):
+            self.check_type(annotation.owner, token)
+            trait = self.program.projection_trait(annotation)
+            if not trait:
+                raise token.error(f"unknown or ambiguous associated type {annotation}")
+            self.obligation(annotation.owner, trait.name.text, token)
             return
         if isinstance(annotation, ReferenceType):
             if isinstance(annotation.inner, ReferenceType):
@@ -1380,6 +2370,9 @@ class Checker:
             if not parameters or len(parameters) != len(annotation.arguments):
                 raise token.error(f"{annotation.name} expects {len(parameters or ())} type arguments")
             for parameter, argument in zip(parameters, annotation.arguments):
+                if parameter.const_type:
+                    self.check_const(argument, parameter.const_type, token)
+                    continue
                 self.check_type(argument, token)
                 self.generic_arguments.append((argument, token))
                 for trait in sorted(parameter.bounds):
@@ -1409,7 +2402,7 @@ class Checker:
                     if isinstance(part, TypeParameter):
                         used.add(part)
         for param in self.program.type_parameters[name]:
-            if param not in used:
+            if param not in used and not param.const_type:
                 raise token.error(f"unused type parameter {param}")
         visiting.remove(name)
         finished.add(name)
@@ -1420,6 +2413,9 @@ class Checker:
             yield annotation.name
             for argument in annotation.arguments:
                 yield from Checker.type_parts(argument)
+        elif isinstance(annotation, ArrayType):
+            yield from Checker.type_parts(annotation.element)
+            yield annotation.length
         else:
             yield annotation
 
@@ -1567,12 +2563,17 @@ class Checker:
         test = "()"
         if kind == "for":
             name, mutable, start, end, _, _ = args
-            bounds = [self.type_of(bound, scope) for bound in (start, end)]
+            first = self.type_of(start, scope)
+            last = self.type_of(end, scope, first if first == "usize" else None)
+            integer = "usize" if "usize" in {first, last} else "i32"
+            if integer == "usize" and start.unsuffixed:
+                first = self.type_of(start, scope, integer)
+            bounds = (first, last)
             for bound in bounds:
-                self.require(bound, "i32", token)
+                self.require(bound, integer, token)
             if NEVER in bounds:
                 test = NEVER
-            scope = Scope(scope, {name.text: Binding("i32", mutable)})
+            scope = Scope(scope, {name.text: Binding(integer, mutable)})
         self.loops.append(target)
         try:
             if kind in {"while", "while_let"}:
@@ -1601,6 +2602,11 @@ class Checker:
         return "()"
 
     def type_of(self, expr, scope, expected=None):
+        if id(expr) in self.program.call_functions or expr.kind == "length":
+            cached = self.resolve(self.program.expr_types[id(expr)])
+            if expected is not None:
+                self.require_argument(cached, expected, expr.token)
+            return cached
         if expr.kind == "block" and expr.label:
             target = ControlTarget(expr)
             self.loops.append(target)
@@ -1638,9 +2644,35 @@ class Checker:
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "literal":
             annotation, value = args
-            if annotation == "i32" and value >= LIMIT:
-                raise token.error("integer literal out of range for i32")
+            hint = self.resolve(expected)
+            if expr.unsuffixed and hint == "usize":
+                annotation = hint
+            elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.integer_literal:
+                self.array_integers.append((hint, value, token))
+                return hint
+            if annotation in {"i32", "usize"}:
+                checked(value, token, annotation)
             return annotation
+        if kind == "const_value":
+            return args[0].const_type
+        if kind in {"array", "array_repeat"}:
+            return self.array_type(expr, scope, expected)
+        if kind == "index":
+            base, index = args
+            annotation = self.type_of(base, scope)
+            if isinstance(annotation, ReferenceType):
+                base = Expr("deref", base.token, (base, False))
+                expr.args = (base, index)
+                annotation = self.type_of(base, scope)
+            if not isinstance(annotation, ArrayType):
+                raise token.error(f"cannot index {annotation}")
+            actual = self.type_of(index, scope, "usize")
+            self.require(actual, "usize", index.token)
+            return NEVER if actual == NEVER else annotation.element
+        if kind == "default":
+            return self.program.expr_types[id(expr)]
+        if kind == "method":
+            return self.method_type(expr, scope, expected)
         if kind == "group":
             return self.type_of(args[0], scope, expected)
         if kind == "name":
@@ -1648,7 +2680,10 @@ class Checker:
             if ctor and ctor.style == "unit":
                 return self.constructor(expr, "unit", expected).annotation
             if expr.type_arguments is not None:
-                raise token.error("type arguments require a generic call or constructor")
+                if "::" not in token.text:
+                    raise token.error("type arguments require a generic call or constructor")
+            if expr.qualified or "::" in token.text:
+                return self.constant_type(expr, scope, expected)
             return scope.find(token).value
         if kind == "field":
             value, name = args
@@ -1769,12 +2804,14 @@ class Checker:
             actual = self.type_of(operand, scope)
             if token.text == "!" and actual == "bool":
                 return "bool"
+            if token.text == "!" and actual == "usize":
+                return "usize"
             if token.text == "!" and isinstance(actual, TypeVariable):
                 result = TypeVariable("operator result", token)
                 self.variables.append(result)
                 self.unary_results.append((actual, result, token))
                 return result
-            self.numeric_operands.append((actual, token))
+            self.numeric_operands.append((actual, "i32", token))
             return NEVER if actual == NEVER else "i32"
         if kind == "assign":
             left, right = args
@@ -1782,23 +2819,32 @@ class Checker:
             self.require_place(left, write=True)
             if isinstance(annotation, ReferenceType):
                 raise token.error("reassigning reference bindings is unsupported")
-            actual = self.type_of(right, scope, annotation if token.text == "=" else None)
+            hint = annotation if token.text == "=" or right.unsuffixed else None
+            actual = self.type_of(right, scope, hint)
             if token.text == "=":
                 self.require(actual, annotation, token)
             else:
-                self.numeric_operands.extend(((annotation, token), (actual, token)))
+                integer = "usize" if annotation == "usize" or actual == "usize" else "i32"
+                self.numeric_operands.extend(((annotation, integer, token), (actual, integer, token)))
             return NEVER if NEVER in {annotation, actual} else "()"
         if kind == "binary":
             hint = "bool" if token.text in {"&&", "||"} else None
             left = self.type_of(args[0], scope, hint)
             second_hint = left if token.text in COMPARE and left != NEVER else hint
-            return self.binary_type(token, left, self.type_of(args[1], scope, second_hint))
+            if args[1].unsuffixed and left == "usize":
+                second_hint = "usize"
+            right = self.type_of(args[1], scope, second_hint)
+            if args[0].unsuffixed and right == "usize":
+                left = self.type_of(args[0], scope, "usize")
+            return self.binary_type(token, left, right)
         if kind == "call":
             return self.call_type(expr, scope, expected)
         if kind == "print":
             if not args:
                 return "()"
             template, *values = args
+            template = ungroup(template)
+            expr.args = (template, *values)
             if template.kind != "literal" or template.args[0] != "&str":
                 raise template.token.error("println! requires a format string literal")
             parts = format_parts(template.args[1], template.token)
@@ -1820,8 +2866,52 @@ class Checker:
             return NEVER if NEVER in types else "()"
         raise AssertionError(kind)
 
+    def array_type(self, expr, scope, expected):
+        kind, token, args = expr.kind, expr.token, expr.args
+        expected = self.resolve(expected)
+        element = expected.element if isinstance(expected, ArrayType) else None
+        if args and args[0].unsuffixed and (element is None or isinstance(element, TypeVariable)):
+            literal = TypeVariable("integer literal", token, integer_literal=True)
+            self.variables.append(literal)
+            if element is not None:
+                self.require(literal, element, token)
+            element = literal
+        diverges = False
+        if kind == "array_repeat":
+            value, length = args
+            element = self.type_of(value, scope, element)
+            if not isinstance(length, ConstValue) or length.value > 1:
+                self.obligation(element, "Copy", token)
+            diverges = element == NEVER
+        else:
+            length = ConstValue(len(args), "usize")
+            for value in args:
+                found = self.type_of(value, scope, element)
+                diverges |= found == NEVER
+                if found != NEVER:
+                    if element is None:
+                        element = found
+                    else:
+                        self.require(found, element, value.token)
+            if element is None and not diverges:
+                element = TypeVariable("array element", token)
+                self.variables.append(element)
+        if diverges:
+            return NEVER
+        result = ArrayType(element, length)
+        self.check_type(result, token)
+        if expected is not None:
+            self.require(result, expected, token)
+        return self.resolve(result)
+
     def call_type(self, expr, scope, expected):
         token, args = expr.token, expr.args
+        if expr.qualified:
+            owner, trait = expr.qualified
+            self.check_type(owner, token)
+            if trait:
+                return self.trait_call(expr, scope, expected, owner, trait, token.text)
+            return self.call_on_type(expr, scope, expected, owner, token.text)
         ctor = self.program.constructors.get(token.text)
         if ctor and ctor.style == "tuple":
             ctor = self.constructor(expr, "tuple", expected)
@@ -1851,22 +2941,158 @@ class Checker:
         else:
             function = self.functions.get(token.text)
             if function is None:
-                raise token.error(f"unknown function {token.text!r}")
+                return self.associated_type(expr, scope, expected)
             arguments = self.specialize(function.type_parameters, expr.type_arguments, token)
-            params = tuple(substitute(kind, arguments) for _, _, kind in function.params)
-            result = substitute(function.result, arguments)
+            return self.function_call(expr, scope, expected, function, arguments)
+        return self.check_call(expr, scope, expected, params, result, arguments)
+
+    def function_call(self, expr, scope, expected, function, arguments, first=None):
+        if function.associated_const != (expr.kind == "name"):
+            raise expr.token.error("associated constants and methods use different call syntax")
+        expr.kind = "call"
+        if function.method_parameters:
+            local = self.specialize(function.method_parameters, expr.type_arguments, expr.token)
+            arguments = arguments | local
+        self.program.call_functions[id(expr)] = function
+        params = tuple(substitute(self.resolve(kind), arguments) for _, _, kind in function.params)
+        result = substitute(self.resolve(function.result), arguments)
+        return self.check_call(expr, scope, expected, params, result, arguments, first)
+
+    def check_call(self, expr, scope, expected, params, result, arguments, first=None):
+        token, args = expr.token, expr.args
         if len(args) != len(params):
             raise token.error(f"{token.text} takes {len(params)} arguments")
-        if expected is not None and arguments:
+        defer_projection = isinstance(self.resolve(result), AssociatedType)
+        if expected is not None and arguments and not defer_projection:
             self.require_argument(result, expected, token)
         actual_types = []
-        for expr_arg, parameter in zip(args, params):
+        for index, (expr_arg, parameter) in enumerate(zip(args, params)):
             hint = self.resolve(parameter)
-            actual = self.type_of(expr_arg, scope, hint)
+            actual = first if index == 0 and first is not None else self.type_of(expr_arg, scope, hint)
             self.require_argument(actual, parameter, expr_arg.token)
             actual_types.append(actual)
+        if expected is not None and defer_projection:
+            self.require_argument(result, expected, token)
         self.program.call_types[id(expr)] = (params, arguments)
         return NEVER if NEVER in actual_types else self.resolve(result)
+
+    @staticmethod
+    def has_receiver(method):
+        return bool(method.params and method.params[0][0].text == "self")
+
+    def method_type(self, expr, scope, expected):
+        name = expr.token.text
+        original, *rest = expr.args
+        actual = self.type_of(original, scope)
+        if actual == NEVER:
+            expr.kind, expr.args = "group", (original,)
+            return NEVER
+        base = actual.inner if isinstance(actual, ReferenceType) else actual
+        if isinstance(base, ArrayType) and name == "len" and not rest:
+            if isinstance(actual, ReferenceType):
+                original = Expr("deref", expr.token, (original, False))
+                self.type_of(original, scope)
+            expr.kind, expr.args = "length", (original,)
+            return "usize"
+        # There can be multiple inherent impl blocks on one target.
+        for impl in self.program.impls:
+            if impl.trait or name not in impl.methods:
+                continue
+            arguments = {}
+            if match_types(impl.target, base, impl.parameters, arguments) and all(
+                self.implements(arguments[p], bound) for p in impl.parameters for bound in p.bounds
+            ):
+                method = impl.methods[name]
+                if self.has_receiver(method):
+                    return self.receiver_call(expr, scope, expected, method, arguments, actual)
+        candidates = [trait for trait in self.program.traits.values()
+                      if name in trait.methods and self.has_receiver(trait.methods[name])
+                      and self.implements(base, trait.name.text)]
+        if len(candidates) > 1:
+            raise expr.token.error(f"multiple traits provide method {name!r}")
+        if candidates:
+            trait = candidates[0]
+            self.program.dispatches[id(expr)] = (trait.name.text, base, name)
+            return self.receiver_call(expr, scope, expected, trait.methods[name],
+                                      {trait.self_type: base}, actual)
+        if name == "clone" and not rest:
+            expr.kind = "clone"
+            return self.check_expr(expr, scope, expected)
+        raise expr.token.error(f"no method {name!r} for {base}")
+
+    def receiver_call(self, expr, scope, expected, method, arguments, actual):
+        original, *rest = expr.args
+        if expr.type_arguments is not None and not method.method_parameters:
+            raise expr.token.error("method takes no generic arguments")
+        wanted = substitute(method.params[0][2], arguments)
+        if isinstance(wanted, ReferenceType) and not isinstance(actual, ReferenceType):
+            original = Expr("borrow", expr.token, (original, wanted.mutable), auto_borrow=True)
+            actual = self.type_of(original, scope)
+        elif isinstance(actual, ReferenceType) and not isinstance(wanted, ReferenceType):
+            original = Expr("deref", expr.token, (original, False))
+            actual = self.type_of(original, scope)
+        expr.kind = "call"
+        expr.args = (original, *rest)
+        return self.function_call(expr, scope, expected, method, arguments, actual)
+
+    def associated_type(self, expr, scope, expected):
+        owner, separator, name = expr.token.text.partition("::")
+        if not separator:
+            raise expr.token.error(f"unknown function {owner!r}")
+        trait = self.program.traits.get(owner)
+        if trait and name in trait.methods:
+            actual = None
+            if self.has_receiver(trait.methods[name]) and expr.args:
+                actual = self.type_of(expr.args[0], scope)
+                base = actual.inner if isinstance(actual, ReferenceType) else actual
+            else:
+                base = TypeVariable("Self", expr.token)
+                self.variables.append(base)
+            return self.trait_call(expr, scope, expected, base, owner, name, actual)
+        candidates = [impl for impl in self.program.impls if impl.trait is None and name in impl.methods
+                      and (impl.target.name if isinstance(impl.target, AppliedType) else impl.target) == owner]
+        if len(candidates) != 1:
+            if owner in self.program.types and not self.program.type_parameters[owner]:
+                return self.call_on_type(expr, scope, expected, owner, name)
+            raise expr.token.error(f"unknown or ambiguous associated function {expr.token.text!r}")
+        impl = candidates[0]
+        method = impl.methods[name]
+        explicit = None if method.method_parameters else expr.type_arguments
+        arguments = self.specialize(impl.parameters, explicit, expr.token)
+        return self.function_call(expr, scope, expected, method, arguments)
+
+    def constant_type(self, expr, scope, expected):
+        if expr.qualified:
+            owner, trait = expr.qualified
+            self.check_type(owner, expr.token)
+            if trait:
+                return self.trait_call(expr, scope, expected, owner, trait, expr.token.text)
+            return self.call_on_type(expr, scope, expected, owner, expr.token.text)
+        return self.associated_type(expr, scope, expected)
+
+    def trait_call(self, expr, scope, expected, owner, trait_name, name, first=None):
+        trait = self.program.traits.get(trait_name)
+        if not trait or name not in trait.methods:
+            raise expr.token.error(f"trait {trait_name!r} has no function {name!r}")
+        self.obligation(owner, trait_name, expr.token)
+        self.program.dispatches[id(expr)] = (trait_name, owner, name)
+        return self.function_call(expr, scope, expected, trait.methods[name], {trait.self_type: owner}, first)
+
+    def call_on_type(self, expr, scope, expected, owner, name):
+        for impl in self.program.impls:
+            if impl.trait is not None or name not in impl.methods:
+                continue
+            args = {}
+            if match_types(impl.target, owner, impl.parameters, args):
+                for parameter, argument in args.items():
+                    for trait in parameter.bounds:
+                        self.obligation(argument, trait, expr.token)
+                return self.function_call(expr, scope, expected, impl.methods[name], args)
+        traits = [trait.name.text for trait in self.program.traits.values()
+                  if name in trait.methods and self.implements(owner, trait.name.text)]
+        if len(traits) == 1:
+            return self.trait_call(expr, scope, expected, owner, traits[0], name)
+        raise expr.token.error(f"unknown or ambiguous associated function {name!r} for {owner}")
 
     def binary_type(self, token, left, right):
         word = token.text
@@ -1879,8 +3105,9 @@ class Checker:
                 self.require(right, left, token)
                 self.obligation(left, "PartialEq" if word in {"==", "!="} else "PartialOrd", token)
             return NEVER if NEVER in {left, right} else "bool"
-        self.numeric_operands.extend(((left, token), (right, token)))
-        return NEVER if NEVER in {left, right} else "i32"
+        integer = "usize" if "usize" in {left, right} else "i32"
+        self.numeric_operands.extend(((left, integer, token), (right, integer, token)))
+        return NEVER if NEVER in {left, right} else integer
 
 
 @dataclass(frozen=True, eq=False)
@@ -1896,8 +3123,11 @@ class Place:
     local: Local
     fields: tuple = ()
     holder: Local | None = field(default=None, compare=False)
+    indexed: bool = field(default=False, compare=False)
 
     def child(self, field):
+        if self.indexed:
+            return self
         return Place(self.local, (*self.fields, field), self.holder)
 
     def contains(self, other):
@@ -2007,6 +3237,8 @@ class MoveState:
             raise token.error(f"use of moved reference {place.holder.token.text!r}")
         if kind == "deref_move":
             raise token.error(f"cannot move out of borrowed place {place.name!r}")
+        if kind == "indexed_move":
+            raise token.error(f"cannot move out of array index in {place.name!r}")
         if kind == "guard_move":
             raise token.error(f"cannot move out of {place.name!r} in a pattern guard")
         if kind == "guard_write":
@@ -2181,6 +3413,11 @@ class Ownership:
             cursor, place = self.lower_address(base, scope, cursor)
             if place is not None:
                 return cursor, place.child(name.text)
+        if expr.kind == "index":
+            base, index = expr.args
+            cursor, place = self.lower_address(base, scope, cursor)
+            if place is not None:
+                return self.lower(index, scope, cursor), replace(place, indexed=True)
         if expr.kind == "deref":
             value = ungroup(expr.args[0])
             if value.kind == "name":
@@ -2257,7 +3494,8 @@ class Ownership:
                         expiring = frozenset({local})
                     else:
                         extend_to.owned.add(local)
-            return self.start_loan(cursor, place, mutable, expr.token, expiring=expiring)
+            return self.start_loan(cursor, place, mutable, expr.token, expiring=expiring,
+                                   two_phase=two_phase and expr.auto_borrow)
         holder = scope.find(expr.token)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
@@ -2323,7 +3561,7 @@ class Ownership:
 
     def lower_call(self, expr, scope, cursor):
         token, args = expr.token, expr.args
-        function = self.program.functions.get(token.text)
+        function = self.program.call_functions.get(id(expr))
         expected, _ = self.program.call_types[id(expr)]
         temporaries = []
         passed = {}
@@ -2389,6 +3627,8 @@ class Ownership:
         return cursor
 
     def move_action(self, place):
+        if place.indexed:
+            return "indexed_move"
         if place.holder:
             return "deref_move"
         if place.local in self.guarded or any(place.overlaps(item) for item in self.guard_borrows):
@@ -2400,7 +3640,7 @@ class Ownership:
         cursor, place = self.lower_address(expr, scope, cursor)
         if place is not None:
             return self.access(cursor, place, self.annotation(expr), token, consume=consume)
-        if kind in {"literal", "name", "default"}:
+        if kind in {"literal", "name", "default", "const_value"}:
             return cursor
         if kind == "borrow":
             cursor, _ = self.lower_reference(expr, scope, cursor)
@@ -2409,6 +3649,12 @@ class Ownership:
             return self.lower(args[0], scope, cursor)
         if kind == "clone":
             return self.lower(args[0], scope, cursor, consume=False)
+        if kind == "length":
+            return self.lower(args[0], scope, cursor, consume=False)
+        if kind in {"array", "index", "array_repeat"}:
+            for item in (args[:1] if kind == "array_repeat" else args):
+                cursor = self.lower(item, scope, cursor)
+            return cursor
         if kind == "block":
             statements, tail = args
             inner = Scope(scope)
@@ -2497,9 +3743,11 @@ class Ownership:
                 target_place.overlaps(item) for item in protected
             )
             action = "guard_write" if forbidden else "write"
+            if target_place.indexed:
+                cursor = self.emit(cursor, "read", target_place, token)
             return self.emit(cursor, action, target_place, token)
         if kind == "binary":
-            if token.text in COMPARE and self.annotation(args[0]) not in {"i32", "bool"}:
+            if token.text in COMPARE and self.annotation(args[0]) not in {"i32", "usize", "bool"}:
                 return self.lower_comparison(args, scope, cursor)
             left, right = args
             cursor = self.lower(left, scope, cursor)
@@ -2679,27 +3927,30 @@ def min_literal(expr):
     return expr.token.text == "-" and operand.kind == "literal" and operand.args == ("i32", LIMIT)
 
 
-def checked(value, token):
-    if not -LIMIT <= value < LIMIT:
-        raise token.error("i32 arithmetic overflow")
+def checked(value, token, integer="i32"):
+    lower, upper = (0, USIZE_LIMIT) if integer == "usize" else (-LIMIT, LIMIT)
+    if not lower <= value < upper:
+        raise token.error(f"{integer} arithmetic overflow")
     return value
 
 
-def binary(word, left, right, token):
+def binary(word, left, right, token, integer="i32"):
     if word in ARITHMETIC:
-        return checked(ARITHMETIC[word](left, right), token)
+        return checked(ARITHMETIC[word](left, right), token, integer)
     if right == 0:
         raise token.error("division by zero")
     quotient = abs(left) // abs(right)
     if (left < 0) != (right < 0):
         quotient = -quotient
-    checked(quotient, token)
+    checked(quotient, token, integer)
     return quotient if word == "/" else left - quotient * right
 
 
 def display(value, debug):
     if isinstance(value, Address):
         return display(value.read(), debug)
+    if isinstance(value, ArrayValue):
+        return "[" + ", ".join(display(item, True) for item in value.items) + "]"
     if isinstance(value, Value):
         ctor = value.constructor
         name = ctor.path.rsplit("::", 1)[-1]
@@ -2774,7 +4025,8 @@ class Interpreter:
             if param.text != "_"
         }
         previous = self.type_arguments
-        self.type_arguments = {p: substitute(t, previous) for p, t in (arguments or {}).items()}
+        self.type_arguments = {p: self.program.normalize(substitute(t, previous))
+                               for p, t in (arguments or {}).items()}
         try:
             return self.eval(function.body, Scope(bindings=bindings))
         except Return as signal:
@@ -2784,7 +4036,10 @@ class Interpreter:
 
     def default_value(self, annotation):
         if annotation in PRIMITIVES:
-            return {"i32": 0, "bool": False, "&str": "", "()": None}[annotation]
+            return {"i32": 0, "usize": 0, "bool": False, "&str": "", "()": None}[annotation]
+        if isinstance(annotation, ArrayType):
+            return ArrayValue(tuple(self.default_value(annotation.element)
+                                    for _ in range(annotation.length.value)))
         constructors = self.program.layout(annotation)[1]
         name = annotation.name if isinstance(annotation, AppliedType) else annotation
         path = self.program.default_variants.get(name)
@@ -2794,6 +4049,12 @@ class Interpreter:
     def compare(self, left, right):
         if isinstance(left, Address):
             return self.compare(left.read(), right.read())
+        if isinstance(left, ArrayValue):
+            for a, b in zip(left.items, right.items):
+                result = self.compare(a, b)
+                if result:
+                    return result
+            return len(left.items) - len(right.items)
         if isinstance(left, Value):
             if left.constructor.path != right.constructor.path:
                 variants = self.program.layout(left.constructor.annotation)[1]
@@ -2809,7 +4070,7 @@ class Interpreter:
         return (left > right) - (left < right)
 
     def runtime_constructor(self, expr, template):
-        annotation = substitute(self.program.expr_types[id(expr)], self.type_arguments)
+        annotation = self.program.normalize(substitute(self.program.expr_types[id(expr)], self.type_arguments))
         layout = self.program.layout(annotation)
         if layout:
             return next(ctor for ctor in layout[1] if ctor.path == template.path)
@@ -2826,15 +4087,38 @@ class Interpreter:
         if expr.kind == "field":
             base, name = expr.args
             return self.address(base, scope).child(name)
+        if expr.kind == "index":
+            base, index = expr.args
+            root = self.address(base, scope)
+            offset = self.eval(index, scope)
+            return root.child(replace(expr.token, text=str(offset)))
         return Address(Binding(self.eval(expr, scope), True))
 
     def eval(self, expr, scope):
         kind, token, args = expr.kind, expr.token, expr.args
         if kind == "literal":
             return args[1]
+        if kind == "const_value":
+            return substitute(args[0], self.type_arguments).value
+        if kind == "array":
+            return ArrayValue(tuple(self.eval(item, scope) for item in args))
+        if kind == "array_repeat":
+            value, length = args
+            item = self.eval(value, scope)
+            count = substitute(length, self.type_arguments).value
+            if count > 1_000_000:
+                raise token.error("array exceeds interpreter allocation limit")
+            return ArrayValue((item,) * count)
+        if kind == "index":
+            base, index = args
+            value = self.eval(base, scope)
+            offset = self.eval(index, scope)
+            return value.at(replace(token, text=str(offset)))
+        if kind == "length":
+            return len(self.eval(args[0], scope).items)
         if kind == "default":
             annotation = self.program.expr_types[id(expr)]
-            return self.default_value(substitute(annotation, self.type_arguments))
+            return self.default_value(self.program.normalize(substitute(annotation, self.type_arguments)))
         if kind == "group":
             return self.eval(args[0], scope)
         if kind == "borrow":
@@ -2950,13 +4234,15 @@ class Interpreter:
             value = self.eval(args[0], scope)
             if token.text == "-":
                 return checked(-value, token)
+            if self.program.expr_types[id(expr)] == "usize":
+                return (USIZE_LIMIT - 1) ^ value
             return not value if isinstance(value, bool) else ~value
         if kind == "assign":
             left, right = args
             value = self.eval(right, scope)
             address = self.address(left, scope)
             if token.text != "=":
-                value = binary(token.text[0], address.read(), value, token)
+                value = binary(token.text[0], address.read(), value, token, self.program.expr_types[id(left)])
             address.write(value)
             return None
         if kind == "binary":
@@ -2969,14 +4255,27 @@ class Interpreter:
             if token.text in COMPARE:
                 other = self.eval(right, scope)
                 return COMPARE[token.text](self.compare(value, other), 0)
-            return binary(token.text, value, self.eval(right, scope), token)
+            return binary(token.text, value, self.eval(right, scope), token, self.program.expr_types[id(expr)])
         if kind == "call":
             values = tuple(self.eval(arg, scope) for arg in args)
             ctor = self.program.constructors.get(token.text)
             if ctor and ctor.style == "tuple":
                 return Value(self.runtime_constructor(expr, ctor), values)
             _, arguments = self.program.call_types[id(expr)]
-            return self.call(token.text, values, arguments)
+            function = self.program.call_functions[id(expr)]
+            dispatch = self.program.dispatches.get(id(expr))
+            if dispatch:
+                trait, receiver, name = dispatch
+                receiver = self.program.normalize(substitute(receiver, self.type_arguments))
+                impl, specialized = self.program.implementation(receiver, trait)
+                if name in impl.methods:
+                    prototype = function
+                    function = impl.methods[name]
+                    arguments = specialized | {actual: arguments[declared] for declared, actual in
+                                               zip(prototype.method_parameters, function.method_parameters)}
+                else:
+                    arguments = arguments | {self.program.traits[trait].self_type: receiver}
+            return self.call(function.name.text, values, arguments)
         if kind == "print":
             if not args:
                 print(file=self.stdout)
@@ -3013,7 +4312,9 @@ fn main() {
 
 
 def run(source, stdout=None):
-    program = Parser(source).parse()
+    trees, end = token_trees(lex(source))
+    expanded = MacroExpander().expand(trees)
+    program = Parser("", tokens=(*flatten_trees(expanded), end)).parse()
     Checker(program).check()
     Ownership(program).check()
     Interpreter(program, sys.stdout if stdout is None else stdout).call("main", ())

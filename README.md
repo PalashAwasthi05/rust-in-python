@@ -42,6 +42,9 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments
 - Built-in trait bounds for copying, cloning, formatting, comparing, and constructing defaults
+- User-defined traits, supertraits, inherent and trait `impl` blocks, default methods, and associated items
+- Const generic parameters and fixed-size arrays with length inference, indexing, and repeat literals
+- Declarative `macro_rules!` with multiple arms, fragment captures, and repetitions
 - Checked `i32` arithmetic, `bool`, string literals, and `()`
 - `println!` with display, debug, and named placeholders
 
@@ -147,10 +150,38 @@ fn main() {
 
 The first call infers the type argument from `7`. The second specifies `bool` explicitly. The program prints `Found 7` and `Still looking`.
 
+## Count something
+
+```rust
+trait Count {
+    const LENGTH: usize;
+    fn count(&self) -> usize { Self::LENGTH }
+}
+
+struct Batch<T, const N: usize>([T; N]);
+
+impl<T, const N: usize> Count for Batch<T, N> {
+    const LENGTH: usize = N;
+}
+
+macro_rules! batch {
+    ($($item:expr),+ $(,)?) => { Batch([$($item),+]) };
+}
+
+fn main() {
+    let batch = batch!(10, 20, 30,);
+    println!("{}", batch.count());
+}
+```
+
+The array length infers the const argument `N`. The trait's default method reads the implementation's associated constant and prints `3`.
+
 ## Scope
 
 This is a tree-walking interpreter for a Rust subset. The move checker tracks record and tuple-struct fields separately and treats enum payloads as a single storage location.
 
 Function signatures can tie reference returns to input lifetimes. At calls the borrow checker uses those declared input regions, including bounds between lifetimes. Reference reassignment, reference fields, reference binding patterns, nested references, and lifetime support for string-slice signatures remain incomplete.
 
-Generic bodies are checked against their declared trait bounds. Const generics, general reference types as type arguments, associated types, user-defined traits, modules, general macros, the standard library, Cargo integration, and native code generation are still open.
+Generic bodies are checked against their declared trait bounds. Const parameters support `i32`, 64-bit `usize`, and `bool`. Type-level expressions cover standalone parameters and basic constant expressions. Trait support covers static dispatch, methods, and non-reference associated types. Declarative macros support selected fragments and local-name hygiene. Trait objects, specialization, generic associated types, full macro hygiene, and procedural macros remain open.
+
+General reference types as type arguments, modules, the standard library, Cargo integration, and native code generation are also incomplete.
