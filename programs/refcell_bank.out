@@ -1,0 +1,14 @@
+0
+rc count alice: 2
+100 -> 101 : 200 ok
+101 -> 102 : 400 failed (bob has only 320)
+101 -> 102 : 300 ok
+102 -> 102 : 1 failed (same account)
+100 -> 999 : 5 failed (no account 999)
+100 alice    330  ["open 500", "sent 200 to bob", "interest 30"]
+101 bob       22  ["open 120", "got 200 from alice", "sent 300 to carol", "interest 2"]
+102 carol    385  ["open 0", "got 300 from bob", "interest 35"]
+total 737
+alice via handle: 330
+try_borrow_mut free=true while borrowed=true
+after bank dropped, rc count alice: 1

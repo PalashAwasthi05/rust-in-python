@@ -1131,6 +1131,9 @@ LAZY = MODULE_SEPARATOR.join(("std", "iter", "Lazy"))
 PATTERN = MODULE_SEPARATOR.join(("std", "str", "Pattern"))
 CONVERT_FROM = MODULE_SEPARATOR.join(("std", "convert", "From"))
 DEREF = MODULE_SEPARATOR.join(("std", "ops", "Deref"))
+DEREF_MUT = MODULE_SEPARATOR.join(("std", "ops", "DerefMut"))
+GUARD_TYPES = {MODULE_SEPARATOR.join(("std", "cell", "RefMut"))}
+GUARDS = GUARD_TYPES | {MODULE_SEPARATOR.join(("std", "cell", "Ref"))}
 DROP = MODULE_SEPARATOR.join(("std", "ops", "Drop"))
 RC = MODULE_SEPARATOR.join(("std", "rc", "Rc"))
 WEAK = MODULE_SEPARATOR.join(("std", "rc", "Weak"))
@@ -8428,6 +8431,12 @@ class Checker:
             original = Expr("deref", original.token, (original, False))
             actual = self.type_of(original, scope)
             expr.args = (original, *rest)
+        guard = actual.inner if isinstance(actual, ReferenceType) else actual
+        if isinstance(self.resolve(guard), AppliedType) and self.resolve(guard).name in GUARDS and name not in {"fmt"}:
+            # Ref and RefMut have no methods of their own; calls go to the borrowed value.
+            target, _ = self.deref_call(original, actual, scope, expr.token)
+            expr.args = (target, *rest)
+            return self.method_type(expr, scope, expected)
         if actual == NEVER:
             expr.kind, expr.args = "group", (original,)
             return NEVER
@@ -9182,6 +9191,12 @@ class Checker:
         call = Expr("method", replace(token, text="deref"), (value,))
         bindings = self.trait_bindings(trait, base, call)
         reference = self.resolve(self.receiver_call(call, scope, None, trait.methods["deref"], bindings, actual))
+        if isinstance(base, AppliedType) and base.name in GUARD_TYPES:
+            # RefMut holds the cell's exclusive borrow, so it hands out &mut as DerefMut would.
+            reference = replace(reference, mutable=True)
+            function = self.program.call_functions.get(id(call))
+            if function is not None:
+                self.program.call_functions[id(call)] = replace(function, result=reference, return_inputs=())
         self.program.expr_types[id(call)] = reference
         target = Expr("deref", token, (call, False))
         self.program.expr_types[id(target)] = reference.inner
@@ -12067,6 +12082,11 @@ class Interpreter:
                 annotation = self.program.normalize(substitute(field.annotation, self.type_arguments))
                 rendered.append(format_value(item, annotation, replace(spec, **adjustments)))
             rendered = "".join(rendered)
+            if self.track_drops:
+                # Format arguments are borrowed; temporaries among them, like a RefCell guard, drop here.
+                for value_expr, value in zip(values, evaluated):
+                    if ungroup(value_expr).kind not in {"name", "field", "index", "deref", "literal", "borrow"}:
+                        self.drop_value(value)
             if kind == "panic":
                 raise RustPanic(rendered)
             if kind == "format":
@@ -14491,6 +14511,11 @@ def rust_from_utf8(interpreter, result, data):
 @intrinsic
 def rust_box_unsized(interpreter, result, value):
     return BoxValue(Address(Binding(value, True)), result.arguments[0])
+
+
+@intrinsic
+def rust_track_drops(interpreter, result):
+    interpreter.track_drops = True
 
 
 def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):

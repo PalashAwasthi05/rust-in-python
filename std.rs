@@ -8,7 +8,7 @@ pub mod prelude {
     pub use crate::cmp::{Ordering, PartialEq, Eq, PartialOrd, Ord};
     pub use crate::mem::drop;
     pub use crate::convert::{From, Into, TryFrom, TryInto, AsRef, AsMut};
-    pub use crate::ops::{Drop, Fn, FnMut, FnOnce};
+    pub use crate::ops::{Drop, Fn, FnMut, FnOnce, Deref, DerefMut};
     pub use crate::clone::Clone;
     pub use crate::default::Default;
     pub use crate::marker::Copy;
@@ -86,6 +86,7 @@ pub mod intrinsics {
     pub fn lazy_elements<C, R>(items: C) -> R;
     pub fn duration_debug(nanos: u128, f: &mut crate::fmt::Formatter) -> crate::fmt::Result;
     pub fn hash_value<T>(value: &T) -> u64;
+    pub fn track_drops();
     pub fn box_unsized<T, U: ?Sized>(value: T) -> Box<U>;
     pub fn pad_text(text: &str, width: Option<usize>, precision: Option<usize>, fill: char, align: u8) -> String;
     pub fn clock_nanos() -> u128;
@@ -2200,17 +2201,82 @@ pub mod sync {
 pub mod cell {
     use crate::fmt;
 
-    #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-    pub struct RefCell<T> { value: T }
+    // `borrow` counts shared borrows above zero and marks a mutable borrow with -1.
+    pub struct RefCell<T> { value: T, borrow: Cell<isize> }
+
+    pub struct Ref<'b, T> { value: &'b T, borrow: &'b Cell<isize> }
+    pub struct RefMut<'b, T> { value: &'b mut T, borrow: &'b Cell<isize> }
+
+    impl<'b, T> crate::ops::Deref for Ref<'b, T> {
+        type Target = T;
+        fn deref(&self) -> &T { self.value }
+    }
+    impl<'b, T> Drop for Ref<'b, T> {
+        fn drop(&mut self) { self.borrow.set(self.borrow.get() - 1); }
+    }
+    impl<'b, T> crate::ops::Deref for RefMut<'b, T> {
+        type Target = T;
+        fn deref(&self) -> &T { &*self.value }
+    }
+    impl<'b, T> crate::ops::DerefMut for RefMut<'b, T> {
+        fn deref_mut(&mut self) -> &mut T { &mut *self.value }
+    }
+    impl<'b, T> Drop for RefMut<'b, T> {
+        fn drop(&mut self) { self.borrow.set(0); }
+    }
+    impl<'b, T: fmt::Display> fmt::Display for Ref<'b, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(self.value, f) }
+    }
+    impl<'b, T: fmt::Debug> fmt::Debug for Ref<'b, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(self.value, f) }
+    }
+    impl<'b, T: fmt::Display> fmt::Display for RefMut<'b, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&*self.value, f) }
+    }
+    impl<'b, T: fmt::Debug> fmt::Debug for RefMut<'b, T> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Debug::fmt(&*self.value, f) }
+    }
+
+    impl<T: Clone> Clone for RefCell<T> {
+        fn clone(&self) -> RefCell<T> { RefCell::new(self.borrow().clone()) }
+    }
+    impl<T: Default> Default for RefCell<T> {
+        fn default() -> RefCell<T> { RefCell::new(T::default()) }
+    }
+    impl<T: PartialEq> PartialEq for RefCell<T> {
+        fn eq(&self, other: &RefCell<T>) -> bool { *self.borrow() == *other.borrow() }
+    }
     #[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
     pub struct Cell<T> { value: T }
 
     impl<T> RefCell<T> {
-        pub fn new(value: T) -> RefCell<T> { RefCell { value: value } }
-        pub fn borrow(&self) -> &T { crate::intrinsics::refcell_value(self) }
-        pub fn borrow_mut(&self) -> &mut T { crate::intrinsics::refcell_value(self) }
-        pub fn try_borrow(&self) -> Result<&T, BorrowError> { Ok(crate::intrinsics::refcell_value(self)) }
-        pub fn try_borrow_mut(&self) -> Result<&mut T, BorrowMutError> { Ok(crate::intrinsics::refcell_value(self)) }
+        pub fn new(value: T) -> RefCell<T> {
+            crate::intrinsics::track_drops();
+            RefCell { value: value, borrow: Cell::new(0) }
+        }
+        pub fn borrow(&self) -> Ref<'_, T> {
+            match self.try_borrow() {
+                Ok(guard) => guard,
+                Err(_) => panic!("already mutably borrowed: BorrowError"),
+            }
+        }
+        pub fn borrow_mut(&self) -> RefMut<'_, T> {
+            match self.try_borrow_mut() {
+                Ok(guard) => guard,
+                Err(_) => panic!("already borrowed: BorrowMutError"),
+            }
+        }
+        pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
+            let state = self.borrow.get();
+            if state < 0 { return Err(BorrowError); }
+            self.borrow.set(state + 1);
+            Ok(Ref { value: &*crate::intrinsics::refcell_value(self), borrow: &self.borrow })
+        }
+        pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
+            if self.borrow.get() != 0 { return Err(BorrowMutError); }
+            self.borrow.set(-1);
+            Ok(RefMut { value: crate::intrinsics::refcell_value(self), borrow: &self.borrow })
+        }
         pub fn get_mut(&mut self) -> &mut T { &mut self.value }
         pub fn into_inner(self) -> T { self.value }
         pub fn replace(&self, value: T) -> T { crate::mem::replace(crate::intrinsics::refcell_value(self), value) }
