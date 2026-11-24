@@ -1,0 +1,10 @@
+0
+ approve -> draft        content=""
+  review -> pending(0)   content=""
+ approve -> pending(1)   content=""
+  reject -> draft        content=""
+  review -> pending(0)   content=""
+ approve -> pending(1)   content=""
+ approve -> published    content="I ate a salad for lunch today"
+  reject -> published    content="I ate a salad for lunch today"
+["draft", "published", "published"]

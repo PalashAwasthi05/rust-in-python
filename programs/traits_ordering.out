@@ -1,0 +1,22 @@
+0
+2 of Spades
+10 of Clubs
+10 of Hearts
+14 of Diamonds
+max = Card { rank: 14, suit: Diamonds }
+true
+eng 120 Bob
+eng 100 Cat
+eng 100 Zed
+ops 90 Amy
+[Score(9.75), Score(3.0), Score(2.5), Score(-1.0)]
+None
+{Version(0, 9, 9), Version(1, 2, 3), Version(1, 10, 0)}
+Greater
+Version(1, 0, 1)
+newest Version(1, 10, 0)
+["fig", "pear", "kiwi", "apple", "banana"]
+Less
+Greater
+Version(2, 0, 0)
+[("Bob", 120), ("Cat", 100), ("Zed", 100), ("Amy", 90)]

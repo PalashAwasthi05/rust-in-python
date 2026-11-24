@@ -1,0 +1,11 @@
+0
+(4, -2) (-2, 6) Point { x: 3, y: 6 }
+dot -5
+sum (8, 3)
+centroid 2.848
+len 5
+(14, 8)
+Point { x: 1.5, y: 2.25 }
+9 1.5 'x'
+(3, 9) eq=true
+(a, b) Point { x: 0, y: 0 }

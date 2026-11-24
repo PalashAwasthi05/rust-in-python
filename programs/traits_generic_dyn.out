@@ -1,0 +1,11 @@
+0
+Key('h') -> 3 still listening
+Click(1, 2) -> 3 still listening
+Key('i') -> 3 still listening
+Click(5, 5) -> 3 still listening
+Quit -> 2 still listening
+[("click", 2), ("key", 2), ("quit", 1)]
+typed "hi"
+first 2: [Key('h'), Click(1, 2)]
+first 3: [10, 20, 30]
+first 1: ["a"]
