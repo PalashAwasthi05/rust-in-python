@@ -14,6 +14,23 @@ from rust_in_python import DEMO, RustError, run
 
 
 VALID = [
+    ("numeric local types inferred from later uses", """
+        fn byte(value: u8) -> u8 { value }
+        fn signed(value: i8) -> i8 { value }
+        fn narrow(value: f32) -> f32 { value }
+        fn main() {
+            let mut item = 197;
+            item += 3;
+            let lower = -128;
+            let magnitude = 2.25;
+            let width = 5;
+            let twice = byte(item + (item / 2 - 100));
+            let signed = signed(lower);
+            let float = narrow(-magnitude);
+            let cast = 4.75;
+            println!("[{twice:>width$}] {signed} {float} {}", cast as u8);
+        }
+    """, "[  200] -128 -2.25 4\n"),
     ("conditional constant functions evaluate only the selected branch", """
         #![feature(generic_const_exprs)]
         const fn width(n: usize) -> usize { if n == 0 { 1 } else { 8 / n } }
@@ -50,7 +67,7 @@ VALID = [
         const fn alternate(n: u8) -> u8 { let mask: u8 = 3; n ^ mask }
         fn main() {
             let row: Grid = [alternate(4); width(2)];
-            let n: usize = 5;
+            let n = 5;
             println!("{} {} {} {}", SIZE, row.len(), row[0], width(n));
         }
     """, "7 5 7 11\n"),
@@ -1788,6 +1805,10 @@ VALID = [
 ]
 
 INVALID = [
+    ("range checking uses the inferred literal width", """
+        fn byte(_: u8) {}
+        fn main() { let value = 256; byte(value); }
+    """, "u8 arithmetic overflow"),
     ("a selected constant branch reports arithmetic failure", """
         const fn quotient(n: usize) -> usize { if n == 4 { 2 } else { 8 / n } }
         const QUOTIENT: usize = quotient(0);

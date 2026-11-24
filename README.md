@@ -61,7 +61,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Inline and file-backed modules, grouped and glob imports, re-exports, and module visibility
 - Prelude `Option` and `Result`, `?` propagation, and selected assertion and matching macros
 - Function pointers, indirect calls, and closures with shared, mutable, and explicit move captures, including references
-- Signed and unsigned integer widths, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
+- Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
 - Owned `String` values with concatenation and UTF-8-aware lengths and mutation
 - Borrowed strings with lifetime checking, UTF-8 substring views, and `chars` and `bytes` iterators
 - Bitwise operators, checked shift counts, and integer casts in const expressions

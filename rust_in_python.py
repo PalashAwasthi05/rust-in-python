@@ -3932,9 +3932,10 @@ class Checker:
         self.obligations = []
         self.generic_arguments = []
         self.numeric_operands = []
-        self.unary_results = []
-        self.array_integers = []
+        self.unary_operands = []
+        self.integer_literals = []
         self.float_literals = []
+        self.scalar_casts = []
         self.iterator_results = []
         self.parameters = {}
         self.ascriptions = []
@@ -4272,7 +4273,7 @@ class Checker:
         return annotation
 
     def finish_inference(self):
-        for annotation, value, token in self.array_integers:
+        for annotation, value, token in self.integer_literals:
             resolved = self.resolve(annotation)
             if isinstance(resolved, TypeVariable):
                 self.require(resolved, "i32", token)
@@ -4288,12 +4289,18 @@ class Checker:
             if resolved not in FLOAT_TYPES:
                 raise token.error(f"expected a float, found {resolved}")
             float_literal_value(value, resolved, token)
-        for operand, result, token in self.unary_results:
+        for operand, token in self.unary_operands:
             operand = self.resolve(operand)
             if not isinstance(operand, TypeVariable):
-                if operand != "bool" and operand not in INTEGER_TYPES:
+                if token.text == "-":
+                    if not (operand in FLOAT_TYPES or (operand in INTEGER_TYPES and INTEGER_BOUNDS[operand][0] < 0)):
+                        raise token.error(f"cannot negate {operand} with '-'")
+                elif operand != "bool" and operand not in INTEGER_TYPES:
                     raise token.error(f"cannot negate {operand} with '!'")
-                self.require(result, operand, token)
+        for actual, target, token in self.scalar_casts:
+            source = self.resolve(actual)
+            if not scalar_cast_supported(source, target):
+                raise token.error(f"cannot cast {source} to {target}")
         for name, item, result, token in self.iterator_results:
             self.check_iterator_result(name, self.resolve(item), self.resolve(result), token)
         for variable in self.variables:
@@ -5019,7 +5026,9 @@ class Checker:
                 if actual == NEVER:
                     expr.kind, expr.args = "group", (value,)
                     return NEVER
-                if not scalar_cast_supported(actual, target):
+                if isinstance(actual, TypeVariable):
+                    self.scalar_casts.append((actual, target, token))
+                elif not scalar_cast_supported(actual, target):
                     raise token.error(f"cannot cast {actual} to {target}")
                 expr.kind = "scalar_cast"
                 return target
@@ -5040,7 +5049,7 @@ class Checker:
             if expr.unsuffixed and hint in INTEGER_TYPES:
                 annotation = hint
             elif expr.unsuffixed and isinstance(hint, TypeVariable) and hint.integer_literal:
-                self.array_integers.append((hint, value, token))
+                self.integer_literals.append((hint, value, token))
                 return hint
             if annotation in INTEGER_TYPES:
                 checked(value, token, annotation)
@@ -5190,7 +5199,20 @@ class Checker:
             if annotation is not None:
                 annotation = self.fill_holes(annotation, token)
                 self.check_type(annotation, token)
-            actual = self.type_of(value, scope, annotation) if value else annotation
+            hint = annotation
+            if annotation is None and value is not None:
+                literal = ungroup(value)
+                signed = literal.kind == "unary" and literal.token.text == "-"
+                number = ungroup(literal.args[0]) if signed else literal
+                if number.kind == "literal" and number.unsuffixed and number.args[0] in NUMBER_TYPES:
+                    floating = number.args[0] in FLOAT_TYPES
+                    hint = TypeVariable("float literal" if floating else "integer literal", number.token,
+                                        integer_literal=not floating, float_literal=floating)
+                    self.variables.append(hint)
+                    if signed:
+                        literal.kind, literal.args = "literal", (number.args[0], -number.args[1])
+                        literal.unsuffixed = True
+            actual = self.type_of(value, scope, hint) if value else annotation
             if annotation:
                 self.require_argument(actual, annotation, token)
                 expr.args = (source, annotation, value, otherwise)
@@ -5276,11 +5298,9 @@ class Checker:
                 if token.text == "-" and INTEGER_BOUNDS[actual][0] == 0:
                     raise token.error(f"cannot negate {actual} with '-'")
                 return actual
-            if token.text == "!" and isinstance(actual, TypeVariable):
-                result = TypeVariable("operator result", token)
-                self.variables.append(result)
-                self.unary_results.append((actual, result, token))
-                return result
+            if isinstance(actual, TypeVariable):
+                self.unary_operands.append((actual, token))
+                return actual
             self.numeric_operands.append((actual, "i32", token))
             return "i32"
         if kind == "assign":
@@ -6046,6 +6066,14 @@ class Checker:
             self.require(left, "bool", token)
             self.require(right, "bool", token)
             return NEVER if NEVER in {left, right} else "bool"
+        variable = next((kind for kind in (left, right)
+                         if isinstance(kind, TypeVariable) and (kind.integer_literal or kind.float_literal)), None)
+        if variable is not None:
+            if variable.float_literal and word not in FLOAT_OPERATORS:
+                raise token.error(f"cannot apply {word!r} to a float")
+            self.require(left, variable, token)
+            self.require(right, variable, token)
+            return NEVER if NEVER in {left, right} else self.resolve(variable)
         integer = self.integer_pair(left, right)
         self.numeric_operands.extend(((left, integer, token), (right, integer, token)))
         return NEVER if NEVER in {left, right} else integer
