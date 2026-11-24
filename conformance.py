@@ -1,9 +1,11 @@
 """Compare executable Rust crate roots against rustc and the interpreter."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -91,8 +93,10 @@ def main(argv=None):
         compiler = invoke([rustc, "--version", "--verbose"], args.timeout, directory=Path.cwd())
         if not compiler.succeeded:
             parser.error("could not identify the reference compiler")
-        cases = [compare(source, rustc=rustc, edition=args.edition, timeout=args.timeout)
-                 for source in sources]
+        # Cases are independent subprocess pairs, so they run concurrently; the report keeps argument order.
+        with ThreadPoolExecutor(max_workers=min(len(sources), os.cpu_count() or 1, 8)) as pool:
+            cases = list(pool.map(lambda source: compare(source, rustc=rustc, edition=args.edition,
+                                                         timeout=args.timeout), sources))
     except OSError as error:
         parser.error(str(error))
     if args.json:

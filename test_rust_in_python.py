@@ -1,5 +1,6 @@
 """Regression cases that also run against rustc when it is installed."""
 
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import redirect_stderr
 from io import StringIO
 import json
@@ -3318,6 +3319,31 @@ INVALID = [
 ]
 
 
+WORKERS = min(os.cpu_count() or 1, 8)
+
+
+def interpret(source, source_path=None):
+    """Run one program: its exit status (or the exception it raised) and its output."""
+    output = StringIO()
+    try:
+        return run(source, output, source_path=source_path), output.getvalue()
+    except Exception as error:
+        return error, output.getvalue()
+
+
+def interpret_all(cases):
+    """interpret each (source, source_path) case in worker processes, since every run is CPU-bound."""
+    with ProcessPoolExecutor(max_workers=WORKERS) as pool:
+        return list(pool.map(interpret, *zip(*cases), chunksize=2))
+
+
+def outcome(result):
+    """The exit status a case returned, re-raising the exception it raised instead."""
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
 class InterpreterTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_source_location_and_file_inclusion(self):
@@ -3539,22 +3565,20 @@ class InterpreterTests(unittest.TestCase):
     def test_program_corpus(self):
         """Each programs/*.rs matches the exit status and output rustc recorded in its .out file."""
         folder = Path(__file__).with_name("programs")
-        for source in sorted(folder.glob("*.rs")):
+        sources = sorted(folder.glob("*.rs"))
+        results = interpret_all([(source.read_text(encoding="utf-8"), source) for source in sources])
+        for source, (result, output) in zip(sources, results):
             with self.subTest(program=source.name):
                 status, _, expected = source.with_suffix(".out").read_text(encoding="utf-8").partition("\n")
-                output = StringIO()
-                try:
-                    actual = run(source.read_text(encoding="utf-8"), output, source_path=source) or 0
-                except RustPanic:
-                    actual = 101
-                self.assertEqual((actual, output.getvalue()), (int(status), expected))
+                actual = 101 if isinstance(result, RustPanic) else outcome(result) or 0
+                self.assertEqual((actual, output), (int(status), expected))
 
     def test_valid_programs(self):
-        for name, source, expected in VALID:
+        results = interpret_all([(source, None) for _, source, _ in VALID])
+        for (name, _, expected), (result, output) in zip(VALID, results):
             with self.subTest(name=name):
-                output = StringIO()
-                run(source, output)
-                self.assertEqual(output.getvalue(), expected)
+                outcome(result)
+                self.assertEqual(output, expected)
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_edition_rules(self):
@@ -3645,10 +3669,11 @@ class InterpreterTests(unittest.TestCase):
                     self.assertEqual(moved["outcome"], "both_rejected")
 
     def test_invalid_programs(self):
-        for name, source, message in INVALID:
+        results = interpret_all([(source, None) for _, source, _ in INVALID])
+        for (name, _, message), (result, _) in zip(INVALID, results):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(RustError, message):
-                    run(source, StringIO())
+                    outcome(result)
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_main_termination(self):
@@ -3700,20 +3725,25 @@ class InterpreterTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_rustc_agrees(self):
-        with TemporaryDirectory() as folder:
-            source_file = Path(folder) / "case.rs"
-            binary = Path(folder) / "case"
-            for name, source, expected in VALID:
-                with self.subTest(name=name):
-                    compiled = self.compile(source_file, binary, source)
-                    self.assertEqual(compiled.returncode, 0, compiled.stderr)
-                    executed = subprocess.run([binary], capture_output=True, text=True, timeout=10)
-                    self.assertEqual(executed.returncode, 0, executed.stderr)
-                    self.assertEqual(executed.stdout, expected)
-            for name, source, _ in INVALID:
-                with self.subTest(name=name):
-                    compiled = self.compile(source_file, binary, source)
-                    self.assertNotEqual(compiled.returncode, 0)
+        def native(source, execute):
+            with TemporaryDirectory() as folder:
+                binary = Path(folder) / "case"
+                compiled = self.compile(Path(folder) / "case.rs", binary, source)
+                if not execute or compiled.returncode != 0:
+                    return compiled, None
+                return compiled, subprocess.run([binary], capture_output=True, text=True, timeout=10)
+
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            valid = list(pool.map(native, [source for _, source, _ in VALID], [True] * len(VALID)))
+            invalid = list(pool.map(native, [source for _, source, _ in INVALID], [False] * len(INVALID)))
+        for (name, _, expected), (compiled, executed) in zip(VALID, valid):
+            with self.subTest(name=name):
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                self.assertEqual(executed.returncode, 0, executed.stderr)
+                self.assertEqual(executed.stdout, expected)
+        for (name, _, _), (compiled, _) in zip(INVALID, invalid):
+            with self.subTest(name=name):
+                self.assertNotEqual(compiled.returncode, 0)
 
     @staticmethod
     def compile(source_file, binary, source):
