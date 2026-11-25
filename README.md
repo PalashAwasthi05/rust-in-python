@@ -76,6 +76,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Signed and unsigned integer widths, inferred numeric bindings, casts and ranges, Unicode `char`, raw strings, byte strings, `bool`, and `()`
 - Owned `String` values with concatenation and UTF-8-aware lengths and mutation
 - String searches with character and shared string patterns and UTF-8 byte offsets
+- Slice searches, prefix and suffix checks, reversal, and swapping on arrays, vectors, and borrowed views
 - Borrowed strings with lifetime checking, UTF-8 substring views, and `chars` and `bytes` iterators
 - Bitwise operators, checked shift counts, and integer casts in const expressions
 - `f32` and `f64` arithmetic, comparisons, casts, and selected float methods

@@ -16,6 +16,17 @@ from rust_in_python import DEMO, RustError, RustPanic, run
 
 
 VALID = [
+    ("arrays vectors and slice views support search and in-place reordering", """
+        fn main() {
+            let mut a = [0, 1, 2, 3];
+            a[1..3].reverse();
+            a.swap(0, 3);
+            let mut b = vec![5, 6, 7];
+            b.reverse();
+            println!("{a:?} {b:?} {} {} {} {}", a.contains(&2), a.starts_with(&[3, 2]),
+                     a.ends_with(&[0]), a.ends_with(&[5]));
+        }
+    """, "[3, 2, 1, 0] [7, 6, 5] true true true false\n"),
     ("reference reassignment preserves earlier reborrows and then permits deferred initialization", """
         fn main() {
             let mut x = 1;
