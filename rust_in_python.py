@@ -2392,6 +2392,8 @@ class Function:
     consumes_captures: bool = False
     const_value: object = None
     where_bounds: tuple = ()
+    # Shared reference captures whose binding the closure uses as a place, so it must borrow the binding itself.
+    reference_slots: set = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -9169,7 +9171,7 @@ class Checker:
             ) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
-                self.require(actual, annotation, token)
+                self.require_argument(actual, annotation, token)
             else:
                 if operator != "+" or annotation != STRING:
                     while isinstance(actual, ReferenceType) and self.numeric_like(actual.inner):
@@ -11039,6 +11041,8 @@ class MoveState:
             for item, reason in self.missing:
                 if reason.startswith("dangling:") and item.local in {place.local, place.holder,
                                                                      place.local.untraced_holder}:
+                    if reason == "dangling:<temporary value>":
+                        raise token.error("temporary value dropped while borrowed")
                     raise token.error(f"borrowed value {reason.removeprefix('dangling:')!r} does not live "
                                       f"long enough (still used through {item.name!r})")
         if kind == "return_reference":
@@ -11118,6 +11122,7 @@ class Ownership:
             self.return_roots = set()
             self.function = function
             self.owned_captures = set()
+            self.reference_captures = set()
             for capture in function.captures:
                 loan = None
                 annotation = capture.annotation
@@ -11130,6 +11135,10 @@ class Ownership:
                 local = Local(capture.name, capture.mutable, loan, shared_capture=not capture.by_move)
                 if capture.by_move:
                     self.owned_captures.add(local)
+                elif isinstance(annotation, ReferenceType):
+                    self.reference_captures.add(local)
+                    if self.program.edition < "2021":
+                        function.reference_slots.add(capture.name.key)
                 scope.bindings[capture.name.key] = local
                 cursor = self.emit(cursor, "declare", Place(local), capture.name)
             for index, (token, mutable, annotation) in enumerate(function.params):
@@ -11282,7 +11291,9 @@ class Ownership:
         if expr.kind == "name":
             ctor = self.program.constructors.get(expr.token.text)
             if not ctor or ctor.style != "unit":
-                return cursor, Place(scope.find(expr.token))
+                local = scope.find(expr.token)
+                self.note_reference_slot(local)
+                return cursor, Place(local)
         if expr.kind == "field":
             base, name = expr.args
             cursor, place = self.lower_address(base, scope, cursor)
@@ -11308,6 +11319,10 @@ class Ownership:
 
     def annotation(self, expr):
         return self.program.expr_types[id(expr)]
+
+    def note_reference_slot(self, local):
+        if local in self.reference_captures:
+            self.function.reference_slots.add(local.token.key)
 
     def access(self, cursor, place, annotation, token, *, consume):
         if consume and not self.program.is_copy(annotation):
@@ -11407,6 +11422,7 @@ class Ownership:
             return self.static_loan(self.lower(expr, scope, cursor, consume=False), expr.token,
                                     isinstance(annotation, ReferenceType) and annotation.mutable)
         holder = scope.find(expr.token)
+        self.note_reference_slot(holder)
         if reborrow:
             return self.start_loan(cursor, self.referent(holder), reborrow.mutable, expr.token,
                                    two_phase=two_phase)
@@ -11555,6 +11571,7 @@ class Ownership:
                     cursor, loan = self.lower_reference(reference, scope, cursor)
                 else:
                     holder = scope.find(reference.token)
+                    self.note_reference_slot(holder)
                     cursor, loan = self.start_loan(cursor, self.referent(holder), False, reference.token)
             else:
                 cursor, place = self.lower_address(value, scope, cursor)
@@ -11573,6 +11590,7 @@ class Ownership:
             for name in arguments:
                 if isinstance(name, str):
                     local = scope.find(replace(template.token, text=name))
+                    self.note_reference_slot(local)
                     place = self.referent(local) if local.loan else Place(local)
                     cursor, loan = self.start_loan(cursor, place, False, token)
                     cursor, holder = self.keep_loan(cursor, loan, token)
@@ -11804,6 +11822,9 @@ class Ownership:
             cursor = self.emit(cursor, action, target_place, token)
             if origins and not target_place.fields and not target_place.holder:
                 cursor = self.emit(cursor, "points_to", target_place, token, roots=frozenset(origins))
+                for origin in origins:
+                    if origin.temporary or origin.token.text == "<temporary value>":
+                        cursor = self.emit(cursor, "storage_dead", Place(origin), token)
             return self.emit(cursor, "read", argument, right.token) if argument else cursor
         if kind == "binary":
             if token.text in COMPARE and self.annotation(args[0]) not in CONST_TYPES:
@@ -11845,7 +11866,13 @@ class Ownership:
         if right.kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, loan = self.lower_call(right, scope, cursor)
             return cursor, loan and [origin.local for origin in loan.regions()]
-        cursor = self.lower(right, scope, cursor)
+        if right.kind == "borrow":
+            cursor, loan = self.lower_reference(right, scope, cursor)
+            if loan and loan.expiring:
+                # Assignment does not extend a temporary's lifetime: the reference dangles once it ends.
+                return cursor, list(loan.expiring)
+        else:
+            cursor = self.lower(right, scope, cursor)
         if right.kind == "name":
             try:
                 local = scope.find(right.token)
@@ -11890,6 +11917,10 @@ class Ownership:
                 if local.loan:
                     leases.append(local.loan)
             elif isinstance(capture.annotation, ReferenceType):
+                if capture.name.key in function.reference_slots:
+                    self.note_reference_slot(local)
+                    cursor, slot = self.start_loan(cursor, place, False, capture.name)
+                    leases.append(slot)
                 cursor, lease = self.start_loan(cursor, self.referent(local), capture.mutable, capture.name)
                 leases.append(lease)
             else:
@@ -13909,11 +13940,18 @@ class Interpreter:
         if kind in {"function_pointer", "closure_value"}:
             name, arguments = args
             environment = {}
-            for capture in self.program.functions[name].captures:
+            function = self.program.functions[name]
+            for capture in function.captures:
                 binding = scope.find(capture.name)
                 if capture.by_move and capture.whole and self.track_drops and self.has_drop_glue(binding.value):
                     binding.moved = True
-                environment[capture.name.key] = Binding(binding.value, capture.mutable) if capture.by_move else binding
+                # A closure that only reaches through a shared reference capture keeps the place it pointed to
+                # when it was created, even if the binding is later reassigned.
+                snapshot = (isinstance(capture.annotation, ReferenceType)
+                            and capture.name.key not in function.reference_slots)
+                environment[capture.name.key] = (
+                    Binding(binding.value, capture.mutable) if capture.by_move or snapshot else binding
+                )
                 if (capture.by_move and capture.whole and self.track_drops and not binding.moved and not self.program.is_copy(
                         self.program.normalize(substitute(capture.annotation, self.type_arguments)))):
                     # The closure owns what it captured by value and drops it when it is dropped.

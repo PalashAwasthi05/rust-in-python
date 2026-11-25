@@ -16,6 +16,33 @@ from rust_in_python import DEMO, RustError, RustPanic, run
 
 
 VALID = [
+    ("reference reassignment preserves earlier reborrows and then permits deferred initialization", """
+        fn main() {
+            let mut x = 1;
+            let mut y = 2;
+            let mut r = &mut x;
+            let earlier = &mut *r;
+            r = &mut y;
+            *earlier += 8;
+            *r += 3;
+            println!("{r}");
+            let later;
+            later = &x;
+            let shared: &i32;
+            shared = &mut y;
+            println!("{later} {shared}");
+        }
+    """, "5\n9 5\n"),
+    ("a closure capturing a dereference keeps the original place after reassignment", """
+        fn main() {
+            let mut x = 1;
+            let mut y = 2;
+            let mut r = &mut x;
+            let original = || *r;
+            r = &mut y;
+            println!("{} {}", original(), *r);
+        }
+    """, "1 2\n"),
     ("immutable static references can be stored and read from aggregates", """
         static GLOBAL: i32 = 6;
         struct Wrapper { value: &'static i32 }
@@ -2222,6 +2249,22 @@ VALID = [
 ]
 
 INVALID = [
+    ("assigning a reference does not extend a temporary's lifetime", """
+        fn main() {
+            let r: &String;
+            r = &String::from("temporary");
+            println!("{r}");
+        }
+    """, "temporary value dropped while borrowed"),
+    ("assignment conflicts with an active closure borrowing the reference binding", """
+        fn main() {
+            let x = 1;
+            let mut r = &x;
+            let print = || println!("{r}");
+            r = &7;
+            print();
+        }
+    """, "immutably borrowed"),
     ("a static reference field cannot store a borrow of a local", """
         struct Wrapper { value: &'static i32 }
         fn main() {
