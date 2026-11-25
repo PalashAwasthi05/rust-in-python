@@ -1268,8 +1268,35 @@ DROP = MODULE_SEPARATOR.join(("std", "ops", "Drop"))
 HASHER = MODULE_SEPARATOR.join(("std", "hash", "Hasher"))
 RC = MODULE_SEPARATOR.join(("std", "rc", "Rc"))
 WEAK = MODULE_SEPARATOR.join(("std", "rc", "Weak"))
-POINTER_TYPES = {BOX, RC, WEAK}
-INDIRECT_TYPES = {VEC, BOX, RC, WEAK, *(MODULE_SEPARATOR.join(("std", "collections", name)) for name in (
+ARC = MODULE_SEPARATOR.join(("std", "sync", "Arc"))
+ARC_WEAK = MODULE_SEPARATOR.join(("std", "sync", "Weak"))
+RC_TYPES = {RC, ARC}
+# Send and Sync for std types whose implementation here (single-threaded, built on Rc and RefCell) would give the
+# wrong answer structurally: each entry is False or the traits every type argument needs.
+AUTO_TRAIT_RULES = {
+    (RC, "Send"): False, (RC, "Sync"): False, (WEAK, "Send"): False, (WEAK, "Sync"): False,
+    (ARC, "Send"): ("Send", "Sync"), (ARC, "Sync"): ("Send", "Sync"),
+    (ARC_WEAK, "Send"): ("Send", "Sync"), (ARC_WEAK, "Sync"): ("Send", "Sync"),
+    ("Mutex", "Send"): ("Send",), ("Mutex", "Sync"): ("Send",),
+    ("RwLock", "Send"): ("Send",), ("RwLock", "Sync"): ("Send", "Sync"),
+    ("OnceLock", "Send"): ("Send",), ("OnceLock", "Sync"): ("Send", "Sync"),
+    ("LazyLock", "Send"): ("Send",), ("LazyLock", "Sync"): ("Send", "Sync"),
+    ("MutexGuard", "Send"): False, ("MutexGuard", "Sync"): ("Sync",),
+    ("RwLockReadGuard", "Send"): False, ("RwLockReadGuard", "Sync"): ("Sync",),
+    ("RwLockWriteGuard", "Send"): False, ("RwLockWriteGuard", "Sync"): ("Sync",),
+    ("Cell", "Send"): ("Send",), ("Cell", "Sync"): False,
+    ("RefCell", "Send"): ("Send",), ("RefCell", "Sync"): False,
+    ("OnceCell", "Send"): ("Send",), ("OnceCell", "Sync"): False,
+    ("Ref", "Send"): False, ("RefMut", "Send"): False,
+    ("Sender", "Send"): ("Send",), ("Sender", "Sync"): ("Send",),
+    ("SyncSender", "Send"): ("Send",), ("SyncSender", "Sync"): ("Send",),
+    ("Receiver", "Send"): ("Send",), ("Receiver", "Sync"): False,
+    ("LocalKey", "Send"): (), ("LocalKey", "Sync"): (),
+    ("JoinHandle", "Send"): (), ("JoinHandle", "Sync"): (),
+}
+WEAK_TYPES = {WEAK, ARC_WEAK}
+POINTER_TYPES = {BOX, *RC_TYPES, *WEAK_TYPES}
+INDIRECT_TYPES = {VEC, BOX, *RC_TYPES, *WEAK_TYPES, *(MODULE_SEPARATOR.join(("std", "collections", name)) for name in (
     "HashMap", "BTreeMap", "HashSet", "BTreeSet", "VecDeque", "BinaryHeap"))}
 MAP_TYPES = {MODULE_SEPARATOR.join(("std", "collections", name)): name
              for name in ("HashMap", "BTreeMap", "HashSet", "BTreeSet")}
@@ -3490,13 +3517,56 @@ class Program:
         arguments = dict(zip(self.type_parameters[name], annotation.arguments))
         return token, tuple(self.apply_constructor(ctor, annotation, arguments) for ctor in constructors)
 
+    def auto_trait(self, annotation, trait, seen):
+        """Whether a type is Send or Sync. Types the checker cannot see into (generic parameters, trait objects,
+        unresolved inference variables) are given the benefit of the doubt."""
+        if isinstance(annotation, ReferenceType):
+            # &T is Send when T is Sync; &mut T is Send when T is Send. Both are Sync when T is Sync.
+            needed = "Send" if annotation.mutable and trait == "Send" else "Sync"
+            return self.auto_trait(annotation.inner, needed, seen)
+        if isinstance(annotation, TupleType):
+            return all(self.auto_trait(element, trait, seen) for element in annotation.elements)
+        if isinstance(annotation, (ArrayType, SliceType)):
+            return self.auto_trait(annotation.element, trait, seen)
+        if isinstance(annotation, FunctionType):
+            function = self.functions.get(annotation.closure) if annotation.closure else None
+            if function is None:
+                return True
+            return all(self.auto_trait(capture.annotation if capture.by_move
+                                       else ReferenceType(capture.annotation, capture.mutable), trait, seen)
+                       for capture in function.captures)
+        if isinstance(annotation, AppliedType):
+            name, arguments = annotation.name, annotation.arguments
+        elif isinstance(annotation, str) and annotation in self.types:
+            name, arguments = annotation, ()
+        else:
+            return True
+        segments = name.split(MODULE_SEPARATOR)
+        if segments[0] in STD_CRATES:
+            def every(*traits):
+                return all(self.auto_trait(argument, needed, seen) for argument in arguments for needed in traits)
+            rule = AUTO_TRAIT_RULES.get((name if name in {RC, WEAK, ARC, ARC_WEAK} else segments[-1], trait))
+            if rule is None:
+                return every(trait)
+            return rule is not False and every(*rule)
+        if annotation in seen:
+            return True
+        seen.add(annotation)
+        try:
+            constructors = self.layout(annotation)[1]
+        except (RustError, KeyError, TypeError, ValueError):
+            return True
+        return all(self.auto_trait(kind, trait, seen) for ctor in constructors for _, kind in ctor.fields)
+
     @staticmethod
     def apply_constructor(ctor, annotation, arguments):
         return replace(ctor, annotation=annotation,
                        fields=tuple((name, substitute(kind, arguments)) for name, kind in ctor.fields))
 
     def implements(self, annotation, trait, assumed=(), *, seen=()):
-        if trait in {"?Sized", "Send", "Sync", "Unpin"}:
+        if trait in {"Send", "Sync"}:
+            return self.auto_trait(annotation, trait, set())
+        if trait in {"?Sized", "Unpin"}:
             return True
         if trait in BUILTIN_OPERATORS:
             primitive = annotation.inner if isinstance(annotation, ReferenceType) else annotation
@@ -3543,12 +3613,12 @@ class Program:
         if isinstance(annotation, AppliedType) and trait == "Default" and (
                 annotation.name in MAP_TYPES or annotation.name in {DEQUE, HEAP}):
             return True
-        if isinstance(annotation, AppliedType) and annotation.name in {RC, WEAK} and trait in TRAIT_MODULES:
+        if isinstance(annotation, AppliedType) and annotation.name in RC_TYPES | WEAK_TYPES and trait in TRAIT_MODULES:
             if trait == "Clone":
                 return True
             if trait in {"Copy", "Sized"}:
                 return trait == "Sized"
-            if annotation.name == WEAK:
+            if annotation.name in WEAK_TYPES:
                 return trait == "Debug"
             return self.implements(annotation.arguments[0], trait, assumed, seen=seen)
         if is_box(annotation):
@@ -6959,7 +7029,12 @@ class Checker:
             visit(expr.args)
 
         for item in self.modules.lazy_items.values():
-            if item.name.source_file == "<std>" or (item.kind == "static" and item.name.expansion_site):
+            if item.name.source_file == "<std>":
+                continue
+            # Every thread can reach a static, so its type must be Sync unless it is `static mut`.
+            if item.kind == "static" and not item.mutable and not self.implements(item.annotation, "Sync"):
+                raise item.name.error(f"`{item.annotation}` cannot be shared between threads safely")
+            if item.kind == "static" and item.name.expansion_site:
                 continue
             visit(item.expression)
 
@@ -7044,6 +7119,29 @@ class Checker:
                 for bound in parameter.bounds:
                     self.obligation(argument, bound, token)
 
+    def orphan(self, impl):
+        """Whether a trait impl breaks the orphan rule: a std trait implemented with no local type in it."""
+        definition = self.program.traits.get(impl.trait)
+        if definition is not None and definition.name.module[:1] != STD_ROOT:
+            return False
+
+        def local(kind):
+            # &T, &mut T, and Box<T> are fundamental: they are local when T is.
+            while isinstance(kind, ReferenceType) or is_box(kind):
+                kind = kind.inner if isinstance(kind, ReferenceType) else kind.arguments[0]
+            if isinstance(kind, (TypeParameter, TypeVariable)):
+                return None
+            if isinstance(kind, DynType):
+                trait = self.program.traits.get(kind.trait)
+                return trait is not None and trait.name.module[:1] != STD_ROOT
+            name = kind.name if isinstance(kind, AppliedType) else kind
+            declaration = self.program.types.get(name) if isinstance(name, str) else None
+            return declaration is not None and declaration[0].module[:1] != STD_ROOT
+
+        verdicts = [local(kind) for kind in (impl.target, *impl.trait_arguments)]
+        # Impls over bare type parameters are left alone rather than risk rejecting valid blanket impls.
+        return None not in verdicts and not any(verdicts)
+
     def check_implementations(self):
         for trait in self.program.traits.values():
             self.check_bounds((trait.self_type,), trait.name)
@@ -7077,6 +7175,9 @@ class Checker:
                 name = owner.name if isinstance(owner, AppliedType) else owner
                 if name in {OPTION, RESULT} or name not in self.program.types:
                     raise impl.token.error("Termination can only be implemented for a type defined in this crate")
+            if impl.trait is not None and impl.token.module[:1] != STD_ROOT and self.orphan(impl):
+                raise impl.token.error("only traits defined in the current crate can be implemented for types "
+                                       "defined outside of the crate")
             target_parameters = set(self.type_parts(impl.target))
             for argument in impl.trait_arguments:
                 target_parameters.update(type_leaves(argument))
@@ -7569,6 +7670,17 @@ class Checker:
             if (annotation, trait) in TYPE_BOUNDS:
                 continue
             if annotation != NEVER and not self.implements(annotation, trait):
+                if trait in {"Send", "Sync"}:
+                    verb = "sent" if trait == "Send" else "shared"
+                    if isinstance(annotation, FunctionType) and annotation.closure in self.program.functions:
+                        # Name the captured value that is not thread-safe, as rustc does.
+                        for capture in self.program.functions[annotation.closure].captures:
+                            kind = capture.annotation if capture.by_move else ReferenceType(capture.annotation,
+                                                                                            capture.mutable)
+                            if not self.implements(kind, trait):
+                                annotation = capture.annotation
+                                break
+                    raise token.error(f"`{annotation}` cannot be {verb} between threads safely")
                 raise token.error(f"{annotation} does not implement {trait}")
         for annotation, expected, token in self.numeric_operands:
             if expected is None:
@@ -9583,6 +9695,11 @@ class Checker:
             local = self.specialize(function.method_parameters, expr.type_arguments, expr.token, callables=False,
                                     requirements=False)
             arguments = arguments | local
+        # A method's where clause on its impl's parameters, like `fn sort(&mut self) where T: Ord`, binds callers.
+        for parameter, bounds, _ in function.where_bounds:
+            if parameter in arguments:
+                for trait in sorted(bounds):
+                    self.obligation(arguments[parameter], trait, expr.token)
         params = tuple(substitute(self.resolve(kind), arguments) for _, _, kind in function.params)
         result = substitute(self.resolve(function.result), arguments)
         annotation = self.check_call(expr, scope, expected, params, result, arguments, first)
@@ -11484,7 +11601,31 @@ class Ownership:
             cursor = self.emit(cursor, "block_reference", holder, token, roots=frozenset(scope.owned))
         return cursor
 
+    def returned_closures(self, expr):
+        """The closure values an expression can evaluate to, looking through blocks, branches, and Box::new."""
+        expr = ungroup(expr)
+        if expr.kind == "closure_value":
+            yield expr
+        elif expr.kind == "box" and expr.args:
+            yield from self.returned_closures(expr.args[0])
+        elif expr.kind in {"block", "unsafe_block"} and len(expr.args) == 2 and expr.args[1] is not None:
+            yield from self.returned_closures(expr.args[1])
+        elif expr.kind == "if" and expr.args[2] is not None:
+            yield from self.returned_closures(expr.args[1])
+            yield from self.returned_closures(expr.args[2])
+
+    def check_escaping_closures(self, expr):
+        if self.function.name.text.startswith("@closure:"):
+            return
+        for closure in self.returned_closures(expr):
+            for capture in self.program.functions[closure.args[0]].captures:
+                if not capture.by_move and not isinstance(capture.annotation, ReferenceType):
+                    raise closure.token.error(
+                        f"closure may outlive the current function, but it borrows {capture.name.text!r}, "
+                        "which is owned by the current function")
+
     def lower_return(self, expr, scope, cursor):
+        self.check_escaping_closures(expr)
         if not isinstance(self.annotation(expr), ReferenceType) or self.function.name.text.startswith("@closure:"):
             return self.lower(expr, scope, cursor)
         cursor, loan = self.lower_reference(expr, scope, cursor)
@@ -11807,6 +11948,9 @@ class Ownership:
                 cursor, origins = self.assigned_reference(ungroup(right), scope, cursor)
             else:
                 cursor = self.lower_stored_value(right, target_type, scope, cursor)
+                if token.text == "=" and ungroup(left).kind == "name":
+                    # A struct, tuple, or array built from borrows of locals points to those locals.
+                    origins = self.aggregate_origins(right, scope) or None
             cursor, target_place = self.lower_address(left, scope, cursor)
             if target_place is None:
                 return self.lower(left, scope, cursor)
@@ -11860,6 +12004,25 @@ class Ownership:
                 return None
             return self.lower_print(expr, scope, cursor)
         raise AssertionError(kind)
+
+    def aggregate_origins(self, expr, scope):
+        """The locals an aggregate value borrows through `&local` parts, when they can be traced."""
+        expr = ungroup(expr)
+        if expr.kind == "record":
+            return [origin for _, value in expr.args[0] for origin in self.aggregate_origins(value, scope)]
+        if expr.kind in {"tuple", "array"}:
+            return [origin for value in expr.args for origin in self.aggregate_origins(value, scope)
+                    if isinstance(value, Expr)]
+        if expr.kind == "borrow":
+            root = place_root(expr.args[0])
+            if root.kind == "name" and root.token.text not in self.program.constructors:
+                try:
+                    local = scope.find(root.token)
+                except RustError:
+                    return []
+                if local.loan is None and not local.static:
+                    return [local]
+        return []
 
     def assigned_reference(self, right, scope, cursor):
         """Lower a reference assigned to a local, with the locals it borrows when they are traceable."""
@@ -13394,7 +13557,7 @@ class Interpreter:
         while isinstance(value, (Address, BoxValue, RcValue)):
             value = value.read()
         while isinstance(annotation, ReferenceType) or (
-                isinstance(annotation, AppliedType) and annotation.name in {BOX, RC} and annotation.arguments):
+                isinstance(annotation, AppliedType) and annotation.name in {BOX, *RC_TYPES} and annotation.arguments):
             annotation = annotation.inner if isinstance(annotation, ReferenceType) else annotation.arguments[0]
         annotation = self.program.concrete_type(annotation)
         if annotation in INTEGER_TYPES:
@@ -13435,7 +13598,7 @@ class Interpreter:
 
     def dyn_format(self, value, annotation, spec):
         """Format a trait object through a Display or Debug impl written for `dyn Trait` itself, if any."""
-        while isinstance(annotation, ReferenceType) or isinstance(annotation, AppliedType) and annotation.name in {BOX, RC}:
+        while isinstance(annotation, ReferenceType) or isinstance(annotation, AppliedType) and annotation.name in {BOX, *RC_TYPES}:
             annotation = annotation.inner if isinstance(annotation, ReferenceType) else annotation.arguments[0]
         if not isinstance(annotation, DynType) or spec.kind not in {"", "?"}:
             return None
@@ -17055,6 +17218,8 @@ for _function in (Rc__new, Rc__clone, Rc__strong_count, Rc__weak_count, Rc__ptr_
                   Rc__try_unwrap, Rc__into_inner, Rc__unwrap_or_clone, Rc__get_mut, Rc__make_mut, Weak__new,
                   Weak__upgrade, Weak__strong_count, Weak__weak_count):
     intrinsic(_function)
+for _key in [key for key in INTRINSICS if key.startswith("Rc.")]:
+    INTRINSICS["Arc" + _key.removeprefix("Rc")] = INTRINSICS[_key]
 
 
 @intrinsic
@@ -17282,7 +17447,7 @@ def rust_layout(interpreter, annotation):
     if annotation in scalars:
         return scalars[annotation]
     if isinstance(annotation, (ReferenceType, AppliedType)) and (
-            isinstance(annotation, ReferenceType) or annotation.name in {BOX, RC, WEAK}):
+            isinstance(annotation, ReferenceType) or annotation.name in POINTER_TYPES):
         pointee = annotation.inner if isinstance(annotation, ReferenceType) else annotation.arguments[0]
         fat = isinstance(pointee, (SliceType, DynType)) or pointee == "str"
         return (16 if fat else 8), 8
@@ -17316,7 +17481,7 @@ def rust_layout(interpreter, annotation):
     align = max(payload[1] for payload in payloads)
     if isinstance(annotation, AppliedType) and annotation.name == OPTION:
         inner = program.concrete_type(program.normalize(annotation.arguments[0]))
-        if (isinstance(inner, ReferenceType) or (isinstance(inner, AppliedType) and inner.name in {BOX, RC, VEC})
+        if (isinstance(inner, ReferenceType) or (isinstance(inner, AppliedType) and inner.name in {BOX, *RC_TYPES, VEC})
                 or inner in {"bool", "char", STRING}):
             return rust_layout(interpreter, inner)
     if all(not ctor.fields for ctor in constructors):

@@ -107,7 +107,7 @@ pub mod intrinsics {
     pub fn stdin_lines() -> crate::iter::Lazy<crate::io::Result<String>>;
     pub fn env_args() -> crate::iter::Lazy<String>;
     pub fn env_var(key: &str) -> Option<String>;
-    pub fn rc_deref<T: ?Sized>(rc: &crate::rc::Rc<T>) -> &T;
+    pub fn rc_deref<P, T: ?Sized>(rc: &P) -> &T;
     pub fn refcell_value<'a, T>(cell: &'a crate::cell::RefCell<T>) -> &'a mut T;
     pub fn cell_value<'a, T>(cell: &'a crate::cell::Cell<T>) -> &'a mut T;
     pub fn lazy_range<C, B, R>(items: C, range: B) -> R;
@@ -2458,21 +2458,21 @@ pub mod collections {
     }
 
     macro_rules! map_methods {
-        ($map:ident) => {
+        ($map:ident, $($key:tt)+) => {
             impl<K, V> $map<K, V> {
                 pub fn new() -> $map<K, V> { crate::intrinsics::map_new() }
                 pub fn with_capacity(capacity: usize) -> $map<K, V> { crate::intrinsics::map_new() }
                 pub fn len(&self) -> usize { crate::intrinsics::map_len(self) }
                 pub fn is_empty(&self) -> bool { crate::intrinsics::map_len(self) == 0 }
                 pub fn clear(&mut self) { crate::intrinsics::map_clear(self) }
-                pub fn insert(&mut self, key: K, value: V) -> Option<V> { crate::intrinsics::map_insert(self, key, value) }
+                pub fn insert(&mut self, key: K, value: V) -> Option<V> where K: $($key)+ { crate::intrinsics::map_insert(self, key, value) }
                 pub fn get<Q: ?Sized>(&self, key: &Q) -> Option<&V> { crate::intrinsics::map_get(self, key) }
                 pub fn get_mut<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut V> { crate::intrinsics::map_get(self, key) }
                 pub fn get_key_value<Q: ?Sized>(&self, key: &Q) -> Option<(&K, &V)> { crate::intrinsics::map_get_key_value(self, key) }
                 pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool { crate::intrinsics::map_has(self, key) }
                 pub fn remove<Q: ?Sized>(&mut self, key: &Q) -> Option<V> { crate::intrinsics::map_remove(self, key) }
                 pub fn remove_entry<Q: ?Sized>(&mut self, key: &Q) -> Option<(K, V)> { crate::intrinsics::map_remove_entry(self, key) }
-                pub fn entry(&mut self, key: K) -> Entry<'_, $map<K, V>, K, V> { Entry::new(self, key) }
+                pub fn entry(&mut self, key: K) -> Entry<'_, $map<K, V>, K, V> where K: $($key)+ { Entry::new(self, key) }
                 pub fn keys(&self) -> Lazy<&K> { crate::intrinsics::map_keys(self) }
                 pub fn values(&self) -> Lazy<&V> { crate::intrinsics::map_values(self) }
                 pub fn values_mut(&mut self) -> Lazy<&mut V> { crate::intrinsics::map_values(self) }
@@ -2525,18 +2525,18 @@ pub mod collections {
             }
         };
     }
-    map_methods!(HashMap);
-    map_methods!(BTreeMap);
+    map_methods!(HashMap, Eq + crate::hash::Hash);
+    map_methods!(BTreeMap, Ord);
 
     macro_rules! set_methods {
-        ($set:ident) => {
+        ($set:ident, $($key:tt)+) => {
             impl<T> $set<T> {
                 pub fn new() -> $set<T> { crate::intrinsics::map_new() }
                 pub fn with_capacity(capacity: usize) -> $set<T> { crate::intrinsics::map_new() }
                 pub fn len(&self) -> usize { crate::intrinsics::map_len(self) }
                 pub fn is_empty(&self) -> bool { crate::intrinsics::map_len(self) == 0 }
                 pub fn clear(&mut self) { crate::intrinsics::map_clear(self) }
-                pub fn insert(&mut self, value: T) -> bool { crate::intrinsics::set_insert(self, value) }
+                pub fn insert(&mut self, value: T) -> bool where T: $($key)+ { crate::intrinsics::set_insert(self, value) }
                 pub fn contains<Q: ?Sized>(&self, value: &Q) -> bool { crate::intrinsics::map_has(self, value) }
                 pub fn get<Q: ?Sized>(&self, value: &Q) -> Option<&T> { crate::intrinsics::set_get(self, value) }
                 pub fn remove<Q: ?Sized>(&mut self, value: &Q) -> bool { crate::intrinsics::set_remove(self, value) }
@@ -2599,8 +2599,8 @@ pub mod collections {
             }
         };
     }
-    set_methods!(HashSet);
-    set_methods!(BTreeSet);
+    set_methods!(HashSet, Eq + crate::hash::Hash);
+    set_methods!(BTreeSet, Ord);
 
     #[derive(Clone, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
     pub struct VecDeque<T> { items: Vec<T> }
@@ -2743,49 +2743,56 @@ pub mod collections {
     }
 }
 
-pub mod rc {
-    use crate::fmt;
-    use crate::ops::Deref;
-
+// Rc and Arc share one implementation: this interpreter runs threads one at a time, so the only
+// difference between them is which one the checker accepts as Send and Sync.
+macro_rules! shared_pointer {
+    ($rc:ident, $weak:ident) => {
     // At runtime an Rc is a shared cell with strong and weak counts.
-    pub struct Rc<T: ?Sized> { value: Box<T> }
-    pub struct Weak<T: ?Sized> { value: Option<Box<T>> }
+    pub struct $rc<T: ?Sized> { value: Box<T> }
+    pub struct $weak<T: ?Sized> { value: Option<Box<T>> }
 
-    impl<T: ?Sized> Rc<T> {
-        pub fn new(value: T) -> Rc<T>;
-        pub fn clone(this: &Rc<T>) -> Rc<T>;
-        pub fn strong_count(this: &Rc<T>) -> usize;
-        pub fn weak_count(this: &Rc<T>) -> usize;
-        pub fn ptr_eq(this: &Rc<T>, other: &Rc<T>) -> bool;
-        pub fn downgrade(this: &Rc<T>) -> Weak<T>;
-        pub fn try_unwrap(this: Rc<T>) -> Result<T, Rc<T>>;
-        pub fn into_inner(this: Rc<T>) -> Option<T>;
-        pub fn unwrap_or_clone(this: Rc<T>) -> T where T: Clone;
-        pub fn get_mut(this: &mut Rc<T>) -> Option<&mut T>;
-        pub fn make_mut(this: &mut Rc<T>) -> &mut T where T: Clone;
-        pub fn as_ptr(this: &Rc<T>) -> usize;
+    impl<T: ?Sized> $rc<T> {
+        pub fn new(value: T) -> $rc<T>;
+        pub fn clone(this: &$rc<T>) -> $rc<T>;
+        pub fn strong_count(this: &$rc<T>) -> usize;
+        pub fn weak_count(this: &$rc<T>) -> usize;
+        pub fn ptr_eq(this: &$rc<T>, other: &$rc<T>) -> bool;
+        pub fn downgrade(this: &$rc<T>) -> $weak<T>;
+        pub fn try_unwrap(this: $rc<T>) -> Result<T, $rc<T>>;
+        pub fn into_inner(this: $rc<T>) -> Option<T>;
+        pub fn unwrap_or_clone(this: $rc<T>) -> T where T: Clone;
+        pub fn get_mut(this: &mut $rc<T>) -> Option<&mut T>;
+        pub fn make_mut(this: &mut $rc<T>) -> &mut T where T: Clone;
+        pub fn as_ptr(this: &$rc<T>) -> usize;
     }
-    impl<T: ?Sized> Deref for Rc<T> {
+    impl<T: ?Sized> Deref for $rc<T> {
         type Target = T;
-        fn deref(&self) -> &T { crate::intrinsics::rc_deref(self) }
+        fn deref(&self) -> &T { crate::intrinsics::rc_deref::<$rc<T>, T>(self) }
     }
-    impl<T> AsRef<T> for Rc<T> {
-        fn as_ref(&self) -> &T { crate::intrinsics::rc_deref(self) }
+    impl<T> AsRef<T> for $rc<T> {
+        fn as_ref(&self) -> &T { crate::intrinsics::rc_deref::<$rc<T>, T>(self) }
     }
-    impl<T> From<T> for Rc<T> {
-        fn from(value: T) -> Rc<T> { Rc::new(value) }
+    impl<T> From<T> for $rc<T> {
+        fn from(value: T) -> $rc<T> { $rc::new(value) }
     }
-    impl<T: ?Sized> Weak<T> {
-        pub fn new() -> Weak<T>;
-        pub fn upgrade(&self) -> Option<Rc<T>>;
+    impl<T: ?Sized> $weak<T> {
+        pub fn new() -> $weak<T>;
+        pub fn upgrade(&self) -> Option<$rc<T>>;
         pub fn strong_count(&self) -> usize;
         pub fn weak_count(&self) -> usize;
     }
+    };
+}
+
+pub mod rc {
+    use crate::fmt;
+    use crate::ops::Deref;
+    shared_pointer!(Rc, Weak);
 }
 
 pub mod sync {
-    pub use crate::rc::Rc as Arc;
-    pub use crate::rc::Weak;
+    use crate::ops::Deref;
+    shared_pointer!(Arc, Weak);
     use crate::cell::{Cell, RefCell};
     use crate::fmt;
     use crate::green::{green_block, green_progress};
@@ -3646,7 +3653,7 @@ pub mod thread {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("JoinHandle { .. }") }
     }
 
-    pub fn spawn<T, F: FnOnce() -> T>(f: F) -> JoinHandle<T> {
+    pub fn spawn<T, F: FnOnce() -> T>(f: F) -> JoinHandle<T> where F: Send, T: Send {
         JoinHandle { id: crate::green::green_spawn::<F, T>(f, String::new(), false), name: None, marker: PhantomData }
     }
     pub fn sleep(duration: crate::time::Duration) { crate::green::green_sleep(duration.as_nanos()) }
@@ -3679,12 +3686,12 @@ pub mod thread {
         pub fn new() -> Builder { Builder { name: None, stack_size: None } }
         pub fn name(self, name: String) -> Builder { Builder { name: Some(name), stack_size: self.stack_size } }
         pub fn stack_size(self, size: usize) -> Builder { Builder { name: self.name, stack_size: Some(size) } }
-        pub fn spawn<T, F: FnOnce() -> T>(self, f: F) -> crate::io::Result<JoinHandle<T>> {
+        pub fn spawn<T, F: FnOnce() -> T>(self, f: F) -> crate::io::Result<JoinHandle<T>> where F: Send, T: Send {
             let named = self.name.is_some();
             let name = self.name.clone().unwrap_or_default();
             Ok(JoinHandle { id: crate::green::green_spawn::<F, T>(f, name, named), name: self.name, marker: PhantomData })
         }
-        pub fn spawn_scoped<'scope, T, F: FnOnce() -> T>(self, scope: &'scope Scope, f: F) -> crate::io::Result<ScopedJoinHandle<T>> {
+        pub fn spawn_scoped<'scope, T, F: FnOnce() -> T>(self, scope: &'scope Scope, f: F) -> crate::io::Result<ScopedJoinHandle<T>> where F: Send, T: Send {
             let named = self.name.is_some();
             let name = self.name.clone().unwrap_or_default();
             let id = crate::green::green_spawn::<F, T>(f, name, named);
@@ -3706,7 +3713,7 @@ pub mod thread {
         pub fn thread(&self) -> Thread { Thread { id: self.id as u64, name: None } }
     }
     impl Scope {
-        pub fn spawn<T, F: FnOnce() -> T>(&self, f: F) -> ScopedJoinHandle<T> {
+        pub fn spawn<T, F: FnOnce() -> T>(&self, f: F) -> ScopedJoinHandle<T> where F: Send, T: Send {
             let id = crate::green::green_spawn::<F, T>(f, String::new(), false);
             self.threads.borrow_mut().push(id);
             ScopedJoinHandle { id: id, marker: PhantomData }
