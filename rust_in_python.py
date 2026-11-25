@@ -2436,7 +2436,11 @@ def is_str_reference(annotation):
 
 
 def is_static_str(annotation):
-    return is_str_reference(annotation) and not annotation.mutable and annotation.lifetime == "'static"
+    return is_str_reference(annotation) and is_static_reference(annotation)
+
+
+def is_static_reference(annotation):
+    return isinstance(annotation, ReferenceType) and not annotation.mutable and annotation.lifetime == "'static"
 
 
 @dataclass(frozen=True)
@@ -6051,7 +6055,7 @@ def place_root(expr):
 
 def reference_source(expr, annotation):
     expr = ungroup(expr)
-    if is_static_str(annotation) or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
+    if is_static_reference(annotation) or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
         return True
     return expr.kind in {"name", "borrow", "call", "indirect_call", "if", "if_chain", "match", "dyn_reference",
                          "slice_reference", "string_reference", "byte_string", "vector_method",
@@ -8933,7 +8937,8 @@ class Checker:
             self.require_place(value, write=mutable, allow_temporary=True)
             if mutable:
                 CaptureContext.mark_mutable(scope, value)
-            result = ReferenceType(annotation, mutable)
+            static = not mutable and (value.kind == "static_item" or is_static_reference(expected))
+            result = ReferenceType(annotation, mutable, "'static" if static else None)
             self.check_type(result, token)
             return result
         if kind == "deref":
@@ -11859,8 +11864,8 @@ class Ownership:
         return cursor, None
 
     def lower_stored_value(self, expr, expected, scope, cursor):
-        # Only a field declared as &'static str is checked; generic fields substituted with 'static are not.
-        if is_static_str(expected) and self.annotation(expr) != NEVER:
+        # Only a field declared as &'static T is checked; generic fields substituted with 'static are not.
+        if is_static_reference(expected) and self.annotation(expr) != NEVER:
             cursor, loan = self.lower_reference(expr, scope, cursor)
             cursor, holder = self.keep_loan(cursor, loan, expr.token)
             return self.emit(cursor, "static_reference", holder, expr.token)
@@ -12110,7 +12115,7 @@ class Ownership:
                 branches, loans = zip(*paths)
                 cursor = branches[0] if len(branches) == 1 else self.join(*branches)
                 binding_loan = self.merge_loans(loans, annotation.mutable)
-            if binding_loan is None and is_static_str(annotation):
+            if binding_loan is None and is_static_reference(annotation):
                 cursor, binding_loan = self.static_loan(cursor, source.token)
             local = Local(source.token.binding(name), mutable, binding_loan)
             scope.bindings[name] = local

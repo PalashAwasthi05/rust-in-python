@@ -16,6 +16,18 @@ from rust_in_python import DEMO, RustError, RustPanic, run
 
 
 VALID = [
+    ("immutable static references can be stored and read from aggregates", """
+        static GLOBAL: i32 = 6;
+        struct Wrapper { value: &'static i32 }
+        fn build() -> Wrapper { Wrapper { value: &GLOBAL } }
+        fn main() {
+            let value = build();
+            let tuple: (&'static i32,) = (&GLOBAL,);
+            let array: [&'static i32; 2] = [&GLOBAL, &7];
+            let opt = Some(&GLOBAL);
+            println!("{} {} {} {}", *value.value, *tuple.0, *array[1], *opt.unwrap());
+        }
+    """, "6 6 7 6\n"),
     ("sibling fields stay disjoint through a borrow selected by a branch", """
         struct Pair { x: i32, y: i32 }
         fn exercise(pick: bool) -> i32 {
@@ -2210,6 +2222,14 @@ VALID = [
 ]
 
 INVALID = [
+    ("a static reference field cannot store a borrow of a local", """
+        struct Wrapper { value: &'static i32 }
+        fn main() {
+            let local = 8;
+            let item = Wrapper { value: &local };
+            println!("{}", item.value);
+        }
+    """, "does not live for 'static"),
     ("selected references still reject overlapping mutable field borrows", """
         struct Pair { x: i32, y: i32 }
         fn exercise(pick: bool) -> i32 {

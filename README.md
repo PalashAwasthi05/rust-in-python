@@ -45,6 +45,7 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Shared and mutable references to locals, fields, and temporaries
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Disjoint field reborrows through references selected by control flow
+- Immutable `'static` references in records, tuples, arrays, and supported generic values
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments, associated-type constraints, and argument-position `impl Trait`
 - Opaque owned return types in free functions and inherent methods with `-> impl Trait` and associated-type bindings
