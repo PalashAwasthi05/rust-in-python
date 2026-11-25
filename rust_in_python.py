@@ -11681,6 +11681,18 @@ class Ownership:
                     cursor = self.emit(cursor, "static_reference", holder, expr.token)
                 temporaries.append((holder, expr.token))
                 passed[index] = loan
+            elif borrowing_iterator(self.annotation(expr)) or (
+                    isinstance(self.annotation(expr), FunctionType) and self.annotation(expr).closure
+                    and ungroup(expr).kind == "closure_value"):
+                # A borrowing iterator or closure argument keeps its borrows live until the call,
+                # so later arguments cannot conflict with them.
+                if borrowing_iterator(self.annotation(expr)):
+                    cursor, loan = self.lower_iterator(expr, scope, cursor)
+                else:
+                    cursor, loan = self.lower_closure(expr, scope, cursor)
+                if loan:
+                    cursor, holder = self.keep_loan(cursor, loan, expr.token)
+                    temporaries.append((holder, expr.token))
             else:
                 cursor = self.lower(expr, scope, cursor)
         # Activate implicit mutable reborrows after all arguments have been
