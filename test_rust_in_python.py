@@ -3373,6 +3373,63 @@ def outcome(result):
 
 class InterpreterTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
+    def test_source_dependency_resolution_and_diagnostic_locations(self):
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            dependency = folder / "dependency"
+            dependency.mkdir()
+            crate = dependency / "lib.rs"
+            crate.write_text("""
+                mod builder;
+                pub use builder::make;
+                pub const LIMIT: u32 = 5;
+                pub type Count = u32;
+                pub struct Report(pub Count);
+                pub(crate) fn internal() -> Count { 7 }
+            """, encoding="utf-8")
+            (dependency / "builder.rs").write_text(
+                "use crate::{Count, Report, LIMIT};\n"
+                "pub fn make(x: Count) -> Report { Report(x + crate::internal() + LIMIT) }\n",
+                encoding="utf-8",
+            )
+            main = folder / "program.rs"
+            main.write_text("""
+                use utility::{Count, Report, make};
+                fn main() {
+                    let n: Count = 3;
+                    let result: Report = make(n);
+                    println!("{} {}", result.0, utility::LIMIT);
+                }
+            """, encoding="utf-8")
+            rlib = folder / "libutility.rlib"
+            binary = folder / "native"
+            subprocess.run(["rustc", "--edition=2021", "--crate-name", "utility", "--crate-type", "rlib",
+                            crate, "-o", rlib], capture_output=True, timeout=30, check=True)
+            native = ["rustc", "--edition=2021", "--extern", f"utility={rlib}", main, "-o", binary]
+            subprocess.run(native, capture_output=True, timeout=30, check=True)
+            expected = subprocess.run([binary], capture_output=True, text=True, timeout=10, check=True)
+            runner = Path(__file__).with_name("rust_in_python.py")
+            python = [sys.executable, runner, "--extern-source", f"utility={crate}", main]
+            actual = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            self.assertEqual(actual.stdout, expected.stdout)
+
+            main.write_text("fn main() { utility::internal(); }", encoding="utf-8")
+            failed = subprocess.run(native, capture_output=True, text=True, timeout=30, check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            rejected = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertIn("'internal' is private", rejected.stderr)
+
+            main.write_text("mod broken;\nfn main() { broken::show(); }\n", encoding="utf-8")
+            broken = folder / "broken.rs"
+            broken.write_text("macro_rules! bad { () => { true + 2 }; }\n"
+                              "pub fn show() {\n    bad!();\n}\n", encoding="utf-8")
+            rejected = subprocess.run(python, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertTrue(rejected.stderr.startswith(f"{broken}:3:5:"), rejected.stderr)
+
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is optional")
     def test_source_location_and_file_inclusion(self):
         with TemporaryDirectory() as directory:
             folder = Path(directory)

@@ -258,6 +258,14 @@ fn main() {
 }
 ```
 
+## Load a source dependency
+
+```sh
+python3 rust_in_python.py --extern-source utility=../utility/src/lib.rs program.rs
+```
+
+Source dependencies have separate crate roots, module trees, and visibility rules. Import supported types and values with paths such as `utility::Report` and `utility::make`. Source dependency loading and compiled macro expansion currently run in separate modes.
+
 ## Load compiled macros
 
 The optional host uses the installed Rust compiler to expand declarative macros from compiled `.rlib` crates and procedural macros from dynamic libraries. Pass the name and path of each crate.
@@ -291,6 +299,6 @@ Generic bodies are checked against their declared trait bounds. Const parameters
 
 Trait objects support shared and mutable references, `Box`, and `Rc`. Generic associated types support type, const, and lifetime parameters. Higher-ranked equalities can tie a projected reference to its receiver's borrow. Trait specialization and inference for unconstrained lending projections remain open.
 
-Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. The optional host supports cross-crate macro expansion and generated local bindings.
+Declarative macros preserve definition-site local bindings and labels, caller-supplied tokens, and fragment opacity. Textual inheritance, `#[macro_use]` modules, `#[macro_export(local_inner_macros)]`, crate-root paths, and macro re-exports work within a crate. Python diagnostics for source files point to the original file and use the invocation location for generated macro tokens. The optional host supports compiled cross-crate macro expansion and generated local bindings.
 
 Threads run one at a time: `thread::spawn` runs its closure to completion before returning, which is one valid schedule but deadlocks on programs that need two threads to make progress together. `HashMap` and `HashSet` iterate in insertion order, which rustc never promises, so output that prints them unsorted can differ from a compiled run. `RefCell` does not panic on conflicting borrows. File and network IO, processes, `async`, procedural derive macros other than the built-in derives, Cargo integration, and native code generation are not implemented.

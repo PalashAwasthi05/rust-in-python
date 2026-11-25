@@ -39,7 +39,9 @@ RUST_EDITIONS = ("2015", "2018", "2021", "2024")
 
 
 class RustError(Exception):
-    pass
+    def __init__(self, message, *, located=False):
+        super().__init__(message)
+        self.located = located
 
 
 CONST_RUNTIME_ONLY = ("unsupported constant expression", "unsupported statement in a constant block",
@@ -110,7 +112,9 @@ class Token:
         return replace(self, text=key, context=())
 
     def error(self, message):
-        return RustError(f"{self.line}:{self.column}: {message}")
+        site = self.expansion_site or self
+        prefix = f"{site.source_file}:" if site.source_file is not None else ""
+        return RustError(f"{prefix}{site.line}:{site.column}: {message}", located=bool(prefix))
 
     def followed_by(self, token):
         return (self.origin is not None and self.origin is token.origin
@@ -247,7 +251,8 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         if match is None:
             start = offset + int(source[offset] == "'")
             if start == len(source) or not is_identifier(source[start]):
-                raise Token(source[offset], line, column).error(f"unexpected character {source[offset]!r}")
+                bad = Token(source[offset], line, column, source_file=source_file)
+                raise bad.error(f"unexpected character {source[offset]!r}")
             end = start + 1
         else:
             end = match.end()
@@ -265,7 +270,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         if identifier:
             word = unicodedata.normalize("NFC", word)
             if raw and identifier_text(word[name_start - offset:]) in {"_", "crate", "self", "Self", "super"}:
-                raise Token(word, line, column).error(f"{word!r} is reserved")
+                raise Token(word, line, column, source_file=source_file).error(f"{word!r} is reserved")
         if word == "/*":
             depth = 1
             for edge in COMMENT_EDGE.finditer(source, end):
@@ -274,7 +279,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
                     end = edge.end()
                     break
             if depth:
-                raise Token(word, line, column).error("unclosed block comment")
+                raise Token(word, line, column, source_file=source_file).error("unclosed block comment")
         consumed = source[offset:end]
         lines = consumed.count("\n")
         next_column = len(consumed.rsplit("\n", 1)[1]) + 1 if lines else column + len(consumed)
@@ -287,7 +292,7 @@ def lex(source, *, edition="2021", source_file=None, host_contexts=None):
         line += lines
         column = next_column
         offset = end
-    yield Token("", line, column)
+    yield Token("", line, column, source_file=source_file)
 
 
 DELIMITERS = {"(": ")", "[": "]", "{": "}"}
@@ -1422,6 +1427,7 @@ class ModuleUnit:
     macro_use: bool = False
     # Functions, constants, and statics that share their name with a module in this scope.
     values: dict = field(default_factory=dict)
+    crate_root: tuple = ()
 
 
 VALUE_KINDS = {"fn", "const", "static"}
@@ -1466,11 +1472,13 @@ def cfg_enabled(items):
 
 
 class Modules:
-    def __init__(self, trees, source_path, edition):
+    def __init__(self, trees, source_path, edition, dependencies=None):
         self.source_path = os.fspath(source_path) if source_path is not None else None
         self.directory = Path(source_path).absolute().parent if source_path is not None else None
         root = ModuleUnit((), self.directory)
         self.units = {(): root}
+        self.crate_files = {(): self.source_path}
+        self.external_roots = {}
         self.edition = edition
         self.exported = {}
         self.macro_paths = {}
@@ -1485,6 +1493,15 @@ class Modules:
         self.enum_variants = {}
         self.local_macros = {}
         self.reexported_macros = {}
+        for name, file in (dependencies or {}).items():
+            key = (f"@external:{name}",)
+            dependency = ModuleUnit(key, file.resolve().parent, crate_root=key)
+            self.units[key] = dependency
+            self.external_roots[name] = key
+            self.crate_files[key] = os.fspath(file)
+            contents, _ = token_trees(lex(file.read_text(encoding="utf-8"), edition=edition,
+                                          source_file=os.fspath(file)))
+            dependency.items = self.scan(dependency, contents)
         root.items = self.scan(root, trees)
         std = ModuleUnit(STD_ROOT, None)
         self.units[STD_ROOT] = std
@@ -1641,7 +1658,7 @@ class Modules:
                 directory = unit.directory / symbol.path[-1] if unit.directory is not None else None
                 if custom_path is not None and unit.directory is not None:
                     directory = (unit.directory / custom_path).resolve().parent
-                child = ModuleUnit(symbol.path, directory, macro_use=macro_use)
+                child = ModuleUnit(symbol.path, directory, macro_use=macro_use, crate_root=unit.crate_root)
                 self.units[symbol.path] = child
                 if isinstance(body, TokenGroup) and tree_text(body) == "{":
                     contents = body.items
@@ -1686,7 +1703,7 @@ class Modules:
                 else:
                     if export and word == "macro_rules":
                         name, body = items[index + 2:index + 4]
-                        key = identifier_text(name.text)
+                        key = (*unit.crate_root, identifier_text(name.text))
                         if key in self.exported and not expanded:
                             raise name.error(f"duplicate exported macro {name.text!r}")
                         self.exported[key] = body, local_inner
@@ -1913,24 +1930,28 @@ class Modules:
             raise token.error(f"module {token.text!r} needs {filenames[0]} or {filenames[1]}")
         try:
             filename = found[0]
-            source_file = os.path.join(os.path.dirname(self.source_path), os.path.relpath(filename, self.directory))
+            crate_file = self.crate_files[unit.crate_root]
+            root = self.units[unit.crate_root]
+            source_file = os.path.join(os.path.dirname(crate_file), os.path.relpath(filename, root.directory))
             return token_trees(lex(filename.read_text(encoding="utf-8"), edition=self.edition,
                                    source_file=source_file))[0]
         except RustError as error:
+            if error.located:
+                raise
             raise RustError(f"{found[0]}: {error}") from error
 
     @staticmethod
     def visibility(unit, group):
         words = tuple(token.text for token in flatten_trees(group.items))
         if words == ("crate",):
-            return ()
+            return unit.crate_root
         if words == ("self",):
             return unit.path
-        if words == ("super",) and unit.path:
+        if words == ("super",) and unit.path != unit.crate_root:
             return unit.path[:-1]
         if words[:2] == ("in", "crate"):
-            boundary = words[3::2]
-            if words[2::2] == ("::",) * len(boundary) and unit.path[:len(boundary)] == boundary:
+            boundary = (*unit.crate_root, *words[3::2])
+            if words[2::2] == ("::",) * len(words[3::2]) and unit.path[:len(boundary)] == boundary:
                 return boundary
         raise group.opening.error("visibility must name an ancestor module")
 
@@ -1987,11 +2008,11 @@ class Modules:
             head = path.pop(0)
             absolute = True
             if head == "crate":
-                root = self.units[STD_ROOT if unit.path[:1] == STD_ROOT else ()]
+                root = self.units[STD_ROOT if unit.path[:1] == STD_ROOT else unit.crate_root]
             if head == "super":
                 current = unit.path
                 while True:
-                    if not current:
+                    if current == unit.crate_root:
                         raise token.error("super goes past the crate root")
                     current = current[:-1]
                     if not path or path[0] != "super":
@@ -2011,7 +2032,10 @@ class Modules:
         if not symbol:
             if absolute:
                 raise token.error("unresolved path")
-            return self.prelude((first, *path), token)
+            if first in self.external_roots:
+                symbol = ModuleSymbol(self.external_roots[first], "module", (), token)
+            else:
+                return self.prelude((first, *path), token)
         while path and symbol.kind == "module":
             nested = self.units[symbol.path]
             name = path.pop(0)
@@ -2158,7 +2182,7 @@ class Modules:
     def macro_path(unit, path):
         head, *tail = path
         if head == "crate":
-            return tuple(tail)
+            return (*unit.crate_root, *tail)
         if head == "self":
             return (*unit.path, *tail)
         if head == "super":
@@ -2177,7 +2201,7 @@ class Modules:
         return bool(entry and unit.path[:len(entry[1])] == entry[1])
 
     def link_macros(self, exports):
-        self.macro_paths = {(name,): (macro, ()) for name, macro in exports.items()}
+        self.macro_paths = {path: (macro, path[:-1]) for path, macro in exports.items()}
         self.macro_paths.update(self.reexported_macros)
         while True:
             size = len(self.macro_paths)
@@ -2196,8 +2220,9 @@ class Modules:
         for path, (macro, visible) in self.macro_paths.items():
             if unit.path[:len(visible)] != visible:
                 continue
-            qualified[("crate", *path)] = macro
-            for ancestor in range(len(unit.path), -1, -1):
+            root_size = len(unit.crate_root)
+            qualified[("crate", *path[root_size:])] = macro
+            for ancestor in range(len(unit.path), root_size - 1, -1):
                 if path[:ancestor] == unit.path[:ancestor] and len(path) > ancestor:
                     prefix = ("super",) * (len(unit.path) - ancestor) or ("self",)
                     qualified[(*prefix, *path[ancestor:])] = macro
@@ -2260,18 +2285,24 @@ class Modules:
             definitions = declared[path] = {}
             unit = self.units[path]
             # #[macro_export] macros live in the crate root's namespace, so bare names resolve there.
-            macros = builtins | (exports if not unit.path else {}) | expander.module_macros.get(unit.path, {})
+            crate_exports = {path[-1]: macro for path, macro in exports.items() if path[:-1] == unit.crate_root}
+            macros = builtins | (crate_exports if unit.path == unit.crate_root else {}) | expander.module_macros.get(
+                unit.path, {})
             macros.update({item.alias: self.macro_paths[self.macro_path(unit, item.path)][0]
                            for item in unit.imports if self.is_macro_import(unit, item)})
             previous = expander.qualified
             previous_path = expander.module_path
+            previous_crate = expander.crate_name
             expander.qualified = self.macro_qualifiers(unit)
-            expander.module_path = unit.path
+            expander.module_path = unit.path[len(unit.crate_root):]
+            if unit.crate_root:
+                expander.crate_name = unit.crate_root[0].removeprefix("@external:")
             try:
                 expanded = expander.expand(unit.items, macros, item_scope=True, definitions=definitions)
             finally:
                 expander.qualified = previous
                 expander.module_path = previous_path
+                expander.crate_name = previous_crate
             unit.items = self.scan(unit, expanded, expanded=True)
             return definitions
 
@@ -3121,6 +3152,7 @@ class Program:
     normalized: dict | None = None
     layouts: dict | None = None
     dispatch_cache: dict = field(default_factory=dict)
+    edition: str = "2021"
 
     def add_prelude(self):
         for name, shape in ((OPTION, (("None", ()), ("Some", ("T",)))),
@@ -14692,17 +14724,17 @@ def strip_host_items(items, marker, shims, repeat_shim, libraries, *, top=True):
     return tuple(result)
 
 
-def macro_libraries(values):
+def external_files(values, kind):
     libraries = {}
     for item in values:
         name, separator, file = item.partition("=")
         if not separator or not name.isascii() or not name.isidentifier() or not file:
-            raise RustError("expected a compiled Rust macro crate as NAME=PATH")
+            raise RustError(f"expected a {kind} as NAME=PATH")
         path = Path(file).resolve()
         if not path.is_file():
-            raise RustError(f"compiled Rust macro crate does not exist: {path}")
+            raise RustError(f"{kind} does not exist: {path}")
         if name in libraries:
-            raise RustError(f"duplicate macro crate {name!r}")
+            raise RustError(f"duplicate {kind} {name!r}")
         libraries[name] = path
     return libraries
 
@@ -17633,7 +17665,7 @@ def rust_green_local(interpreter, result, key):
     return Address(slot[1])
 
 
-def compile_program(source, *, proc_extern=(), source_path=None, edition="2021"):
+def compile_program(source, *, proc_extern=(), extern_source=(), source_path=None, edition="2021"):
     PROJECTION_BOUNDS.clear()
     TYPE_BOUNDS.clear()
     OVERFLOWING_LITERALS[0] = False
@@ -17643,13 +17675,18 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
     if proc_extern:
-        trees, end = rustc_source(source, macro_libraries(proc_extern), source_path, edition=edition)
+        if extern_source:
+            raise RustError("source dependencies and compiled macro crates require separate expansion modes")
+        libraries = external_files(proc_extern, "compiled Rust macro crate")
+        trees, end = rustc_source(source, libraries, source_path, edition=edition)
     else:
         source_file = os.fspath(source_path) if source_path is not None else None
         trees, end = token_trees(lex(source, edition=edition, source_file=source_file))
-    modules = Modules(trees, source_path, edition)
+    dependencies = external_files(extern_source, "Rust dependency source")
+    modules = Modules(trees, source_path, edition, dependencies)
     modules.expand()
-    program = Program(type_aliases=modules.type_aliases, statics=modules.statics, lazy_items=modules.lazy_items)
+    program = Program(type_aliases=modules.type_aliases, statics=modules.statics, lazy_items=modules.lazy_items,
+                      edition=edition)
     program.crate_name = Path(source_path).stem.replace("-", "_") if source_path else "rust_out"
     program.add_prelude()
     scalars = modules.constants | modules.statics
@@ -17679,8 +17716,9 @@ def compile_program(source, *, proc_extern=(), source_path=None, edition="2021")
     return program
 
 
-def run(source, stdout=None, *, proc_extern=(), source_path=None, edition="2021"):
-    program = compile_program(source, proc_extern=proc_extern, source_path=source_path, edition=edition)
+def run(source, stdout=None, *, proc_extern=(), extern_source=(), source_path=None, edition="2021"):
+    program = compile_program(source, proc_extern=proc_extern, extern_source=extern_source,
+                              source_path=source_path, edition=edition)
     interpreter = Interpreter(program, sys.stdout if stdout is None else stdout)
     try:
         value = interpreter.call("main", ())
@@ -17698,6 +17736,8 @@ def main():
     parser.add_argument("--edition", choices=RUST_EDITIONS, default="2021", help="Rust edition used for syntax")
     parser.add_argument("--proc-extern", "--macro-extern", action="append", default=[], metavar="NAME=PATH",
                         help="load a compiled declarative or procedural macro crate through rustc")
+    parser.add_argument("--extern-source", action="append", default=[], metavar="NAME=PATH",
+                        help="load a dependency crate from its Rust source")
     args = parser.parse_args()
     if args.demo == bool(args.source):
         parser.error("provide either a source file or --demo")
@@ -17711,11 +17751,13 @@ def main():
             source = Path(args.source).read_text(encoding="utf-8")
         source_path = None if args.demo or args.source == "-" else args.source
         operation = compile_program if args.check else run
-        result = operation(source, proc_extern=args.proc_extern, source_path=source_path, edition=args.edition)
+        result = operation(source, proc_extern=args.proc_extern, extern_source=args.extern_source,
+                           source_path=source_path, edition=args.edition)
         if not args.check and result is not None:
             return result
     except (RustError, OSError, UnicodeError) as error:
-        print(f"{label}: {str(error).replace(MODULE_SEPARATOR, '::')}", file=sys.stderr)
+        prefix = "" if isinstance(error, RustError) and error.located else f"{label}: "
+        print(prefix + str(error).replace(MODULE_SEPARATOR, "::"), file=sys.stderr)
         return 1
     except RustPanic as error:
         location = error.location
