@@ -2472,6 +2472,18 @@ def is_static_reference(annotation):
     return isinstance(annotation, ReferenceType) and not annotation.mutable and annotation.lifetime == "'static"
 
 
+def contained_references(annotation):
+    """The references a value type such as Option<&T>, Result<&T, E>, or (&A, &B) holds in its type arguments."""
+    if isinstance(annotation, ReferenceType):
+        yield annotation
+    elif isinstance(annotation, AppliedType):
+        for argument in annotation.arguments:
+            yield from contained_references(argument)
+    elif isinstance(annotation, TupleType):
+        for element in annotation.elements:
+            yield from contained_references(element)
+
+
 @dataclass(frozen=True)
 class FunctionType:
     parameters: tuple
@@ -11488,6 +11500,11 @@ class Ownership:
                 # A reference returned without a traceable input borrow is left untracked.
                 return self.static_loan(cursor, expr.token, annotation.mutable)
             return cursor, loan
+        if expr.kind == "try" or expr.kind == "enum_method" and expr.args[3]:
+            cursor, loan = self.lower_payload(expr, scope, cursor)
+            if loan is None and cursor is not None:
+                return self.static_loan(cursor, expr.token, annotation.mutable)
+            return cursor, loan
         if expr.kind == "byte_string" or (is_str_reference(annotation) and expr.kind in {"literal", "default"}):
             return self.static_loan(cursor, expr.token)
         if expr.kind == "clone":
@@ -11697,7 +11714,66 @@ class Ownership:
             place = Place(Local(token, function.result.mutable, static=True))
             cursor = self.emit(cursor, "declare", place, token)
             return cursor, Loan(place, function.result.mutable)
+        if function and not isinstance(function.result, ReferenceType):
+            inputs, mutable = self.contained_inputs(function)
+            if inputs and all(index in passed for index in inputs):
+                return cursor, self.merge_loans(tuple(passed[index] for index in inputs), mutable, from_call=True)
         return cursor, None
+
+    @staticmethod
+    def contained_inputs(function):
+        """The reference inputs a result holding references, like Option<&mut T>, borrows from by elision."""
+        references = [reference for reference in contained_references(function.result)
+                      if reference.lifetime != "'static"]
+        if not references:
+            return (), False
+        params = function.params
+        receiver = bool(params and params[0][0].text == "self" and isinstance(params[0][2], ReferenceType))
+        mutable = any(reference.mutable for reference in references)
+        if (receiver and mutable and not params[0][2].mutable and function.name.module[:1] == STD_ROOT):
+            # Interior mutability (RefCell, Cell) hands out &mut from &self, checked at runtime.
+            return (), False
+        regions = {}
+        for index, (_, _, annotation) in enumerate(params):
+            if isinstance(annotation, ReferenceType):
+                regions.setdefault(annotation.lifetime or index, []).append(index)
+        inputs = set()
+        for reference in references:
+            if reference.lifetime is None:
+                if receiver:
+                    inputs.add(0)
+                elif sum(map(len, regions.values())) == 1:
+                    inputs.update(*regions.values())
+                continue
+            permitted = {reference.lifetime}
+            while True:
+                longer = {lifetime for lifetime, bounds in function.lifetimes.items()
+                          if any(bound.text in permitted for bound in bounds)}
+                if longer <= permitted:
+                    break
+                permitted.update(longer)
+            inputs.update(index for lifetime in permitted for index in regions.get(lifetime, ()))
+        return tuple(sorted(inputs)), mutable
+
+    def lower_payload(self, expr, scope, cursor):
+        """Lower an unwrap, expect, unwrap_or, or `?` whose payload is a reference, tracing the loan its
+        Option or Result operand carries from a call that returned it."""
+        receiver = ungroup(expr.args[0])
+        loan = None
+        if receiver.kind in {"call", "indirect_call", "vector_method", "string_method"}:
+            cursor, loan = self.lower_call(receiver, scope, cursor)
+        else:
+            cursor = self.lower(receiver, scope, cursor, consume=expr.kind == "try" or expr.args[3])
+        loans = [loan] if loan else []
+        if expr.kind == "enum_method":
+            for argument in expr.args[1]:
+                if isinstance(self.annotation(argument), ReferenceType) and self.annotation(argument) != NEVER:
+                    cursor, extra = self.lower_reference(argument, scope, cursor)
+                    if extra:
+                        loans.append(extra)
+                else:
+                    cursor = self.lower(argument, scope, cursor)
+        return cursor, loan and self.merge_loans(tuple(loans), self.annotation(expr).mutable)
 
     def lower_print(self, expr, scope, cursor):
         token, args = expr.token, expr.args
@@ -12282,8 +12358,17 @@ class Ownership:
             if loan:
                 cursor, origin = self.keep_loan(cursor, loan, expr.token)
             return cursor, origin, loan
+        loan = None
         if origin is None:
-            cursor = self.lower(expr, scope, cursor)
+            call = ungroup(expr)
+            if (call.kind in {"call", "indirect_call", "vector_method", "string_method"}
+                    and self.annotation(expr) != NEVER):
+                # A result like Option<&mut T> carries the borrow of the call's reference input into its bindings.
+                cursor, loan = self.lower_call(call, scope, cursor)
+                if loan and not all(self.carries_result_loan(source, loan.mutable) for source in sources):
+                    loan = None
+            else:
+                cursor = self.lower(expr, scope, cursor)
             references = [kind for source in sources for kind, _ in self.program.patterns[id(source)][1].values()
                           if isinstance(kind, ReferenceType)]
             if references:
@@ -12294,7 +12379,28 @@ class Ownership:
                 cursor = self.emit(cursor, "declare", origin, expr.token)
                 if extend_to is not None and not promoted:
                     extend_to.owned.add(local)
-        return cursor, origin, None
+        return cursor, origin, loan
+
+    def carries_result_loan(self, source, mutable):
+        """Whether a pattern's bindings can all share a call result's loan: each binding that would carry it is a
+        reference bound by value outside any `&` pattern, and a mutable loan reaches at most one of them."""
+        pattern, types = self.program.patterns[id(source)]
+        direct, by_reference = set(), set()
+        pending = [pattern]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.aliases)
+            pending.extend(node.alternatives)
+            if node.binding:
+                (by_reference if node.by_reference else direct).add(node.binding)
+            if not (isinstance(node.tag, Constructor) and node.tag.style == "reference"):
+                pending.extend(node.children)
+        carriers = [name for name, (annotation, _) in types.items() if name not in by_reference and (
+                    isinstance(annotation, ReferenceType) or borrowing_iterator(annotation)
+                    or isinstance(annotation, FunctionType) and annotation.closure)]
+        if any(name not in direct or not isinstance(types[name][0], ReferenceType) for name in carriers):
+            return False
+        return not mutable or len(carriers) <= 1
 
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None, borrows=None):
         action = "declare" if initialized else "uninitialized"
