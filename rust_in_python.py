@@ -2513,6 +2513,12 @@ def borrowing_iterator(annotation):
     return isinstance(annotation, IteratorType) and annotation.borrowed
 
 
+def holds_references(annotation):
+    """Whether a value type that is not itself a reference, like Option<&mut T> or (&A, usize), holds borrows."""
+    return isinstance(annotation, (AppliedType, TupleType)) and any(
+        reference.lifetime != "'static" for reference in contained_references(annotation))
+
+
 class BufferedCursor:
     """A Python iterator over buffered items that can also be consumed from the back."""
 
@@ -11064,7 +11070,7 @@ class Place:
 
     @property
     def name(self):
-        return ".".join((self.local.token.text, *self.fields))
+        return ".".join((self.local.token.text, *(field for field in self.fields if not field.startswith("<part "))))
 
 
 @dataclass(frozen=True, eq=False)
@@ -11100,7 +11106,7 @@ class Effect:
     roots: frozenset = frozenset()
 
     def reference_uses(self):
-        if self.kind in {"declare", "uninitialized", "end_temporaries", "storage_dead"}:
+        if self.kind in {"declare", "uninitialized", "end_temporaries", "storage_dead", "rebind", "attach"}:
             return set()
         if self.place.holder:
             return {self.place.holder}
@@ -11165,7 +11171,7 @@ class MoveState:
         if effect is None:
             return
         kind, place, token = effect.kind, effect.place, effect.token
-        if kind not in {"declare", "uninitialized", "storage_dead", "points_to"} and not (
+        if kind not in {"declare", "uninitialized", "storage_dead", "points_to", "rebind", "attach"} and not (
                 kind == "write" and not place.holder):
             for item, reason in self.missing:
                 if reason.startswith("dangling:") and item.local in {place.local, place.holder,
@@ -11324,6 +11330,39 @@ class Ownership:
         for node in nodes:
             for successor in node.edges:
                 predecessors[successor].append(node)
+        reaching = Ownership.reaching_loans(nodes, predecessors)
+
+        def uses(node):
+            found = set()
+            locals_used = node.effect.reference_uses()
+            if node.effect.kind not in {"declare", "uninitialized", "end_temporaries", "storage_dead", "rebind",
+                                        "attach"}:
+                locals_used |= {local for local in (node.effect.place.local, node.effect.place.holder)
+                                if local in reaching[node]}
+            for local in locals_used:
+                held = reaching[node][local] if local in reaching[node] else (local.loan,)
+                found.update((local, loan) for loan in held if loan)
+            return found
+
+        # A reference derived from a reassigned one, like `node` in `while let Some(node) = cur`, reborrows
+        # whatever that reference holds at the time, so the loans it may hold there are permitted too.
+        declared = {local.loan: local for node in nodes for local in reaching[node] if local.loan}
+
+        def current(node):
+            if not declared:
+                return frozenset()
+            effect = node.effect
+            sources = [local.loan for local in (effect.place.holder, effect.place.local) if local and local.loan]
+            sources.extend(reaching[node].get(effect.place.holder, ()))
+            permitted = set()
+            for loan in sources:
+                for ancestor in loan.ancestors():
+                    local = declared.get(ancestor)
+                    if local is not None:
+                        for held_loan in reaching[node].get(local, ()):
+                            permitted.update(held_loan.ancestors())
+            return frozenset(permitted)
+
         live = {node: set() for node in nodes}
         # Reference bindings carry loans back to their last reachable uses.
         pending = deque(reversed(nodes))
@@ -11334,9 +11373,9 @@ class Ownership:
             before = set().union(*(live[successor] for successor in node.edges))
             effect = node.effect
             if effect:
-                if effect.kind in {"declare", "uninitialized"}:
-                    before.discard(effect.place.local)
-                before.update(effect.reference_uses())
+                if effect.kind in {"declare", "uninitialized", "rebind"}:
+                    before = {pair for pair in before if pair[0] is not effect.place.local}
+                before.update(uses(node))
             if before != live[node]:
                 live[node] = before
                 for previous in predecessors[node]:
@@ -11345,11 +11384,55 @@ class Ownership:
                         queued.add(previous)
         for node, holders in live.items():
             if node.effect:
-                active = {loan for local in holders for loan in local.loan.ancestors()}
-                Ownership.validate_loans(node.effect, active)
+                # A loan stored into a local is held only where some path from its storing reaches.
+                state = reaching[node]
+                active = {ancestor for local, loan in holders if local not in state or loan in state[local]
+                          for ancestor in loan.ancestors()}
+                holder = node.effect.place.holder
+                held = reaching[node].get(holder) if holder in reaching[node] else None
+                local = node.effect.place.local
+                owned = reaching[node].get(local) if local in reaching[node] else None
+                Ownership.validate_loans(node.effect, active, held, current(node), owned)
 
     @staticmethod
-    def validate_loans(effect, live):
+    def reaching_loans(nodes, predecessors):
+        """For locals reassigned a borrow, the loans each may hold at every node, by forward dataflow."""
+        rebound = {node.effect.place.local for node in nodes
+                   if node.effect and node.effect.kind in {"rebind", "attach"}}
+        reaching = {node: {} for node in nodes}
+        if not rebound:
+            return reaching
+        out = {}
+        pending = deque(nodes)
+        queued = set(nodes)
+        while pending:
+            node = pending.popleft()
+            queued.remove(node)
+            state = {}
+            for previous in predecessors[node]:
+                for local, loans in out.get(previous, {}).items():
+                    state[local] = state.get(local, frozenset()) | loans
+            reaching[node] = state
+            effect = node.effect
+            after = state
+            if effect and effect.place.local in rebound:
+                if effect.kind in {"declare", "uninitialized"}:
+                    after = {**state, effect.place.local: frozenset({effect.place.local.loan} - {None})}
+                elif effect.kind == "rebind":
+                    after = {**state, effect.place.local: frozenset({effect.loan} - {None})}
+                elif effect.kind == "attach":
+                    after = {**state, effect.place.local: state.get(effect.place.local, frozenset()) | {effect.loan}}
+            if out.get(node) != after:
+                out[node] = after
+                for successor in node.edges:
+                    if successor not in queued:
+                        pending.append(successor)
+                        queued.add(successor)
+        return reaching
+
+    @staticmethod
+    def validate_loans(effect, live, held=None, current=frozenset(), owned=None):
+        """Check one effect against the live loans. `held` is the set of loans a reassigned holder may hold here."""
         kind, place, token = effect.kind, effect.place, effect.token
         if kind == "end_temporaries":
             if place.local.loan in live:
@@ -11376,9 +11459,19 @@ class Ownership:
             parent = place.holder.loan if place.holder else None
             regions = place.regions()
         permitted = set(parent.ancestors()) if parent else set()
+        if held:
+            # A reference reassigned a new borrow accesses that borrow's place, not the one it was declared with.
+            base = len(parent.place.fields) if parent else 0
+            projection = place.fields[base:]
+            permitted = {ancestor for loan in held for ancestor in loan.ancestors()}
+            regions = tuple(replace(origin, fields=(*origin.fields, *projection), holder=None)
+                            if not origin.indexed else origin for loan in held for origin in loan.regions())
+        permitted |= current
         reference = place.local.loan
-        if kind == "move" and reference:
-            if any(loan is not reference and reference in loan.ancestors() for loan in live):
+        if kind == "move" and (reference or owned):
+            owned = owned or {reference}
+            lineage = {ancestor for item in owned for ancestor in item.ancestors()}
+            if any(loan not in lineage and any(item in loan.ancestors() for item in owned) for loan in live):
                 raise token.error(f"cannot move reference {place.name!r} while it is reborrowed")
         exclusive = kind in {"move", "write", "activate"} or (
             kind == "borrow" and effect.loan.mutable and not effect.loan.two_phase
@@ -11659,7 +11752,9 @@ class Ownership:
 
     def lower_call(self, expr, scope, cursor):
         token, args = expr.token, expr.args
+        result_type = self.annotation(expr)
         temporaries = []
+        held = []
         if expr.kind == "indirect_call":
             pointer, *args = args
             annotation = self.annotation(pointer)
@@ -11710,6 +11805,14 @@ class Ownership:
                 if loan:
                     cursor, holder = self.keep_loan(cursor, loan, expr.token)
                     temporaries.append((holder, expr.token))
+            elif holds_references(self.annotation(expr)):
+                # A by-value argument like Option<&T> keeps its borrow, which a result holding references carries on.
+                cursor, loan = self.lower_holding(expr, scope, cursor)
+                if loan:
+                    cursor, holder = self.keep_loan(cursor, loan, expr.token)
+                    temporaries.append((holder, expr.token))
+                    held.append(loan)
+                    passed.setdefault(index, loan)
             else:
                 cursor = self.lower(expr, scope, cursor)
         # Activate implicit mutable reborrows after all arguments have been
@@ -11719,6 +11822,7 @@ class Ownership:
                 cursor = self.emit(cursor, "activate", holder, at)
         for holder, at in temporaries:
             cursor = self.emit(cursor, "read", holder, at)
+        cursor = self.store_argument_loans(function, args, passed, scope, cursor, token)
         if function and function.return_inputs and all(index in passed for index in function.return_inputs):
             loans = tuple(passed[index] for index in function.return_inputs)
             return cursor, self.merge_loans(loans, function.result.mutable, from_call=True)
@@ -11730,7 +11834,58 @@ class Ownership:
             inputs, mutable = self.contained_inputs(function)
             if inputs and all(index in passed for index in inputs):
                 return cursor, self.merge_loans(tuple(passed[index] for index in inputs), mutable, from_call=True)
+        if held and (isinstance(result_type, ReferenceType) or holds_references(result_type)):
+            # Option<&T>::ok_or, map, or as_deref pass the borrow of a by-value argument on to their result.
+            mutable = any(reference.mutable for reference in contained_references(result_type))
+            return cursor, self.merge_loans(tuple(held), mutable, from_call=True)
         return cursor, None
+
+    def store_argument_loans(self, function, args, passed, scope, cursor, token):
+        """A `&mut self` method like Vec::push or HashMap::insert stores the borrows its element arguments carry
+        in the receiver, so a local like `refs` in `refs.push(&mut x)` holds that loan from then on."""
+        if not args:
+            return cursor
+        if function is None:
+            if token.text not in {"push", "insert", "push_back", "push_front"}:
+                return cursor
+        elif not function.params or function.params[0][0].text != "self":
+            return cursor
+        receiver = ungroup(args[0])
+        if receiver.kind != "borrow" or not receiver.args[1]:
+            return cursor
+        target = ungroup(receiver.args[0])
+        if target.kind != "name" or not holds_references(self.annotation(target)):
+            return cursor
+        if function is None:
+            # Built-in Vec and VecDeque insertions store their element argument.
+            stored = [loan for index, loan in passed.items() if index > 0]
+        else:
+            owned = set(function.type_parameters) - set(function.method_parameters)
+            stored = [loan for index, loan in passed.items() if index > 0 and index < len(function.params)
+                      and owned & set(type_leaves(function.params[index][2]))]
+        if not stored:
+            return cursor
+        try:
+            local = scope.find(target.token)
+        except RustError:
+            return cursor
+        return self.emit(cursor, "attach", Place(local), token,
+                         loan=self.merge_loans(tuple(stored), any(loan.mutable for loan in stored), from_call=True))
+
+    def lower_holding(self, expr, scope, cursor):
+        """Lower a value that holds references without being one, like Option<&T>, with the loan it carries."""
+        value = ungroup(expr)
+        if value.kind == "name":
+            cursor = self.lower(expr, scope, cursor)
+            try:
+                return cursor, scope.find(value.token).loan
+            except RustError:
+                return cursor, None
+        if value.kind in {"call", "indirect_call", "vector_method", "string_method"}:
+            return self.lower_call(value, scope, cursor)
+        if value.kind == "try" or value.kind == "enum_method" and value.args[3]:
+            return self.lower_payload(value, scope, cursor)
+        return self.lower(expr, scope, cursor), None
 
     @staticmethod
     def contained_inputs(function):
@@ -11774,6 +11929,12 @@ class Ownership:
         loan = None
         if receiver.kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, loan = self.lower_call(receiver, scope, cursor)
+        elif receiver.kind == "name" and holds_references(self.annotation(receiver)):
+            cursor = self.lower(receiver, scope, cursor, consume=expr.kind == "try" or expr.args[3])
+            try:
+                loan = scope.find(receiver.token).loan
+            except RustError:
+                loan = None
         else:
             cursor = self.lower(receiver, scope, cursor, consume=expr.kind == "try" or expr.args[3])
         loans = [loan] if loan else []
@@ -12028,12 +12189,16 @@ class Ownership:
             target_type = self.annotation(left)
             argument = None
             origins = None
+            rebound = False
             if target_type == STRING and token.text == "+=" and self.annotation(right) != NEVER:
                 cursor, loan = self.lower_reference(right, scope, cursor)
                 cursor, argument = self.keep_loan(cursor, loan, right.token)
-            elif (token.text == "=" and isinstance(target_type, ReferenceType) and not is_static_str(target_type)
+            elif (token.text == "=" and (isinstance(target_type, ReferenceType) and not is_static_str(target_type)
+                                         or holds_references(target_type)
+                                         or isinstance(target_type, FunctionType) and target_type.closure)
                   and ungroup(left).kind == "name" and self.annotation(right) != NEVER):
                 cursor, origins = self.assigned_reference(ungroup(right), scope, cursor)
+                rebound = self.assigned_loan
             else:
                 cursor = self.lower_stored_value(right, target_type, scope, cursor)
                 if token.text == "=" and ungroup(left).kind == "name":
@@ -12052,6 +12217,9 @@ class Ownership:
             if target_place.indexed:
                 cursor = self.emit(cursor, "read", target_place, token)
             cursor = self.emit(cursor, action, target_place, token)
+            if rebound is not False and not target_place.fields and not target_place.holder:
+                # The local holds the assigned borrow from here on, not the one it was declared with.
+                cursor = self.emit(cursor, "rebind", target_place, token, loan=rebound)
             if origins and not target_place.fields and not target_place.holder:
                 cursor = self.emit(cursor, "points_to", target_place, token, roots=frozenset(origins))
                 for origin in origins:
@@ -12113,15 +12281,32 @@ class Ownership:
         return []
 
     def assigned_reference(self, right, scope, cursor):
-        """Lower a reference assigned to a local, with the locals it borrows when they are traceable."""
+        """Lower a reference assigned to a local, with the locals it borrows when they are traceable.
+        The loan the local holds from here on is left in self.assigned_loan."""
+        self.assigned_loan = None
+        if right.kind == "closure_value":
+            cursor, loan = self.lower_closure(right, scope, cursor)
+            self.assigned_loan = loan
+            return cursor, loan and [origin.local for origin in loan.regions()]
+        if holds_references(self.annotation(right)) and right.kind not in {"name", "tuple", "struct", "array"}:
+            cursor, loan = self.lower_holding(right, scope, cursor)
+            self.assigned_loan = loan
+            return cursor, loan and [origin.local for origin in loan.regions()]
         if right.kind in {"call", "indirect_call", "vector_method", "string_method"}:
             cursor, loan = self.lower_call(right, scope, cursor)
+            self.assigned_loan = loan
             return cursor, loan and [origin.local for origin in loan.regions()]
         if right.kind == "borrow":
             cursor, loan = self.lower_reference(right, scope, cursor)
+            self.assigned_loan = loan
             if loan and loan.expiring:
                 # Assignment does not extend a temporary's lifetime: the reference dangles once it ends.
                 return cursor, list(loan.expiring)
+        elif right.kind in {"try", "enum_method", "if", "if_chain", "match", "block"} and isinstance(
+                self.annotation(right), ReferenceType):
+            cursor, loan = self.lower_reference(right, scope, cursor)
+            self.assigned_loan = loan
+            return cursor, loan and [origin.local for origin in loan.regions()]
         else:
             cursor = self.lower(right, scope, cursor)
         if right.kind == "name":
@@ -12129,6 +12314,7 @@ class Ownership:
                 local = scope.find(right.token)
             except RustError:
                 return cursor, None
+            self.assigned_loan = local.loan
             return cursor, local.loan and [origin.local for origin in local.loan.regions()]
         if right.kind == "borrow":
             root = place_root(right.args[0])
@@ -12288,6 +12474,11 @@ class Ownership:
                 step = self.emit(restart, "read", iterator, token) if iterator else restart
                 self.connect(step, finish)
                 item_loan = loan if isinstance(item_type, ReferenceType) else None
+                iterable_type = self.annotation(iterable) if iterable.kind != "range" else None
+                if (isinstance(iterable_type, ReferenceType) and iterable_type.mutable
+                        and self.program.implements(iterable_type.inner, ITERATOR)):
+                    # Iterator::next(&mut self) yields items that cannot borrow from the iterator itself.
+                    item_loan = loan = None
                 item = Place(Local(replace(source.token, text="<iteration item>"), True, item_loan))
                 body_entry = self.emit(step, "declare", item, source.token)
                 pattern, types = self.program.patterns[id(source)]
@@ -12371,6 +12562,12 @@ class Ownership:
                 cursor, origin = self.keep_loan(cursor, loan, expr.token)
             return cursor, origin, loan
         loan = None
+        if (origin is not None and not origin.fields and origin.local.loan
+                and holds_references(self.annotation(expr))):
+            # A local like `let o = v.first_mut();` passes the borrow it holds to the pattern's bindings.
+            loan = origin.local.loan
+            if not all(self.carries_result_loan(source, loan.mutable) for source in sources):
+                loan = None
         if origin is None:
             call = ungroup(expr)
             if (call.kind in {"call", "indirect_call", "vector_method", "string_method"}
@@ -12409,18 +12606,29 @@ class Ownership:
                 pending.extend(node.children)
         carriers = [name for name, (annotation, _) in types.items() if name not in by_reference and (
                     isinstance(annotation, ReferenceType) or borrowing_iterator(annotation)
-                    or isinstance(annotation, FunctionType) and annotation.closure)]
-        if any(name not in direct or not isinstance(types[name][0], ReferenceType) for name in carriers):
+                    or isinstance(annotation, FunctionType) and annotation.closure or holds_references(annotation))]
+        if any(name not in direct or not (isinstance(types[name][0], ReferenceType)
+                                          or holds_references(types[name][0])) for name in carriers):
             return False
-        return not mutable or len(carriers) <= 1
+        return True
 
     def declare(self, source, types, scope, cursor, *, initialized=True, loan=None, borrows=None):
         action = "declare" if initialized else "uninitialized"
         borrows = borrows or {}
+        carriers = [name for name, (annotation, _) in types.items() if name not in borrows and (
+                    isinstance(annotation, ReferenceType) or borrowing_iterator(annotation)
+                    or (isinstance(annotation, FunctionType) and annotation.closure) or holds_references(annotation))]
+        split = loan is not None and loan.mutable and len(carriers) > 1
         for name, (annotation, mutable) in types.items():
-            carries_loan = (isinstance(annotation, ReferenceType) or borrowing_iterator(annotation)
-                            or (isinstance(annotation, FunctionType) and annotation.closure))
-            binding_loan = loan if carries_loan else None
+            binding_loan = loan if name in carriers else None
+            if split and binding_loan:
+                # Mutable references split out of one borrow, like split_at_mut's halves, are disjoint parts of it.
+                part = f"<part {carriers.index(name)}>"
+                part_mutable = annotation.mutable if isinstance(annotation, ReferenceType) else True
+                binding_loan = Loan(Place(loan.place.local, (*loan.place.fields, part)), part_mutable, (loan,),
+                                    possible=tuple(Place(region.local, (*region.fields, part))
+                                                   for region in loan.possible),
+                                    expiring=loan.expiring)
             locations = borrows.get(name, ())
             if locations and isinstance(annotation, ReferenceType):
                 paths = [self.start_loan(cursor, place, annotation.mutable, source.token) for place in locations]
