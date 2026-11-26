@@ -46,6 +46,9 @@ It prints `I borrowed 15 integers.` The loan was unsecured.
 - Borrow checks through last use, including aliases, reborrows, and function arguments
 - Disjoint field reborrows through references selected by control flow
 - Same-block reference reassignment and deferred initialization of reference bindings
+- Reassigned references, `Option<&T>` locals, and `split_at_mut` halves tracked flow by flow, so each holds only the borrow it was last given
+- Borrows stored in containers, like `refs.push(&mut x)` or a `HashMap<&str, _>` key, held for as long as the container is used
+- Calls to `unsafe fn` checked for an enclosing `unsafe` block or function
 - Immutable `'static` references in records, tuples, arrays, and supported generic values
 - Reference returns, lifetime elision, named lifetime bounds, and immutable `'static` references
 - Generic functions, structs, and enums with inferred and explicit type arguments, associated-type constraints, and argument-position `impl Trait`

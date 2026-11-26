@@ -2421,6 +2421,7 @@ class Function:
     where_bounds: tuple = ()
     # Shared reference captures whose binding the closure uses as a place, so it must borrow the binding itself.
     reference_slots: set = field(default_factory=set)
+    unsafe: bool = False
 
 
 @dataclass(frozen=True)
@@ -3084,6 +3085,8 @@ OVERFLOWING_LITERALS = [False]
 ALLOWED_LINTS = set()
 # Positions of the `fn` keywords of `unsafe fn` items, whose bodies may use mutable statics.
 UNSAFE_FUNCTIONS = set()
+# Positions of tokens inside an unsafe block or function, where calling an `unsafe fn` is allowed.
+UNSAFE_TOKENS = set()
 
 
 def token_position(token):
@@ -3830,6 +3833,8 @@ class Parser:
         if not token.text:
             raise token.error("unexpected end of input")
         self.current = self.lookahead.popleft() if self.lookahead else next(self.tokens)
+        if self.unsafe_depth:
+            UNSAFE_TOKENS.add(token_position(token))
         return replace(token, module=self.unit.path) if self.unit and self.unit.path else token
 
     def accept(self, text):
@@ -4159,6 +4164,7 @@ class Parser:
                 self.unsafe_depth -= unsafe
             if constant:
                 self.validate_const_function(function)
+            function.unsafe = bool(unsafe) and not self.in_std
             program.functions[name.text] = function
         return program
 
@@ -4430,7 +4436,8 @@ class Parser:
             if constant and self.current.text in {"fn", "unsafe"}:
                 # A `const fn` method behaves like any other method at run time.
                 constant = None
-            if self.current.text == "unsafe" and self.peek() == "fn":
+            unsafe = self.current.text == "unsafe" and self.peek() == "fn"
+            if unsafe:
                 self.advance()
             if not constant:
                 self.expect("fn")
@@ -4462,7 +4469,12 @@ class Parser:
                     # It may name constants of impls not yet parsed; fold it when a pattern needs it.
                     function.const_value = functools.partial(self.const_expression, body, annotation)
             else:
-                function = self.function(internal, method=True, declaration=declaration or self.in_std)
+                self.unsafe_depth += unsafe
+                try:
+                    function = self.function(internal, method=True, declaration=declaration or self.in_std)
+                finally:
+                    self.unsafe_depth -= unsafe
+                function.unsafe = unsafe and not self.in_std
             function.visible_from = visible
             methods[name.text] = function
             if function.body is not None or (self.in_std and not declaration):
@@ -9734,6 +9746,9 @@ class Checker:
     def function_call(self, expr, scope, expected, function, arguments, first=None):
         if function.associated_const != (expr.kind == "name"):
             raise expr.token.error("associated constants and methods use different call syntax")
+        if function.unsafe and token_position(expr.token) not in UNSAFE_TOKENS:
+            raise expr.token.error(f"call to unsafe function {function.name.text.rsplit(':', 1)[-1]!r} is unsafe "
+                                   "and requires an unsafe function or block")
         expr.kind = "call"
         if function.method_parameters:
             local = self.specialize(function.method_parameters, expr.type_arguments, expr.token, callables=False,
@@ -18233,6 +18248,7 @@ def compile_program(source, *, proc_extern=(), extern_source=(), source_path=Non
     OVERFLOWING_LITERALS[0] = False
     ALLOWED_LINTS.clear()
     UNSAFE_FUNCTIONS.clear()
+    UNSAFE_TOKENS.clear()
     ALLOWED_LINTS.update(re.findall(r"\b(?:arithmetic_overflow|unconditional_panic)\b", source))
     if edition not in RUST_EDITIONS:
         raise RustError(f"unsupported Rust edition {edition!r}")
