@@ -2945,6 +2945,28 @@ def match_types(template, actual, parameters, result):
     return template == actual
 
 
+def may_match_types(template, actual, parameters):
+    """Whether an impl target could match a type once its inference variables are known."""
+    if isinstance(actual, TypeVariable) and not (actual.integer_literal or actual.float_literal):
+        return True
+    if isinstance(actual, TypeVariable):
+        return template in parameters or literal_compatible(actual, template)
+    if template in parameters:
+        return True
+    if isinstance(template, AppliedType) and isinstance(actual, AppliedType):
+        return (template.name == actual.name and len(template.arguments) == len(actual.arguments)
+                and all(may_match_types(left, right, parameters)
+                        for left, right in zip(template.arguments, actual.arguments)))
+    if isinstance(template, TupleType) and isinstance(actual, TupleType):
+        return len(template.elements) == len(actual.elements) and all(
+            may_match_types(left, right, parameters) for left, right in zip(template.elements, actual.elements))
+    if isinstance(template, ReferenceType) and isinstance(actual, ReferenceType):
+        return template.mutable == actual.mutable and may_match_types(template.inner, actual.inner, parameters)
+    if isinstance(template, (ArrayType, SliceType)) and isinstance(actual, type(template)):
+        return may_match_types(template.element, actual.element, parameters)
+    return match_types(template, actual, parameters, {})
+
+
 def literal_compatible(variable, other):
     """Whether an {integer} or {float} inference variable could become the other type."""
     if isinstance(other, (TypeVariable, TypeParameter)):
@@ -9301,6 +9323,10 @@ class Checker:
             ) else None
             actual = self.type_of(right, scope, hint)
             if token.text == "=":
+                resolved = self.resolve(actual)
+                if (isinstance(annotation, FunctionType) and annotation.closure and isinstance(resolved, FunctionType)
+                        and resolved.closure and resolved.closure != annotation.closure):
+                    raise right.token.error("mismatched types: no two closures, even if identical, have the same type")
                 self.require_argument(actual, annotation, token)
             else:
                 if operator != "+" or annotation != STRING:
@@ -10492,7 +10518,9 @@ class Checker:
                     found = {}
                     if impl.trait == trait.name.text and match_types(impl.target, resolved, impl.parameters, found):
                         matches.append((impl, found))
-                if len(matches) == 1:
+                possible = sum(1 for impl in self.program.impls if impl.trait == trait.name.text
+                               and may_match_types(impl.target, resolved, impl.parameters))
+                if len(matches) == 1 and possible == 1:
                     # With a single candidate impl, its trait arguments are known, as in rustc.
                     impl, found = matches[0]
                     declared = self.program.trait_arguments(impl.trait, impl.trait_arguments, impl.target)

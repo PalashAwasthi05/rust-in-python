@@ -1,0 +1,31 @@
+3
+ok 42
+ok 8
+err neg -3
+err parse: invalid digit found in string
+Err(Parse(ParseIntError { kind: InvalidDigit }))
+4 "bone" 4 legs, 1.5
+[Pt { x: 0, y: 5 }, Pt { x: 1, y: 2 }]
+# .....#...
+V2(-5, -4)
+Some(5) 2 1 1
+6
+[1, 2]
+["alpha", "beta", "gamma"]
+a_b ab
+16 hey 50
+[      r] [    5] [1.23]
+[1, 2, 3] [] [9]
+[2, 5, 8]
+[1, 2, 3] Some(4)
+Some(8) Some((1, "a"))
+[-1.0, 2.5, 3.75]
+ten-ish 15
+c
+1e21
+0.30000000000000004 1 NaN
+["bob", "kayak"]
+0 true
+Ok(-255)
+true
+2147483647

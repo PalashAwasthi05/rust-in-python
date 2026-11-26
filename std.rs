@@ -3964,6 +3964,59 @@ pub mod borrow {
     impl<'a, T: ?Sized> Borrow<T> for &'a T { fn borrow(&self) -> &T { &**self } }
     impl Borrow<str> for String { fn borrow(&self) -> &str { self.as_str() } }
     impl<T> Borrow<[T]> for Vec<T> { fn borrow(&self) -> &[T] { self.as_slice() } }
+
+    pub trait ToOwned {
+        type Owned;
+        fn to_owned(&self) -> Self::Owned;
+        #[doc(hidden)]
+        fn borrow_owned(owned: &Self::Owned) -> &Self;
+    }
+    impl ToOwned for str {
+        type Owned = String;
+        fn to_owned(&self) -> String { String::from(self) }
+        fn borrow_owned(owned: &String) -> &str { owned.as_str() }
+    }
+    impl<T: Clone> ToOwned for [T] {
+        type Owned = Vec<T>;
+        fn to_owned(&self) -> Vec<T> { self.to_vec() }
+        fn borrow_owned(owned: &Vec<T>) -> &[T] { owned.as_slice() }
+    }
+
+    pub enum Cow<'a, B: ?Sized + ToOwned + 'a> {
+        Borrowed(&'a B),
+        Owned(B::Owned),
+    }
+
+    impl<'a, B: ?Sized + ToOwned> Cow<'a, B> {
+        pub fn into_owned(self) -> B::Owned {
+            match self { Cow::Borrowed(b) => b.to_owned(), Cow::Owned(o) => o }
+        }
+        pub fn to_mut(&mut self) -> &mut B::Owned {
+            if let Cow::Borrowed(b) = *self { *self = Cow::Owned(b.to_owned()); }
+            match self { Cow::Owned(o) => o, Cow::Borrowed(_) => unreachable!() }
+        }
+    }
+    impl<'a, B: ?Sized + ToOwned> crate::ops::Deref for Cow<'a, B> {
+        type Target = B;
+        fn deref(&self) -> &B { match self { Cow::Borrowed(b) => *b, Cow::Owned(o) => B::borrow_owned(o) } }
+    }
+    impl<'a, B: ?Sized + ToOwned> Clone for Cow<'a, B> where B::Owned: Clone {
+        fn clone(&self) -> Self { match self { Cow::Borrowed(b) => Cow::Borrowed(*b), Cow::Owned(o) => Cow::Owned(o.clone()) } }
+    }
+    impl<'a, B: ?Sized + ToOwned + crate::fmt::Display> crate::fmt::Display for Cow<'a, B> {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { crate::fmt::Display::fmt(&**self, f) }
+    }
+    impl<'a, B: ?Sized + ToOwned + crate::fmt::Debug> crate::fmt::Debug for Cow<'a, B> {
+        fn fmt(&self, f: &mut crate::fmt::Formatter) -> crate::fmt::Result { crate::fmt::Debug::fmt(&**self, f) }
+    }
+    impl<'a, B: ?Sized + ToOwned + PartialEq> PartialEq for Cow<'a, B> {
+        fn eq(&self, other: &Self) -> bool { **self == **other }
+    }
+    impl<'a> From<&'a str> for Cow<'a, str> { fn from(s: &'a str) -> Self { Cow::Borrowed(s) } }
+    impl<'a> From<String> for Cow<'a, str> { fn from(s: String) -> Self { Cow::Owned(s) } }
+    impl<'a> From<&'a String> for Cow<'a, str> { fn from(s: &'a String) -> Self { Cow::Borrowed(s.as_str()) } }
+    impl<'a, T: Clone> From<&'a [T]> for Cow<'a, [T]> { fn from(s: &'a [T]) -> Self { Cow::Borrowed(s) } }
+    impl<'a, T: Clone> From<Vec<T>> for Cow<'a, [T]> { fn from(v: Vec<T>) -> Self { Cow::Owned(v) } }
 }
 
 pub mod array {
